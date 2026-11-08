@@ -139,6 +139,9 @@ pub fn export(s: &Settings, lods: &[u32], path: &Path) -> Result<Value, String> 
 pub struct GameOptions {
     /// The PBO prefix the textures and materials are named under (default `grove_<name>`).
     pub prefix: Option<String>,
+    /// Write the FOREST-PROXY tree properties (lodfade, facepairs, forestcrowns, barkpom,
+    /// shadowcoarser, forestinterior) so the model can stand as a per-tree forest instance.
+    pub forest_proxy: bool,
 }
 
 /// The native Poseidon tree with the game LOD ladder (near, mid, far, very far; see gamelod.rs)
@@ -191,8 +194,22 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
         .unwrap_or(s.height);
     let mut counts = Vec::new();
     for (k, level) in ladder.levels.iter().enumerate() {
-        let props: Vec<(&str, String)> = Vec::new();
-        let _ = (k, height);
+        let mut props: Vec<(&str, String)> = Vec::new();
+        if options.forest_proxy {
+            props.push(("facepairs", "1".into()));
+            props.push(("forestcrowns", "1".into()));
+            props.push((
+                "forestinterior",
+                format!("{:.1} 0.35", (height * 0.65).max(4.)),
+            ));
+            if k == 0 {
+                props.extend([
+                    ("lodfade", "1".into()),
+                    ("barkpom", "1".into()),
+                    ("shadowcoarser", "1".into()),
+                ]);
+            }
+        }
         write_lod_with(
             &mut model,
             &level.bark,
@@ -244,6 +261,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
     let asset = json!({
         "path": path, "format": "MLOD 1.1 / P3DM", "settings": s,
         "pboPrefix": prefix, "model": reference(path), "levels": counts,
+        "forestProxy": options.forest_proxy,
         "geometryLod": "Convex trunk collision",
         "wind": {"map":"tree","height":"model-space Y, meters"},
         "sidecars": [&bark, &bark_n, &leaves, &leaves_n, &bark_mat, &leaf_mat],
@@ -456,6 +474,35 @@ fn paa(mut image: RgbaImage, compression: CompressionVariant, alpha: bool) -> Ve
     }
     output.extend([0; 4]);
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forest_proxy_export_writes_the_per_tree_properties_and_normal_maps() {
+        let dir = std::env::temp_dir().join(format!("grove-proxy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("beech_a.p3d");
+        let s = Settings::preset("solstice-cwa-buk").unwrap();
+        let options = GameOptions {
+            prefix: Some("op_grove_trees".into()),
+            forest_proxy: true,
+        };
+        export_game(&s, &path, &options).unwrap();
+        let model = std::fs::read(&path).unwrap();
+        let has = |needle: &[u8]| model.windows(needle.len()).any(|w| w == needle);
+        for key in ["facepairs", "forestcrowns", "forestinterior", "lodfade", "barkpom", "shadowcoarser"] {
+            assert!(has(key.as_bytes()), "{key}");
+        }
+        assert!(has(b"op_grove_trees\\beech_a_leaves_ca.paa"));
+        assert!(!has(b".rvmat"), "faces name no RVMAT");
+        for tex in ["bark_co", "leaves_ca"] {
+            assert!(dir.join(format!("beech_a_{tex}_nohq.paa")).is_file());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 fn material(shader: &str, normal: &str) -> String {
