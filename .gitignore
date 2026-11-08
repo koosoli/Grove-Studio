@@ -1,0 +1,10 @@
+/target/
+/exports/
+/shots/
+/.agent/
+
+# Local machine configuration and build output. Ship the executable through GitHub Releases.
+mcp-config.json
+*.exe
+*.pdb
+mechanics.json

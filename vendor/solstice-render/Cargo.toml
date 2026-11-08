@@ -1,0 +1,13 @@
+[package]
+name = "solstice-render"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+solstice-asset = { git = "https://github.com/SamG-Coder/solstice.git", rev = "c347879d8f6b97a850db004ecfd6a9c5cf29768b" }
+block_compression = { version = "0.11", default-features = false, features = ["bc15", "bc7"] }
+bytemuck = { version = "1", features = ["derive"] }
+glam = { version = "0.30", features = ["bytemuck"] }
+log = "0.4"
+wgpu = "30"

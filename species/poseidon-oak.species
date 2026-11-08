@@ -1,0 +1,17 @@
+# The Poseidon engine's forest oak (content/default-packs/forest-trees/source/presets/forest_oak.json,
+# ez-tree growth, MIT) written in Solstice's species form. The engine grows it to 24 m; this is
+# the same proportions at 16 m, the editor's largest height.
+#
+# ez-tree mapping: eleven limbs on the trunk (per_metre over the upper span), five limbs on each
+# limb and five twigs on each of those. Angles 58 to 42 degrees on the limbs, 48 on the branches,
+# 40 on the twigs. Limb lengths are 35% of the trunk, branch lengths 43% of a limb. The trunk
+# flares at its root as the engine's flare (0.75). Leaves are single oak leaves rather than
+# ez-tree's billboard cards, so each one is a Solstice leaf of the broadleaf atlas.
+height 16
+trunk radius=0.38 flare=0.75 gnarl=0.05
+crown round
+bark oak_bark
+level per_metre=1.5 span=0.35..0.97 angle=70..52 length=0.42 taper=0.3 radius=0.5 upturn=0.1 gnarl=0.25
+level per_metre=1.4 span=0.2..0.98 angle=56 length=0.45 taper=0.3 radius=0.6 upturn=0.15 droop=0.05 gnarl=0.45
+level per_metre=4 span=0.2..1 angle=46 length=0.4 taper=0.3 radius=0.6 upturn=0.25 droop=0.2 gnarl=0.6
+leaves broadleaf_leaves per_metre=110 length=0.09..0.14 width=0.55 variants=0.4,0.3,0.2,0.1 normals=0.45
