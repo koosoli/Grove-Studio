@@ -1,0 +1,11 @@
+# Forest-grown Norway spruce (Picea abies) for the Poseidon forest: the CWA spruce
+# (tree_str_smrk) at the engine pack's 25 m. Narrow cone; in a closed stand the lowest part has
+# lost its green branches, so the crown starts at 30 % of the height.
+# Base species: solstice-cwa-smrk.
+height 25
+trunk radius=0.30 flare=0.45 gnarl=0.04
+crown cone
+bark fir_bark
+level per_metre=6 span=0.3..0.99 angle=95..70 length=0.24 taper=0.3 radius=0.42 upturn=0 droop=0.3 gnarl=0.1 whorl=6
+level per_metre=6 span=0.05..0.97 angle=60..60 length=0.35 taper=0.3 radius=0.5 upturn=0 droop=0.2 gnarl=0.2 whorl=0
+leaves fir_needles per_metre=14 length=0.16..0.26 width=0.17 variants=0.4,0.3,0.2,0.1 normals=0.4

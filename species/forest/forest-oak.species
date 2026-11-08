@@ -1,0 +1,11 @@
+# Forest-grown oak (Quercus robur) for the Poseidon forest: the CWA oak (tree_str_dub) at the
+# 24 m of the engine pack's forest oak. Stout bole, crown from about 40 % of the height, crooked
+# open limbs. Base species: solstice-cwa-dub.
+height 24
+trunk radius=0.42 flare=0.65 gnarl=0.05
+crown round
+bark oak_bark
+level per_metre=1.9 span=0.4..0.96 angle=68..45 length=0.4 taper=0.3 radius=0.5 upturn=0.1 droop=0 gnarl=0.3 whorl=0
+level per_metre=2.4 span=0.15..0.95 angle=45..45 length=0.45 taper=0.3 radius=0.6 upturn=0 droop=0.05 gnarl=0.45 whorl=0
+level per_metre=7 span=0.2..1 angle=40..40 length=0.35 taper=0.3 radius=0.6 upturn=0 droop=0.2 gnarl=0.6 whorl=0
+leaves broadleaf_leaves per_metre=48 length=0.09..0.14 width=0.55 variants=0.5,0.3,0.15,0.05 normals=0.45

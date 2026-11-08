@@ -101,7 +101,8 @@ impl Settings {
                 "height",
                 self.height,
                 if shrub { 0.25 } else { 3. },
-                if shrub { 0.65 } else { 16. },
+                // forest-grown trees (species files) reach 25-30 m
+                if shrub { 0.65 } else { 40. },
             ),
             ("spread", self.spread, 0.4, 1.6),
             ("density", self.density, 0.25, 1.8),

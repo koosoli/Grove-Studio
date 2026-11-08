@@ -8,8 +8,26 @@ use std::{io::Cursor, sync::OnceLock};
 
 pub use crate::catalog::IDS;
 
+/// A species text that replaces one library species for this process (headless
+/// `--species-file`): (species id, text). The library id still names the bark cache and palette.
+static OVERRIDE: OnceLock<(String, String)> = OnceLock::new();
+
+/// Grows `id` from `text` instead of its library definition. Fails if the text does not parse
+/// or an override is already set.
+pub fn override_species(id: &str, text: String) -> Result<(), String> {
+    Species::parse(&text).map_err(|e| format!("species file: {e}"))?;
+    OVERRIDE
+        .set((id.to_string(), text))
+        .map_err(|_| "only one species file per run".to_string())
+}
+
 fn plant(name: &str) -> Option<Species> {
     let id = format!("solstice-{name}");
+    if let Some((over, text)) = OVERRIDE.get() {
+        if *over == id {
+            return Species::parse(text).ok();
+        }
+    }
     match crate::catalog::CUSTOM.iter().find(|entry| entry.0 == id) {
         Some((id, _, _, text)) => Some(Species::parse(text).unwrap_or_else(|e| panic!("{id}: {e}"))),
         None => Species::by_name(name),
@@ -246,6 +264,20 @@ pub fn bark_images(s: &Settings) -> Option<&'static BarkImages> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forest_species_files_parse_at_forest_heights() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("species/forest");
+        let mut count = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let plant = Species::parse(&text).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+            assert!((14.0..=30.0).contains(&plant.height), "{path:?}");
+            count += 1;
+        }
+        assert!(count >= 5);
+    }
 
     #[test]
     fn reference_presets_preserve_upstream_geometry_and_reduce_foliage() {
