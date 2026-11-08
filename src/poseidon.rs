@@ -135,6 +135,143 @@ pub fn export(s: &Settings, lods: &[u32], path: &Path) -> Result<Value, String> 
     Ok(asset)
 }
 
+/// How a game ladder export is written.
+pub struct GameOptions {
+    /// The PBO prefix the textures and materials are named under (default `grove_<name>`).
+    pub prefix: Option<String>,
+}
+
+/// The native Poseidon tree with the game LOD ladder (near, mid, far, very far; see gamelod.rs)
+/// and a trunk Geometry LOD. Every texture ships its `_nohq` normal map beside it.
+pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<Value, String> {
+    s.validate()?;
+    let stem = name(path)?.to_ascii_lowercase();
+    let prefix = options.prefix.clone().unwrap_or_else(|| format!("grove_{stem}"));
+    if prefix.is_empty() || prefix.contains('/') {
+        return Err("The prefix must be a PBO prefix such as op_grove_trees".into());
+    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let file = |suffix: &str| dir.join(format!("{stem}_{suffix}"));
+    let [bark, bark_n, leaves, leaves_n, bark_mat, leaf_mat, manifest] = [
+        "bark_co.paa",
+        "bark_co_nohq.paa",
+        "leaves_ca.paa",
+        "leaves_ca_nohq.paa",
+        "bark.rvmat",
+        "leaves.rvmat",
+        "poseidon.json",
+    ]
+    .map(file);
+    let reference = |p: &Path| format!("{prefix}\\{}", p.file_name().unwrap().to_string_lossy());
+    // As the engine's own generated trees: no RVMAT, the face texture is the colour and the
+    // renderer finds `<texture>_nohq.paa` beside it (an RVMAT without a BaseColour slot only
+    // made the WGPU material path warn). The RVMATs are still written for other tools.
+    let bark_surface = Surface {
+        texture: reference(&bark),
+        material: String::new(),
+    };
+    let leaf_surface = Surface {
+        texture: reference(&leaves),
+        material: String::new(),
+    };
+    let ladder = crate::gamelod::ladder(s);
+    let mut model = b"MLOD\x01\x01\x00\x00".to_vec();
+    integer(&mut model, ladder.levels.len() as u32 + 1);
+    let height = ladder
+        .levels
+        .first()
+        .map(|l| {
+            l.bark
+                .v
+                .iter()
+                .chain(&l.leaves.v)
+                .map(|v| v.p.y)
+                .fold(0., f32::max)
+        })
+        .unwrap_or(s.height);
+    let mut counts = Vec::new();
+    for (k, level) in ladder.levels.iter().enumerate() {
+        let props: Vec<(&str, String)> = Vec::new();
+        let _ = (k, height);
+        write_lod_with(
+            &mut model,
+            &level.bark,
+            &level.leaves,
+            &bark_surface,
+            &leaf_surface,
+            level.rung.resolution,
+            true,
+            &props,
+        );
+        counts.push(json!({
+            "level": level.rung.name, "resolution": level.rung.resolution,
+            "triangles": level.triangles(),
+            "faces": level.bark.i.len() / 3 + level.leaves.i.len() * 2 / 3,
+            "vertices": level.vertices(),
+        }));
+    }
+    let empty = Surface {
+        texture: String::new(),
+        material: String::new(),
+    };
+    write_lod(&mut model, &trunk_collision(s), &Part::default(), &empty, &empty, 1.0e13);
+
+    const BARK_EDGE: u32 = 512;
+    let load = |data: &[u8]| {
+        image::load_from_memory(data)
+            .map(|im| {
+                im.resize_exact(BARK_EDGE, BARK_EDGE, FilterType::Triangle)
+                    .into_rgba8()
+            })
+            .map_err(|err| err.to_string())
+    };
+    let bark_pixels = load(tree::bark_texture(s))?;
+    let (_, normal_bytes) = tree::relief_textures(s);
+    let mut bark_normal = load(normal_bytes)?;
+    for p in bark_normal.pixels_mut() {
+        // Poseidon's native NOHQ path reads tangent X from A and Y from G.
+        p.0 = [128, p[1], 255, p[0]];
+    }
+    let edge = crate::gamelod::ATLAS;
+    let atlas = RgbaImage::from_raw(edge, edge, ladder.atlas.clone()).unwrap();
+    let leaf_normal = leaf_normal_map(&atlas);
+    tree::write(&bark, paa(bark_pixels, CompressionVariant::BC1, false))?;
+    tree::write(&bark_n, paa(bark_normal, CompressionVariant::BC3, false))?;
+    tree::write(&leaves, paa(atlas, CompressionVariant::BC3, true))?;
+    tree::write(&leaves_n, paa(leaf_normal, CompressionVariant::BC3, false))?;
+    tree::write(&bark_mat, material("TreeAdvTrunk", &reference(&bark_n)))?;
+    tree::write(&leaf_mat, material("TreeAdv", &reference(&leaves_n)))?;
+    let asset = json!({
+        "path": path, "format": "MLOD 1.1 / P3DM", "settings": s,
+        "pboPrefix": prefix, "model": reference(path), "levels": counts,
+        "geometryLod": "Convex trunk collision",
+        "wind": {"map":"tree","height":"model-space Y, meters"},
+        "sidecars": [&bark, &bark_n, &leaves, &leaves_n, &bark_mat, &leaf_mat],
+    });
+    tree::write(path, model)?;
+    tree::write(&manifest, serde_json::to_vec_pretty(&asset).unwrap())?;
+    Ok(asset)
+}
+
+/// A tangent-space normal map for the leaf atlas from its luminance (veins and needle gaps sit
+/// lower), in the native NOHQ layout (X in A, Y in G).
+fn leaf_normal_map(atlas: &RgbaImage) -> RgbaImage {
+    let (w, h) = atlas.dimensions();
+    let lum = |x: i64, y: i64| {
+        let p = atlas.get_pixel(x.clamp(0, w as i64 - 1) as u32, y.clamp(0, h as i64 - 1) as u32);
+        (p[0] as f32 * 0.25 + p[1] as f32 * 0.5 + p[2] as f32 * 0.25) / 255.
+    };
+    RgbaImage::from_fn(w, h, |x, y| {
+        let (x, y) = (x as i64, y as i64);
+        let strength = 2.0;
+        let dx = (lum(x + 1, y) - lum(x - 1, y)) * strength;
+        let dy = (lum(x, y + 1) - lum(x, y - 1)) * strength;
+        let n = vec3(-dx, -dy, 1.).normalize();
+        let byte = |c: f32| ((c * 0.5 + 0.5) * 255.).round() as u8;
+        image::Rgba([128, byte(n.y), 255, byte(n.x)])
+    })
+}
+
 fn integer(data: &mut Vec<u8>, n: u32) {
     data.extend(n.to_le_bytes());
 }
@@ -177,6 +314,23 @@ fn write_lod(
     foliage: &Surface,
     resolution: f32,
 ) {
+    write_lod_with(data, wood, leaves, bark, foliage, resolution, false, &[]);
+}
+
+/// `raw_uv`: the foliage UVs are already in the leaf texture's layout (the game ladder's
+/// atlas); otherwise V is squeezed into the editor atlas' opaque band. `props` are extra named
+/// properties of the level.
+#[allow(clippy::too_many_arguments)]
+fn write_lod_with(
+    data: &mut Vec<u8>,
+    wood: &Part,
+    leaves: &Part,
+    bark: &Surface,
+    foliage: &Surface,
+    resolution: f32,
+    raw_uv: bool,
+    props: &[(&str, String)],
+) {
     let points = (wood.v.len() + leaves.v.len()) as u32;
     let normals = points + leaves.v.len() as u32;
     let faces = (wood.i.len() / 3 + leaves.i.len() * 2 / 3) as u32;
@@ -211,7 +365,10 @@ fn write_lod(
                     integer(data, if back { points + i } else { point });
                     floats(
                         data,
-                        [v.uv.x, if foliage { 0.25 + 0.5 * v.uv.y } else { v.uv.y }],
+                        [
+                            v.uv.x,
+                            if foliage && !raw_uv { 0.25 + 0.5 * v.uv.y } else { v.uv.y },
+                        ],
                     );
                 }
                 data.extend([0; 16]);
@@ -224,6 +381,9 @@ fn write_lod(
     data.extend(b"TAGG");
     property(data, "map", "tree");
     property(data, "autocenter", "0");
+    for (key, value) in props {
+        property(data, key, value);
+    }
     if resolution == 1.0e13 {
         tag(data, "component01", points + faces);
         data.resize(data.len() + (points + faces) as usize, 1);

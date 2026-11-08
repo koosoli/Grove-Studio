@@ -1,5 +1,6 @@
 mod agent;
 mod catalog;
+mod gamelod;
 mod gui;
 mod log;
 mod poseidon;

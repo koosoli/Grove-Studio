@@ -10,6 +10,8 @@ pub const HELP: &str = "Grove Studio
 Editor: grove-studio [--preset NAME] [--config FILE] [--forest SPECIES]
 Mesh export: grove-studio --headless --preset solstice-oak --out exports/oak.p3d --lod all
 Mesh inspection: grove-studio --headless --inspect --preset solstice-birch
+Game LOD ladder (near/mid/far/very far, P3D): grove-studio --headless --preset solstice-cwa-buk
+  --lod game --out exports/beech.p3d [--prefix PBO_PREFIX] (also with --inspect)
 PNG preview: grove-studio --headless --preview --out exports/forest.png --forest solstice-oak,solstice-fir
 
 Presets: solstice-oak, solstice-birch, solstice-fir, solstice-bush, solstice-poseidon-oak.
@@ -71,6 +73,7 @@ fn headless(args: &[String]) -> Result<(), String> {
         match args[i].as_str() {
             "--headless" | "--inspect" | "--preview" => i += 1,
             "--preset" | "--seed" | "--height" | "--density" | "--format" | "--lod" | "--count"
+            | "--prefix"
             | "--config" | "--out" | "--season" | "--parallax-depth" | "--forest"
             | "--preview-view" | "--distance" | "--wind-time" | "--time-of-day" | "--forest-count"
             | "--sun-azimuth" | "--skybox" => {
@@ -162,6 +165,38 @@ fn headless(args: &[String]) -> Result<(), String> {
         return Err("Forest, view, distance and wind time options require --preview".into());
     }
     let lod = option(args, "--lod").unwrap_or_else(|| "all".into());
+    let game = lod == "game";
+    if option(args, "--prefix").is_some() && !game {
+        return Err("--prefix needs --lod game".into());
+    }
+    if game {
+        if args.iter().any(|a| a == "--inspect") {
+            let ladder = crate::gamelod::ladder(&s);
+            println!("{}", json!({"settings":s,"levels":crate::gamelod::stats(&ladder)}));
+            return Ok(());
+        }
+        let out = PathBuf::from(option(args, "--out").unwrap_or_else(|| "exports/tree.p3d".into()));
+        let format = option(args, "--format").unwrap_or_else(|| "p3d".into());
+        if format != "p3d" || out.extension().and_then(|x| x.to_str()) != Some("p3d") {
+            return Err("--lod game writes a Poseidon .p3d".into());
+        }
+        let count: u32 = option(args, "--count")
+            .unwrap_or_else(|| "1".into())
+            .parse()
+            .map_err(|_| "Invalid count")?;
+        let options = crate::poseidon::GameOptions {
+            prefix: option(args, "--prefix"),
+        };
+        let mut files = vec![];
+        let seed = s.seed;
+        for n in 0..count {
+            s.seed = seed.wrapping_add(n);
+            let path = output_name(&out, 0, false, (count > 1).then_some(n), "p3d");
+            files.push(crate::poseidon::export_game(&s, &path, &options)?);
+        }
+        println!("{}", json!({"ok":true,"files":files}));
+        return Ok(());
+    }
     let lods = parse_lods(&lod)?;
     if args.iter().any(|a| a == "--inspect") {
         println!(

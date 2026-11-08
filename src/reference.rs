@@ -23,6 +23,11 @@ pub fn evergreen_id(id: &str) -> bool {
         .is_some_and(|p| p.leaves.kind == LeafKind::Needles)
 }
 
+/// The kind of leaf a species grows.
+pub fn leaf_kind(s: &Settings) -> Option<LeafKind> {
+    species(s).map(|p| p.leaves.kind)
+}
+
 pub fn evergreen(s: &Settings) -> bool {
     evergreen_id(&s.species)
 }

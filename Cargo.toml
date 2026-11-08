@@ -22,6 +22,7 @@ solstice-builder = { git = "https://github.com/SamG-Coder/solstice.git", rev = "
 solstice-procgen = { git = "https://github.com/SamG-Coder/solstice.git", rev = "c347879d8f6b97a850db004ecfd6a9c5cf29768b" }
 solstice-render = { path = "vendor/solstice-render" }
 wgpu = "30"
+meshopt = "0.7"
 
 [profile.dev.package.solstice-builder]
 opt-level = 3
