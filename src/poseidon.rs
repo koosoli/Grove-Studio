@@ -369,11 +369,14 @@ fn write_lod_with(
         floats(data, v.p.to_array());
         integer(data, 0);
     }
+    // MLOD stores normals negated (as the face winding is: the loader flips both), exactly as
+    // OpenPoseidon's own generated trees do; written as-is the bark was lit from inside and
+    // drew black in game (2026-11-08, measured: the engine's trees' trunk normals point in).
     for v in wood.v.iter().chain(&leaves.v) {
-        floats(data, v.n.to_array());
+        floats(data, (-v.n).to_array());
     }
     for v in &leaves.v {
-        floats(data, (-v.n).to_array());
+        floats(data, v.n.to_array());
     }
     for (part, surface, first, foliage) in [
         (wood, bark, 0, false),
