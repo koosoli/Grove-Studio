@@ -12,6 +12,8 @@ Mesh export: grove-studio --headless --preset solstice-oak --out exports/oak.p3d
 Mesh inspection: grove-studio --headless --inspect --preset solstice-birch
 Game LOD ladder (near/mid/far/very far, P3D): grove-studio --headless --preset solstice-cwa-buk
   --lod game --out exports/beech.p3d [--prefix PBO_PREFIX] [--forest-proxy] (also with --inspect)
+  [--budgets near,mid,far,veryfar] [--opaque-leaves [--budgets near,veryfar]]: opaque leaf pieces
+  in one near level for an engine that simplifies per cluster, plus the very far spray level
 Species file: --species-file species/forest/forest-beech.species --preset solstice-cwa-buk
   grows the preset from that text (forest-grown heights up to 40 m).
 PNG preview: grove-studio --headless --preview --out exports/forest.png --forest solstice-oak,solstice-fir
@@ -73,7 +75,7 @@ fn headless(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--headless" | "--inspect" | "--preview" | "--forest-proxy" => i += 1,
+            "--headless" | "--inspect" | "--preview" | "--forest-proxy" | "--opaque-leaves" => i += 1,
             "--preset" | "--seed" | "--height" | "--density" | "--format" | "--lod" | "--count"
             | "--prefix" | "--species-file" | "--budgets"
             | "--config" | "--out" | "--season" | "--parallax-depth" | "--forest"
@@ -175,6 +177,10 @@ fn headless(args: &[String]) -> Result<(), String> {
     let lod = option(args, "--lod").unwrap_or_else(|| "all".into());
     let game = lod == "game";
     let forest_proxy = args.iter().any(|a| a == "--forest-proxy");
+    let opaque_leaves = args.iter().any(|a| a == "--opaque-leaves");
+    if opaque_leaves && !game {
+        return Err("--opaque-leaves needs --lod game".into());
+    }
     if (forest_proxy || option(args, "--prefix").is_some()) && !game {
         return Err("--prefix and --forest-proxy need --lod game".into());
     }
@@ -189,9 +195,13 @@ fn headless(args: &[String]) -> Result<(), String> {
     };
     if game {
         if args.iter().any(|a| a == "--inspect") {
-            let ladder = match &budgets {
-                Some(b) => crate::gamelod::ladder_with(&s, &crate::gamelod::rungs_with_budgets(b)?),
-                None => crate::gamelod::ladder(&s),
+            let ladder = if opaque_leaves {
+                crate::gamelod::ladder_with(&s, &crate::gamelod::opaque_rungs(budgets.as_deref())?)
+            } else {
+                match &budgets {
+                    Some(b) => crate::gamelod::ladder_with(&s, &crate::gamelod::rungs_with_budgets(b)?),
+                    None => crate::gamelod::ladder(&s),
+                }
             };
             println!("{}", json!({"settings":s,"levels":crate::gamelod::stats(&ladder)}));
             return Ok(());
@@ -209,6 +219,7 @@ fn headless(args: &[String]) -> Result<(), String> {
             prefix: option(args, "--prefix"),
             forest_proxy,
             budgets,
+            opaque_leaves,
         };
         let mut files = vec![];
         let seed = s.seed;

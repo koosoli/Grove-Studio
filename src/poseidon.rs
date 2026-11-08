@@ -144,6 +144,11 @@ pub struct GameOptions {
     pub forest_proxy: bool,
     /// Triangle budgets near, mid, far, very far (`--budgets`); None = the default ladder.
     pub budgets: Option<Vec<usize>>,
+    /// `--opaque-leaves`: two levels, a near level of opaque leaf pieces (no alpha test, its own
+    /// BC1 leaf texture `_leaves_co.paa`) marked `clusterfoliage=1`, which OpenPoseidon reduces
+    /// per cluster with distance (GROVE-OPAQUE), and the very far spray level, which casts the
+    /// shadows (`shadowcoarser`) and stands for the tree in the far forest.
+    pub opaque_leaves: bool,
 }
 
 /// The native Poseidon tree with the game LOD ladder (near, mid, far, very far; see gamelod.rs)
@@ -179,9 +184,19 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
         texture: reference(&leaves),
         material: String::new(),
     };
-    let ladder = match &options.budgets {
-        Some(b) => crate::gamelod::ladder_with(s, &crate::gamelod::rungs_with_budgets(b)?),
-        None => crate::gamelod::ladder(s),
+    let ladder = if options.opaque_leaves {
+        crate::gamelod::ladder_with(s, &crate::gamelod::opaque_rungs(options.budgets.as_deref())?)
+    } else {
+        match &options.budgets {
+            Some(b) => crate::gamelod::ladder_with(s, &crate::gamelod::rungs_with_budgets(b)?),
+            None => crate::gamelod::ladder(s),
+        }
+    };
+    let opaque_leaves = file("leaves_co.paa");
+    let opaque_leaves_n = file("leaves_co_nohq.paa");
+    let opaque_surface = Surface {
+        texture: reference(&opaque_leaves),
+        material: String::new(),
     };
     let mut model = b"MLOD\x01\x01\x00\x00".to_vec();
     integer(&mut model, ladder.levels.len() as u32 + 1);
@@ -208,19 +223,23 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
                 format!("{:.1} 0.35", (height * 0.65).max(4.)),
             ));
             if k == 0 {
-                props.extend([
-                    ("lodfade", "1".into()),
-                    ("barkpom", "1".into()),
-                    ("shadowcoarser", "1".into()),
-                ]);
+                props.extend([("lodfade", "1".into()), ("barkpom", "1".into())]);
+                // an opaque-leaf near level casts its own shadow, reduced per cluster from the eye
+                // (OpenPoseidon WGR_CLUSTER_LOD_SHADOW_PX); the very far sprays are alpha-tested
+                if !options.opaque_leaves {
+                    props.push(("shadowcoarser", "1".into()));
+                }
             }
+        }
+        if options.opaque_leaves && k == 0 {
+            props.push(("clusterfoliage", "1".into()));
         }
         write_lod_with(
             &mut model,
             &level.bark,
             &level.leaves,
             &bark_surface,
-            &leaf_surface,
+            if options.opaque_leaves && k == 0 { &opaque_surface } else { &leaf_surface },
             level.rung.resolution,
             true,
             &props,
@@ -263,6 +282,14 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
     let leaf_normal = leaf_normal_map(&atlas);
     tree::write(&bark, paa(bark_pixels, CompressionVariant::BC1, false))?;
     tree::write(&bark_n, paa(bark_normal, CompressionVariant::BC3, false))?;
+    if options.opaque_leaves {
+        let mut opaque = atlas.clone();
+        for p in opaque.pixels_mut() {
+            p.0[3] = 255;
+        }
+        tree::write(&opaque_leaves, paa(opaque, CompressionVariant::BC1, false))?;
+        tree::write(&opaque_leaves_n, paa(leaf_normal.clone(), CompressionVariant::BC3, false))?;
+    }
     tree::write(&leaves, paa(atlas, CompressionVariant::BC3, true))?;
     tree::write(&leaves_n, paa(leaf_normal, CompressionVariant::BC3, false))?;
     tree::write(&bark_mat, material("TreeAdvTrunk", &reference(&bark_n)))?;
@@ -270,7 +297,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
     let asset = json!({
         "path": path, "format": "MLOD 1.1 / P3DM", "settings": s,
         "pboPrefix": prefix, "model": reference(path), "levels": counts,
-        "forestProxy": options.forest_proxy,
+        "forestProxy": options.forest_proxy, "opaqueLeaves": options.opaque_leaves,
         "geometryLod": "Convex trunk collision",
         "wind": {"map":"tree","height":"model-space Y, meters"},
         "sidecars": [&bark, &bark_n, &leaves, &leaves_n, &bark_mat, &leaf_mat],
@@ -502,6 +529,7 @@ mod tests {
             prefix: Some("op_grove_trees".into()),
             forest_proxy: true,
             budgets: None,
+            opaque_leaves: false,
         };
         export_game(&s, &path, &options).unwrap();
         let model = std::fs::read(&path).unwrap();
@@ -513,6 +541,32 @@ mod tests {
         assert!(!has(b".rvmat"), "faces name no RVMAT");
         for tex in ["bark_co", "leaves_ca"] {
             assert!(dir.join(format!("beech_a_{tex}_nohq.paa")).is_file());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opaque_leaves_export_is_two_levels_with_an_opaque_cluster_foliage_near_level() {
+        let dir = std::env::temp_dir().join(format!("grove-opaque-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("oak_a.p3d");
+        let s = Settings::preset("solstice-cwa-dub").unwrap();
+        let options = GameOptions {
+            prefix: Some("op_grove_trees".into()),
+            forest_proxy: true,
+            budgets: Some(vec![40_000, 400]),
+            opaque_leaves: true,
+        };
+        let asset = export_game(&s, &path, &options).unwrap();
+        assert_eq!(asset["levels"].as_array().unwrap().len(), 2);
+        let model = std::fs::read(&path).unwrap();
+        let has = |needle: &[u8]| model.windows(needle.len()).any(|w| w == needle);
+        assert!(has(b"clusterfoliage"));
+        assert!(!has(b"shadowcoarser"), "the opaque near level casts its own shadow");
+        assert!(has(b"op_grove_trees\\oak_a_leaves_co.paa"));
+        assert!(has(b"op_grove_trees\\oak_a_leaves_ca.paa"), "the very far sprays keep the alpha atlas");
+        for tex in ["leaves_co", "leaves_co_nohq", "leaves_ca"] {
+            assert!(dir.join(format!("oak_a_{tex}.paa")).is_file(), "{tex}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

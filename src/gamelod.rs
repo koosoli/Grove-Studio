@@ -43,6 +43,10 @@ pub enum LeafStyle {
     Clusters,
     /// The mid level's spray cards plus thinned source pieces (conifers up close).
     PiecesOverSprays,
+    /// The source leaf pieces themselves, thinned with their area kept, opaque: their outline is
+    /// their geometry, so no alpha test. For an engine that simplifies the whole tree per cluster
+    /// (OpenPoseidon GROVE-OPAQUE, `--opaque-leaves`), as Solstice draws its own trees.
+    Opaque,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -172,7 +176,28 @@ pub fn rungs_with_budgets(budgets: &[usize]) -> Result<[Rung; 4], String> {
     Ok(rungs)
 }
 
-pub fn ladder_with(s: &Settings, rungs: &[Rung; 4]) -> Ladder {
+/// The two-level ladder of `--opaque-leaves`: a near level of opaque leaf pieces that the engine
+/// reduces per cluster with distance, and the very far spray-card level for shadows and the far
+/// forest hand-over. `budgets` = (near, very far) single-sided triangles.
+pub fn opaque_rungs(budgets: Option<&[usize]>) -> Result<[Rung; 2], String> {
+    let mut near = LADDER[0];
+    near.name = "near (opaque)";
+    near.broadleaf = LeafStyle::Opaque;
+    near.needles = LeafStyle::Opaque;
+    let mut far = LADDER[3];
+    if let Some(b) = budgets {
+        if b.len() != 2 || b[1] >= b[0] || b[1] < 200 {
+            return Err("--budgets with --opaque-leaves wants two shrinking triangle counts (near, very far)".into());
+        }
+        near.wood = (near.wood as f64 * b[0] as f64 / near.budget as f64).round().max(60.) as usize;
+        near.budget = b[0];
+        far.wood = (far.wood as f64 * b[1] as f64 / far.budget as f64).round().max(60.) as usize;
+        far.budget = b[1];
+    }
+    Ok([near, far])
+}
+
+pub fn ladder_with(s: &Settings, rungs: &[Rung]) -> Ladder {
     let mut full = crate::tree::generate(s, 0);
     // The origin is the trunk's foot, not the lowest point of the wood: a fir's lowest whorls
     // droop below where its trunk starts, and the far levels drop them.
@@ -197,7 +222,8 @@ pub fn ladder_with(s: &Settings, rungs: &[Rung; 4]) -> Ladder {
     let card_scale = if needles { 1.0 } else { 0.65 };
     // The sprays are baked once, from clusters of the size the far level uses, and scaled for
     // every level that draws them.
-    let bake = cluster(&leaves, rungs[2].budget * 3 / 4 / 6, card_scale);
+    let bake_budget = if rungs.len() > 2 { rungs[2].budget } else { LADDER[2].budget };
+    let bake = cluster(&leaves, bake_budget * 3 / 4 / 6, card_scale);
     if !bake.is_empty() {
         bake_sprays(&mut atlas, &colors, &full.leaves, pieces, &leaves, &bake);
     }
@@ -210,11 +236,12 @@ pub fn ladder_with(s: &Settings, rungs: &[Rung; 4]) -> Ladder {
             LeafStyle::Folded => cards(&leaves, left, true),
             LeafStyle::Flat => cards(&leaves, left, false),
             LeafStyle::Clusters => spray_cards(&leaves, &cluster(&leaves, left / 6, card_scale), crown),
+            LeafStyle::Opaque => opaque_pieces(&full.leaves, pieces, left),
             LeafStyle::PiecesOverSprays => {
                 // the mid level's spray cards as the body of the crown, and needle fans in the
                 // rest of the budget for the close-up detail: near hands over to mid without
                 // the crown thinning out
-                let body = rungs[1].budget * 3 / 4;
+                let body = rungs.get(1).map_or(LADDER[1].budget, |r| r.budget) * 3 / 4;
                 let mut part = spray_cards(&leaves, &cluster(&leaves, body / 6, card_scale), crown);
                 let fans = thin_pieces(&full.leaves, pieces, left.saturating_sub(body));
                 let first = part.v.len() as u32;
@@ -335,6 +362,43 @@ fn thin_pieces(part: &Part, verts: usize, budget: usize) -> Part {
         let ccw = (b - a).cross(c - a).dot(piece[0].n) >= 0.;
         out.i
             .extend(if ccw { [first, first + 1, first + 2] } else { [first, first + 2, first + 1] });
+    }
+    out
+}
+
+/// The source leaf pieces (`verts` vertices each, their own triangles), every n-th kept and grown
+/// about its centre so the kept ones cover what all of them covered; UVs into the opaque band.
+fn opaque_pieces(part: &Part, verts: usize, budget: usize) -> Part {
+    let count = part.v.len() / verts;
+    if count == 0 {
+        return Part::default();
+    }
+    let mut tris: Vec<Vec<[u32; 3]>> = vec![Vec::new(); count];
+    for t in part.i.chunks_exact(3) {
+        let k = t[0] as usize / verts;
+        if k < count && t.iter().all(|&i| i as usize / verts == k) {
+            tris[k].push([t[0], t[1], t[2]]);
+        }
+    }
+    let each = (part.i.len() / 3).div_ceil(count).max(1);
+    let (n, grow) = stride(count, each, budget);
+    let mut out = Part::default();
+    for (k, piece) in part.v.chunks_exact(verts).enumerate() {
+        if k % n != 0 || tris[k].is_empty() {
+            continue;
+        }
+        let center = piece.iter().map(|v| v.p).sum::<Vec3>() / verts as f32;
+        let first = out.v.len() as u32;
+        for v in piece {
+            let mut v = *v;
+            v.p = center + (v.p - center) * grow;
+            v.uv = vec2(v.uv.x, uv_in(OPAQUE, v.uv.y));
+            out.v.push(v);
+        }
+        let base = (k * verts) as u32;
+        for t in &tris[k] {
+            out.i.extend(t.iter().map(|i| i - base + first));
+        }
     }
     out
 }
