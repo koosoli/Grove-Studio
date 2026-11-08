@@ -153,6 +153,26 @@ pub struct Ladder {
 }
 
 pub fn ladder(s: &Settings) -> Ladder {
+    ladder_with(s, &LADDER)
+}
+
+/// The rungs with other triangle budgets (`--budgets near,mid,far,veryfar`): each rung's wood
+/// share scales with it. A dense forest draws thousands of trees past 30 m, so its far rungs
+/// must be far cheaper than a lone tree's (2026-11-08: the default 6.5k/1.5k cost 3x the
+/// engine's own trees there).
+pub fn rungs_with_budgets(budgets: &[usize]) -> Result<[Rung; 4], String> {
+    if budgets.len() != 4 || budgets.windows(2).any(|w| w[1] >= w[0]) || budgets[3] < 200 {
+        return Err("--budgets wants four shrinking triangle counts, the last at least 200".into());
+    }
+    let mut rungs = LADDER;
+    for (rung, &b) in rungs.iter_mut().zip(budgets) {
+        rung.wood = (rung.wood as f64 * b as f64 / rung.budget as f64).round().max(60.) as usize;
+        rung.budget = b;
+    }
+    Ok(rungs)
+}
+
+pub fn ladder_with(s: &Settings, rungs: &[Rung; 4]) -> Ladder {
     let mut full = crate::tree::generate(s, 0);
     // The origin is the trunk's foot, not the lowest point of the wood: a fir's lowest whorls
     // droop below where its trunk starts, and the far levels drop them.
@@ -177,12 +197,12 @@ pub fn ladder(s: &Settings) -> Ladder {
     let card_scale = if needles { 1.0 } else { 0.65 };
     // The sprays are baked once, from clusters of the size the far level uses, and scaled for
     // every level that draws them.
-    let bake = cluster(&leaves, LADDER[2].budget * 3 / 4 / 6, card_scale);
+    let bake = cluster(&leaves, rungs[2].budget * 3 / 4 / 6, card_scale);
     if !bake.is_empty() {
         bake_sprays(&mut atlas, &colors, &full.leaves, pieces, &leaves, &bake);
     }
     let mut levels = Vec::new();
-    for rung in LADDER {
+    for &rung in rungs {
         let bark = simplify_wood(&full.bark, &rung, height);
         let left = rung.budget.saturating_sub(bark.i.len() / 3);
         let style = if needles { rung.needles } else { rung.broadleaf };
@@ -194,7 +214,7 @@ pub fn ladder(s: &Settings) -> Ladder {
                 // the mid level's spray cards as the body of the crown, and needle fans in the
                 // rest of the budget for the close-up detail: near hands over to mid without
                 // the crown thinning out
-                let body = LADDER[1].budget * 3 / 4;
+                let body = rungs[1].budget * 3 / 4;
                 let mut part = spray_cards(&leaves, &cluster(&leaves, body / 6, card_scale), crown);
                 let fans = thin_pieces(&full.leaves, pieces, left.saturating_sub(body));
                 let first = part.v.len() as u32;

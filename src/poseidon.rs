@@ -142,6 +142,8 @@ pub struct GameOptions {
     /// Write the FOREST-PROXY tree properties (lodfade, facepairs, forestcrowns, barkpom,
     /// shadowcoarser, forestinterior) so the model can stand as a per-tree forest instance.
     pub forest_proxy: bool,
+    /// Triangle budgets near, mid, far, very far (`--budgets`); None = the default ladder.
+    pub budgets: Option<Vec<usize>>,
 }
 
 /// The native Poseidon tree with the game LOD ladder (near, mid, far, very far; see gamelod.rs)
@@ -177,7 +179,10 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
         texture: reference(&leaves),
         material: String::new(),
     };
-    let ladder = crate::gamelod::ladder(s);
+    let ladder = match &options.budgets {
+        Some(b) => crate::gamelod::ladder_with(s, &crate::gamelod::rungs_with_budgets(b)?),
+        None => crate::gamelod::ladder(s),
+    };
     let mut model = b"MLOD\x01\x01\x00\x00".to_vec();
     integer(&mut model, ladder.levels.len() as u32 + 1);
     let height = ladder
@@ -489,6 +494,7 @@ mod tests {
         let options = GameOptions {
             prefix: Some("op_grove_trees".into()),
             forest_proxy: true,
+            budgets: None,
         };
         export_game(&s, &path, &options).unwrap();
         let model = std::fs::read(&path).unwrap();
