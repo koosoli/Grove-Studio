@@ -75,7 +75,7 @@ fn headless(args: &[String]) -> Result<(), String> {
         match args[i].as_str() {
             "--headless" | "--inspect" | "--preview" | "--forest-proxy" => i += 1,
             "--preset" | "--seed" | "--height" | "--density" | "--format" | "--lod" | "--count"
-            | "--prefix" | "--species-file"
+            | "--prefix" | "--species-file" | "--budgets"
             | "--config" | "--out" | "--season" | "--parallax-depth" | "--forest"
             | "--preview-view" | "--distance" | "--wind-time" | "--time-of-day" | "--forest-count"
             | "--sun-azimuth" | "--skybox" => {
@@ -178,9 +178,21 @@ fn headless(args: &[String]) -> Result<(), String> {
     if (forest_proxy || option(args, "--prefix").is_some()) && !game {
         return Err("--prefix and --forest-proxy need --lod game".into());
     }
+    let budgets = match option(args, "--budgets") {
+        Some(v) if game => Some(
+            v.split(',')
+                .map(|n| n.trim().parse::<usize>().map_err(|_| "Invalid --budgets"))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Some(_) => return Err("--budgets needs --lod game".into()),
+        None => None,
+    };
     if game {
         if args.iter().any(|a| a == "--inspect") {
-            let ladder = crate::gamelod::ladder(&s);
+            let ladder = match &budgets {
+                Some(b) => crate::gamelod::ladder_with(&s, &crate::gamelod::rungs_with_budgets(b)?),
+                None => crate::gamelod::ladder(&s),
+            };
             println!("{}", json!({"settings":s,"levels":crate::gamelod::stats(&ladder)}));
             return Ok(());
         }
@@ -196,6 +208,7 @@ fn headless(args: &[String]) -> Result<(), String> {
         let options = crate::poseidon::GameOptions {
             prefix: option(args, "--prefix"),
             forest_proxy,
+            budgets,
         };
         let mut files = vec![];
         let seed = s.seed;

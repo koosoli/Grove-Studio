@@ -142,6 +142,8 @@ pub struct GameOptions {
     /// Write the FOREST-PROXY tree properties (lodfade, facepairs, forestcrowns, barkpom,
     /// shadowcoarser, forestinterior) so the model can stand as a per-tree forest instance.
     pub forest_proxy: bool,
+    /// Triangle budgets near, mid, far, very far (`--budgets`); None = the default ladder.
+    pub budgets: Option<Vec<usize>>,
 }
 
 /// The native Poseidon tree with the game LOD ladder (near, mid, far, very far; see gamelod.rs)
@@ -177,7 +179,10 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
         texture: reference(&leaves),
         material: String::new(),
     };
-    let ladder = crate::gamelod::ladder(s);
+    let ladder = match &options.budgets {
+        Some(b) => crate::gamelod::ladder_with(s, &crate::gamelod::rungs_with_budgets(b)?),
+        None => crate::gamelod::ladder(s),
+    };
     let mut model = b"MLOD\x01\x01\x00\x00".to_vec();
     integer(&mut model, ladder.levels.len() as u32 + 1);
     let height = ladder
@@ -246,8 +251,12 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
     let (_, normal_bytes) = tree::relief_textures(s);
     let mut bark_normal = load(normal_bytes)?;
     for p in bark_normal.pixels_mut() {
-        // Poseidon's native NOHQ path reads tangent X from A and Y from G.
-        p.0 = [128, p[1], 255, p[0]];
+        // OpenPoseidon's `_nohq` layout, as its own tree generator writes it (TreeCommand.cpp
+        // WriteNohq): G = y, B = z, A = x, R = 0. A non-zero R is not ignored by the WGPU
+        // material path (2026-11-08: the first Grove forest drew pitch-black trunks with R=128).
+        let [x, y] = [p[0], p[1]].map(|c| c as f32 / 127.5 - 1.);
+        let z = (1. - x * x - y * y).max(0.).sqrt();
+        p.0 = [0, p[1], (z * 127.5 + 127.5) as u8, p[0]];
     }
     let edge = crate::gamelod::ATLAS;
     let atlas = RgbaImage::from_raw(edge, edge, ladder.atlas.clone()).unwrap();
@@ -286,7 +295,7 @@ fn leaf_normal_map(atlas: &RgbaImage) -> RgbaImage {
         let dy = (lum(x, y + 1) - lum(x, y - 1)) * strength;
         let n = vec3(-dx, -dy, 1.).normalize();
         let byte = |c: f32| ((c * 0.5 + 0.5) * 255.).round() as u8;
-        image::Rgba([128, byte(n.y), 255, byte(n.x)])
+        image::Rgba([0, byte(n.y), byte(n.z), byte(n.x)])
     })
 }
 
@@ -360,11 +369,14 @@ fn write_lod_with(
         floats(data, v.p.to_array());
         integer(data, 0);
     }
+    // MLOD stores normals negated (as the face winding is: the loader flips both), exactly as
+    // OpenPoseidon's own generated trees do; written as-is the bark was lit from inside and
+    // drew black in game (2026-11-08, measured: the engine's trees' trunk normals point in).
     for v in wood.v.iter().chain(&leaves.v) {
-        floats(data, v.n.to_array());
+        floats(data, (-v.n).to_array());
     }
     for v in &leaves.v {
-        floats(data, (-v.n).to_array());
+        floats(data, v.n.to_array());
     }
     for (part, surface, first, foliage) in [
         (wood, bark, 0, false),
@@ -489,6 +501,7 @@ mod tests {
         let options = GameOptions {
             prefix: Some("op_grove_trees".into()),
             forest_proxy: true,
+            budgets: None,
         };
         export_game(&s, &path, &options).unwrap();
         let model = std::fs::read(&path).unwrap();
