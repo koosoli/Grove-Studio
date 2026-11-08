@@ -12,6 +12,8 @@ Mesh export: grove-studio --headless --preset solstice-oak --out exports/oak.p3d
 Mesh inspection: grove-studio --headless --inspect --preset solstice-birch
 Game LOD ladder (near/mid/far/very far, P3D): grove-studio --headless --preset solstice-cwa-buk
   --lod game --out exports/beech.p3d [--prefix PBO_PREFIX] [--forest-proxy] (also with --inspect)
+Species file: --species-file species/forest/forest-beech.species --preset solstice-cwa-buk
+  grows the preset from that text (forest-grown heights up to 40 m).
 PNG preview: grove-studio --headless --preview --out exports/forest.png --forest solstice-oak,solstice-fir
 
 Presets: solstice-oak, solstice-birch, solstice-fir, solstice-bush, solstice-poseidon-oak.
@@ -73,7 +75,7 @@ fn headless(args: &[String]) -> Result<(), String> {
         match args[i].as_str() {
             "--headless" | "--inspect" | "--preview" | "--forest-proxy" => i += 1,
             "--preset" | "--seed" | "--height" | "--density" | "--format" | "--lod" | "--count"
-            | "--prefix"
+            | "--prefix" | "--species-file"
             | "--config" | "--out" | "--season" | "--parallax-depth" | "--forest"
             | "--preview-view" | "--distance" | "--wind-time" | "--time-of-day" | "--forest-count"
             | "--sun-azimuth" | "--skybox" => {
@@ -84,6 +86,12 @@ fn headless(args: &[String]) -> Result<(), String> {
             }
             other => return Err(format!("Unknown option: {other}")),
         }
+    }
+    if let Some(file) = option(args, "--species-file") {
+        // The species text replaces the preset's own definition; the preset names its bark.
+        let id = option(args, "--preset").ok_or("--species-file needs --preset (its base species)")?;
+        let text = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?;
+        crate::reference::override_species(&id.to_lowercase(), text)?;
     }
     let mut s = if let Some(path) = option(args, "--config") {
         tree::load_project(Path::new(&path))?
