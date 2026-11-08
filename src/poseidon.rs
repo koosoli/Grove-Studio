@@ -251,8 +251,12 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
     let (_, normal_bytes) = tree::relief_textures(s);
     let mut bark_normal = load(normal_bytes)?;
     for p in bark_normal.pixels_mut() {
-        // Poseidon's native NOHQ path reads tangent X from A and Y from G.
-        p.0 = [128, p[1], 255, p[0]];
+        // OpenPoseidon's `_nohq` layout, as its own tree generator writes it (TreeCommand.cpp
+        // WriteNohq): G = y, B = z, A = x, R = 0. A non-zero R is not ignored by the WGPU
+        // material path (2026-11-08: the first Grove forest drew pitch-black trunks with R=128).
+        let [x, y] = [p[0], p[1]].map(|c| c as f32 / 127.5 - 1.);
+        let z = (1. - x * x - y * y).max(0.).sqrt();
+        p.0 = [0, p[1], (z * 127.5 + 127.5) as u8, p[0]];
     }
     let edge = crate::gamelod::ATLAS;
     let atlas = RgbaImage::from_raw(edge, edge, ladder.atlas.clone()).unwrap();
@@ -291,7 +295,7 @@ fn leaf_normal_map(atlas: &RgbaImage) -> RgbaImage {
         let dy = (lum(x, y + 1) - lum(x, y - 1)) * strength;
         let n = vec3(-dx, -dy, 1.).normalize();
         let byte = |c: f32| ((c * 0.5 + 0.5) * 255.).round() as u8;
-        image::Rgba([128, byte(n.y), 255, byte(n.x)])
+        image::Rgba([0, byte(n.y), byte(n.z), byte(n.x)])
     })
 }
 

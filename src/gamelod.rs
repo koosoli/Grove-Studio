@@ -475,6 +475,13 @@ fn spray_cards(leaves: &[Leaf], clusters: &[Cluster], crown: Vec3) -> Part {
         let lit = (c.center - crown).normalize_or(Vec3::Y);
         let color = leaves[c.members[0]].color;
         let spray = SPRAY_U[(h & 1) as usize];
+        // A card never hangs below its cluster's lowest leaf: big far cards otherwise drop a
+        // curtain of foliage to head height under the crowns (2026-11-08, in game).
+        let floor = c
+            .members
+            .iter()
+            .map(|&k| leaves[k].base.y.min(leaves[k].tip.y))
+            .fold(f32::MAX, f32::min);
         for (j, normal) in [out_dir, across, up].into_iter().enumerate() {
             let (t0, b0) = orthonormal(normal);
             let angle = (hash(h ^ j as u32) & 0xffff) as f32 / 65535. * std::f32::consts::TAU;
@@ -483,8 +490,10 @@ fn spray_cards(leaves: &[Leaf], clusters: &[Cluster], crown: Vec3) -> Part {
             let n = (normal * 0.4 + lit * 0.6).normalize_or(normal);
             let first = out.v.len() as u32;
             for (x, y) in [(-1., -1.), (1., -1.), (1., 1.), (-1., 1.)] {
+                let mut p = c.center + (t * x + b * y) * c.radius;
+                p.y = p.y.max(floor);
                 out.v.push(V {
-                    p: c.center + (t * x + b * y) * c.radius,
+                    p,
                     n,
                     c: color,
                     uv: vec2(
