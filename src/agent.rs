@@ -11,7 +11,7 @@ Editor: grove-studio [--preset NAME] [--config FILE] [--forest SPECIES]
 Mesh export: grove-studio --headless --preset solstice-oak --out exports/oak.p3d --lod all
 Mesh inspection: grove-studio --headless --inspect --preset solstice-birch
 Game LOD ladder (near/mid/far/very far, P3D): grove-studio --headless --preset solstice-cwa-buk
-  --lod game --out exports/beech.p3d [--prefix PBO_PREFIX] (also with --inspect)
+  --lod game --out exports/beech.p3d [--prefix PBO_PREFIX] [--forest-proxy] (also with --inspect)
 PNG preview: grove-studio --headless --preview --out exports/forest.png --forest solstice-oak,solstice-fir
 
 Presets: solstice-oak, solstice-birch, solstice-fir, solstice-bush, solstice-poseidon-oak.
@@ -71,7 +71,7 @@ fn headless(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--headless" | "--inspect" | "--preview" => i += 1,
+            "--headless" | "--inspect" | "--preview" | "--forest-proxy" => i += 1,
             "--preset" | "--seed" | "--height" | "--density" | "--format" | "--lod" | "--count"
             | "--prefix"
             | "--config" | "--out" | "--season" | "--parallax-depth" | "--forest"
@@ -166,8 +166,9 @@ fn headless(args: &[String]) -> Result<(), String> {
     }
     let lod = option(args, "--lod").unwrap_or_else(|| "all".into());
     let game = lod == "game";
-    if option(args, "--prefix").is_some() && !game {
-        return Err("--prefix needs --lod game".into());
+    let forest_proxy = args.iter().any(|a| a == "--forest-proxy");
+    if (forest_proxy || option(args, "--prefix").is_some()) && !game {
+        return Err("--prefix and --forest-proxy need --lod game".into());
     }
     if game {
         if args.iter().any(|a| a == "--inspect") {
@@ -186,6 +187,7 @@ fn headless(args: &[String]) -> Result<(), String> {
             .map_err(|_| "Invalid count")?;
         let options = crate::poseidon::GameOptions {
             prefix: option(args, "--prefix"),
+            forest_proxy,
         };
         let mut files = vec![];
         let seed = s.seed;
