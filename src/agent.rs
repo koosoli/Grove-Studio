@@ -12,6 +12,8 @@ Mesh export: grove-studio --headless --preset solstice-oak --out exports/oak.p3d
 Mesh inspection: grove-studio --headless --inspect --preset solstice-birch
 Game LOD ladder (near/mid/far/very far, P3D): grove-studio --headless --preset solstice-cwa-buk
   --lod game --out exports/beech.p3d [--prefix PBO_PREFIX] [--forest-proxy] (also with --inspect)
+  [--no-trim-cards] [--budgets near,mid,far,veryfar] [--opaque-leaves [--budgets near,veryfar]]: opaque leaf pieces
+  in one near level for an engine that simplifies per cluster, plus the very far spray level
 Species file: --species-file species/forest/forest-beech.species --preset solstice-cwa-buk
   grows the preset from that text (forest-grown heights up to 40 m).
 PNG preview: grove-studio --headless --preview --out exports/forest.png --forest solstice-oak,solstice-fir
@@ -73,7 +75,7 @@ fn headless(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--headless" | "--inspect" | "--preview" | "--forest-proxy" => i += 1,
+            "--headless" | "--inspect" | "--preview" | "--forest-proxy" | "--opaque-leaves" | "--no-trim-cards" => i += 1,
             "--preset" | "--seed" | "--height" | "--density" | "--format" | "--lod" | "--count"
             | "--prefix" | "--species-file" | "--budgets"
             | "--config" | "--out" | "--season" | "--parallax-depth" | "--forest"
@@ -174,7 +176,14 @@ fn headless(args: &[String]) -> Result<(), String> {
     }
     let lod = option(args, "--lod").unwrap_or_else(|| "all".into());
     let game = lod == "game";
+    if !game && args.iter().any(|a| a == "--no-trim-cards") {
+        return Err("--no-trim-cards needs --lod game".into());
+    }
     let forest_proxy = args.iter().any(|a| a == "--forest-proxy");
+    let opaque_leaves = args.iter().any(|a| a == "--opaque-leaves");
+    if opaque_leaves && !game {
+        return Err("--opaque-leaves needs --lod game".into());
+    }
     if (forest_proxy || option(args, "--prefix").is_some()) && !game {
         return Err("--prefix and --forest-proxy need --lod game".into());
     }
@@ -189,10 +198,15 @@ fn headless(args: &[String]) -> Result<(), String> {
     };
     if game {
         if args.iter().any(|a| a == "--inspect") {
-            let ladder = match &budgets {
-                Some(b) => crate::gamelod::ladder_with(&s, &crate::gamelod::rungs_with_budgets(b)?),
-                None => crate::gamelod::ladder(&s),
+            let mut ladder = if opaque_leaves {
+                crate::gamelod::ladder_with(&s, &crate::gamelod::opaque_rungs(budgets.as_deref())?)
+            } else {
+                match &budgets {
+                    Some(b) => crate::gamelod::ladder_with(&s, &crate::gamelod::rungs_with_budgets(b)?),
+                    None => crate::gamelod::ladder(&s),
+                }
             };
+            if !args.iter().any(|a| a == "--no-trim-cards") { crate::gamelod::trim_cards(&mut ladder); }
             println!("{}", json!({"settings":s,"levels":crate::gamelod::stats(&ladder)}));
             return Ok(());
         }
@@ -209,6 +223,8 @@ fn headless(args: &[String]) -> Result<(), String> {
             prefix: option(args, "--prefix"),
             forest_proxy,
             budgets,
+            opaque_leaves,
+            trim_cards: !args.iter().any(|a| a == "--no-trim-cards"),
         };
         let mut files = vec![];
         let seed = s.seed;
@@ -353,7 +369,7 @@ pub fn tools_list() -> Value {
     json!({"tools":[
         {"name":"tree_presets","description":"List the available tree species and their default generation settings.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"tree_inspect","description":"Generate tree statistics for all detail levels without opening a window or writing files.","inputSchema":{"type":"object","properties":{"settings":schema()},"additionalProperties":false}},
-        {"name":"tree_generate","description":"Generate a deterministic tree and export glTF, OBJ or Poseidon P3D beneath the output root.","inputSchema":{"type":"object","properties":{"settings":schema(),"output":{"type":"string","description":"Relative output name, e.g. oak.p3d"},"format":{"type":"string","enum":["gltf","obj","p3d"]},"lod":{"type":"string","enum":["all","0","1","2"]}},"required":["output"],"additionalProperties":false}},
+        {"name":"tree_generate","description":"Generate a deterministic tree and export glTF, OBJ or Poseidon P3D beneath the output root.","inputSchema":{"type":"object","properties":{"settings":schema(),"output":{"type":"string","description":"Relative output name, e.g. oak.p3d"},"format":{"type":"string","enum":["gltf","obj","p3d"]},"lod":{"type":"string","enum":["all","0","1","2","game"]},"trimCards":{"type":"boolean","default":true,"description":"Trim alpha card outlines for game LOD P3D exports."}},"required":["output"],"additionalProperties":false}},
         {"name":"tree_preview","description":"Render a Solstice PNG and return measured visible triangle and cluster counts. Requires a compatible GPU, with no window.","inputSchema":{"type":"object","properties":{"settings":schema(),"output":{"type":"string","description":"Relative PNG filename"},"forest":{"type":"string","description":"Comma-separated species, e.g. solstice-oak,solstice-fir"},"lod":{"type":"string","enum":["auto","0","1","2"]},"view":{"type":"string","enum":["lit","clusters","triangles","gi","reflections","voxels","albedo","normals"]},"distance":{"type":"number","minimum":0.15,"maximum":500},"sky":{"type":"boolean"},"skybox":{"type":"string","enum":["clear","fair","broken","overcast","storm","cirrus"]},"windDirection":{"type":"number","minimum":0,"maximum":360},"treeCount":{"type":"integer","minimum":1,"maximum":1000},"ratios":{"type":"array","minItems":crate::preview::SPECIES.len(),"maxItems":crate::preview::SPECIES.len(),"items":{"type":"integer","minimum":0,"maximum":100}},"windTime":{"type":"number","minimum":0,"maximum":86400},"timeOfDay":{"type":"number","minimum":0,"maximum":24},"sunAzimuth":{"type":"number","minimum":0,"maximum":360}},"required":["output"],"additionalProperties":false}}
     ]})
 }
@@ -377,7 +393,7 @@ pub fn call_tool(name: &str, args: &Value, root: &Path) -> Result<Value, String>
     let allowed: &[&str] = match name {
         "tree_presets" => &[],
         "tree_inspect" => &["settings"],
-        "tree_generate" => &["settings", "output", "format", "lod"],
+        "tree_generate" => &["settings", "output", "format", "lod", "trimCards"],
             "tree_preview" => &[
             "settings",
             "output",
@@ -453,6 +469,17 @@ pub fn call_tool(name: &str, args: &Value, root: &Path) -> Result<Value, String>
         Some(v) => v.as_str().ok_or("lod must be a string")?,
         None => "all",
     };
+    if lod == "game" {
+        if format != "p3d" || rel.extension().and_then(|v| v.to_str()) != Some("p3d") {
+            return Err("Game LOD requires a .p3d output and p3d format".into());
+        }
+        let trim = args.get("trimCards").map(|v| v.as_bool().ok_or("trimCards must be a boolean")).transpose()?.unwrap_or(true);
+        check_outputs(Some(&root), std::iter::once(base.clone()).chain(crate::poseidon::game_sidecars(&base)))?;
+        let options = crate::poseidon::GameOptions { prefix: None, forest_proxy: false, budgets: None, opaque_leaves: false, trim_cards: trim };
+        let file = crate::poseidon::export_game(&s, &base, &options)?;
+        return Ok(json!({"ok":true,"files":[file]}));
+    }
+    if args.get("trimCards").is_some() { return Err("trimCards requires lod=game".into()); }
     let lods = parse_lods(lod)?;
     let files = export_lods(&s, &lods, format, &base, None, Some(&root))?;
     Ok(json!({"ok":true,"files":files}))

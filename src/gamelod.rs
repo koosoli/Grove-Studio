@@ -43,6 +43,10 @@ pub enum LeafStyle {
     Clusters,
     /// The mid level's spray cards plus thinned source pieces (conifers up close).
     PiecesOverSprays,
+    /// The source leaf pieces themselves, thinned with their area kept, opaque: their outline is
+    /// their geometry, so no alpha test. For an engine that simplifies the whole tree per cluster
+    /// (OpenPoseidon GROVE-OPAQUE, `--opaque-leaves`), as Solstice draws its own trees.
+    Opaque,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -152,6 +156,107 @@ pub struct Ladder {
     pub atlas: Vec<u8>,
 }
 
+/// Clip alpha cards to a padded convex hull of the base atlas alpha. Opaque pieces are kept.
+/// Clipping each source triangle separately preserves folds and interpolates its attributes.
+/// Coarse mipmaps, compression and vertex-driven wind can still change the image.
+pub fn trim_cards(ladder: &mut Ladder) {
+    let regions: Vec<_> = (0..4).map(|i| (i as f32 / 4., (i + 1) as f32 / 4., CUTOUT))
+        .chain(SPRAY_U.into_iter().map(|(a,b)| (a,b,SPRAY))).collect();
+    let hulls: Vec<_> = regions.iter().map(|&(u0,u1,(v0,v1))| {
+        let mut points = Vec::new();
+        for y in (v0 * ATLAS as f32) as u32..((v1 * ATLAS as f32).ceil() as u32).min(ATLAS) {
+            for x in (u0 * ATLAS as f32) as u32..((u1 * ATLAS as f32).ceil() as u32).min(ATLAS) {
+                if ladder.atlas[((y * ATLAS + x) * 4 + 3) as usize] != 0 {
+                    // Four texels cover base-level filtering and most BC3 block spread.
+                    for (dx,dy) in [(-4.,-4.), (5.,-4.), (5.,5.), (-4.,5.)] {
+                        points.push(vec2((x as f32 + dx) / ATLAS as f32, (y as f32 + dy) / ATLAS as f32));
+                    }
+                }
+            }
+        }
+        points.sort_by(|a,b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+        points.dedup();
+        fn cross(a: Vec2,b: Vec2,c: Vec2) -> f32 { (b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x) }
+        let mut hull = Vec::new();
+        for &p in &points {
+            while hull.len() >= 2 && cross(hull[hull.len()-2], hull[hull.len()-1], p) <= 0. { hull.pop(); }
+            hull.push(p);
+        }
+        let lower = hull.len();
+        for &p in points.iter().rev().skip(1) {
+            while hull.len() > lower && cross(hull[hull.len()-2], hull[hull.len()-1], p) <= 0. { hull.pop(); }
+            hull.push(p);
+        }
+        if hull.len() > 1 { hull.pop(); }
+        if hull.len() < 3 { return Vec::new(); }
+        // Intersect eight support half-planes around the hull. This contains every alpha texel
+        // while bounding tessellation regardless of how irregular the baked texture is.
+        let mut outline = vec![vec2(-1.,-1.), vec2(2.,-1.), vec2(2.,2.), vec2(-1.,2.)];
+        for k in 0..8 {
+            let angle = k as f32 * std::f32::consts::FRAC_PI_4;
+            let normal = vec2(angle.cos(), angle.sin());
+            let limit = hull.iter().map(|p| p.dot(normal)).fold(f32::NEG_INFINITY, f32::max);
+            let input = std::mem::take(&mut outline);
+            let mut previous = *input.last().unwrap();
+            let mut dp = limit - previous.dot(normal);
+            for current in input {
+                let dc = limit - current.dot(normal);
+                if (dp >= 0.) != (dc >= 0.) { outline.push(previous.lerp(current, dp / (dp-dc))); }
+                if dc >= 0. { outline.push(current); }
+                previous = current; dp = dc;
+            }
+        }
+        outline
+    }).collect();
+    for level in ladder.levels.iter_mut().skip(1) {
+        let old = std::mem::take(&mut level.leaves);
+        let mut result = Part::default();
+        for tri in old.i.chunks_exact(3) {
+            let vertices = [old.v[tri[0] as usize], old.v[tri[1] as usize], old.v[tri[2] as usize]];
+            let uv = (vertices[0].uv + vertices[1].uv + vertices[2].uv) / 3.;
+            let region = if (CUTOUT.0..=CUTOUT.1).contains(&uv.y) {
+                Some(((uv.x * 4.) as usize).min(3))
+            } else if (SPRAY.0..=SPRAY.1).contains(&uv.y) {
+                Some(4 + usize::from(uv.x >= 0.5))
+            } else { None };
+            let mut polygon = vertices.to_vec();
+            if let Some(hull) = region.map(|i| &hulls[i]).filter(|h| h.len() >= 3) {
+                for edge in 0..hull.len() {
+                    let a = hull[edge]; let b = hull[(edge + 1) % hull.len()];
+                    let side = |p: Vec2| (b.x-a.x)*(p.y-a.y)-(b.y-a.y)*(p.x-a.x);
+                    let input = std::mem::take(&mut polygon);
+                    if input.is_empty() { break; }
+                    let mut previous = *input.last().unwrap();
+                    let mut dp = side(previous.uv);
+                    for current in input {
+                        let dc = side(current.uv);
+                        if (dp >= 0.) != (dc >= 0.) {
+                            let t = dp / (dp - dc);
+                            polygon.push(V { p: previous.p.lerp(current.p,t), n: previous.n.lerp(current.n,t),
+                                uv: previous.uv.lerp(current.uv,t), c: std::array::from_fn(|i| previous.c[i] + (current.c[i]-previous.c[i])*t) });
+                        }
+                        if dc >= 0. { polygon.push(current); }
+                        previous = current; dp = dc;
+                    }
+                }
+                polygon.dedup_by(|a,b| a.uv.distance_squared(b.uv) < 1e-14);
+                if polygon.len() > 1 && polygon[0].uv.distance_squared(polygon[polygon.len()-1].uv) < 1e-14 { polygon.pop(); }
+            }
+            if polygon.len() >= 3 {
+                let base = result.v.len() as u32;
+                for i in 1..polygon.len()-1 {
+                    let a = polygon[i].uv - polygon[0].uv; let b = polygon[i+1].uv - polygon[0].uv;
+                    if region.is_none() || (a.x*b.y-a.y*b.x).abs() > 1e-12 {
+                        result.i.extend([base, base+i as u32, base+i as u32+1]);
+                    }
+                }
+                result.v.extend(polygon);
+            }
+        }
+        level.leaves = result;
+    }
+}
+
 pub fn ladder(s: &Settings) -> Ladder {
     ladder_with(s, &LADDER)
 }
@@ -172,7 +277,28 @@ pub fn rungs_with_budgets(budgets: &[usize]) -> Result<[Rung; 4], String> {
     Ok(rungs)
 }
 
-pub fn ladder_with(s: &Settings, rungs: &[Rung; 4]) -> Ladder {
+/// The two-level ladder of `--opaque-leaves`: a near level of opaque leaf pieces that the engine
+/// reduces per cluster with distance, and the very far spray-card level for shadows and the far
+/// forest hand-over. `budgets` = (near, very far) single-sided triangles.
+pub fn opaque_rungs(budgets: Option<&[usize]>) -> Result<[Rung; 2], String> {
+    let mut near = LADDER[0];
+    near.name = "near (opaque)";
+    near.broadleaf = LeafStyle::Opaque;
+    near.needles = LeafStyle::Opaque;
+    let mut far = LADDER[3];
+    if let Some(b) = budgets {
+        if b.len() != 2 || b[1] >= b[0] || b[1] < 200 {
+            return Err("--budgets with --opaque-leaves wants two shrinking triangle counts (near, very far)".into());
+        }
+        near.wood = (near.wood as f64 * b[0] as f64 / near.budget as f64).round().max(60.) as usize;
+        near.budget = b[0];
+        far.wood = (far.wood as f64 * b[1] as f64 / far.budget as f64).round().max(60.) as usize;
+        far.budget = b[1];
+    }
+    Ok([near, far])
+}
+
+pub fn ladder_with(s: &Settings, rungs: &[Rung]) -> Ladder {
     let mut full = crate::tree::generate(s, 0);
     // The origin is the trunk's foot, not the lowest point of the wood: a fir's lowest whorls
     // droop below where its trunk starts, and the far levels drop them.
@@ -197,7 +323,8 @@ pub fn ladder_with(s: &Settings, rungs: &[Rung; 4]) -> Ladder {
     let card_scale = if needles { 1.0 } else { 0.65 };
     // The sprays are baked once, from clusters of the size the far level uses, and scaled for
     // every level that draws them.
-    let bake = cluster(&leaves, rungs[2].budget * 3 / 4 / 6, card_scale);
+    let bake_budget = if rungs.len() > 2 { rungs[2].budget } else { LADDER[2].budget };
+    let bake = cluster(&leaves, bake_budget * 3 / 4 / 6, card_scale);
     if !bake.is_empty() {
         bake_sprays(&mut atlas, &colors, &full.leaves, pieces, &leaves, &bake);
     }
@@ -210,11 +337,12 @@ pub fn ladder_with(s: &Settings, rungs: &[Rung; 4]) -> Ladder {
             LeafStyle::Folded => cards(&leaves, left, true),
             LeafStyle::Flat => cards(&leaves, left, false),
             LeafStyle::Clusters => spray_cards(&leaves, &cluster(&leaves, left / 6, card_scale), crown),
+            LeafStyle::Opaque => opaque_pieces(&full.leaves, pieces, left),
             LeafStyle::PiecesOverSprays => {
                 // the mid level's spray cards as the body of the crown, and needle fans in the
                 // rest of the budget for the close-up detail: near hands over to mid without
                 // the crown thinning out
-                let body = rungs[1].budget * 3 / 4;
+                let body = rungs.get(1).map_or(LADDER[1].budget, |r| r.budget) * 3 / 4;
                 let mut part = spray_cards(&leaves, &cluster(&leaves, body / 6, card_scale), crown);
                 let fans = thin_pieces(&full.leaves, pieces, left.saturating_sub(body));
                 let first = part.v.len() as u32;
@@ -335,6 +463,43 @@ fn thin_pieces(part: &Part, verts: usize, budget: usize) -> Part {
         let ccw = (b - a).cross(c - a).dot(piece[0].n) >= 0.;
         out.i
             .extend(if ccw { [first, first + 1, first + 2] } else { [first, first + 2, first + 1] });
+    }
+    out
+}
+
+/// The source leaf pieces (`verts` vertices each, their own triangles), every n-th kept and grown
+/// about its centre so the kept ones cover what all of them covered; UVs into the opaque band.
+fn opaque_pieces(part: &Part, verts: usize, budget: usize) -> Part {
+    let count = part.v.len() / verts;
+    if count == 0 {
+        return Part::default();
+    }
+    let mut tris: Vec<Vec<[u32; 3]>> = vec![Vec::new(); count];
+    for t in part.i.chunks_exact(3) {
+        let k = t[0] as usize / verts;
+        if k < count && t.iter().all(|&i| i as usize / verts == k) {
+            tris[k].push([t[0], t[1], t[2]]);
+        }
+    }
+    let each = (part.i.len() / 3).div_ceil(count).max(1);
+    let (n, grow) = stride(count, each, budget);
+    let mut out = Part::default();
+    for (k, piece) in part.v.chunks_exact(verts).enumerate() {
+        if k % n != 0 || tris[k].is_empty() {
+            continue;
+        }
+        let center = piece.iter().map(|v| v.p).sum::<Vec3>() / verts as f32;
+        let first = out.v.len() as u32;
+        for v in piece {
+            let mut v = *v;
+            v.p = center + (v.p - center) * grow;
+            v.uv = vec2(v.uv.x, uv_in(OPAQUE, v.uv.y));
+            out.v.push(v);
+        }
+        let base = (k * verts) as u32;
+        for t in &tris[k] {
+            out.i.extend(t.iter().map(|i| i - base + first));
+        }
     }
     out
 }
@@ -820,6 +985,25 @@ fn raster(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trimming_preserves_opaque_pieces_and_clips_empty_card_corners() {
+        let vertex = |u: f32, v: f32| V { p: Vec3::new(u, v, 0.), n: Vec3::Z, uv: vec2(u,v), c: [1.; 4] };
+        let mut atlas = vec![0; (ATLAS * ATLAS * 4) as usize];
+        for y in 170..190 { for x in 45..75 { atlas[((y * ATLAS + x) * 4 + 3) as usize] = 255; } }
+        let leaves = Part { v: vec![vertex(0.01, CUTOUT.0), vertex(0.24, CUTOUT.0), vertex(0.24, CUTOUT.1), vertex(0.01, CUTOUT.1),
+                                      vertex(0.01, OPAQUE.0), vertex(0.1, OPAQUE.0), vertex(0.1, OPAQUE.1)],
+                            i: vec![0,1,2, 0,2,3, 4,5,6] };
+        let mut ladder = Ladder { atlas, levels: vec![Level { rung: LADDER[0], bark: Part::default(), leaves: Part::default() }, Level { rung: LADDER[1], bark: Part::default(), leaves }] };
+        trim_cards(&mut ladder);
+        let out = &ladder.levels[1].leaves;
+        assert!(out.i.len() >= 9);
+        assert!(out.v.iter().any(|v| v.uv.y == OPAQUE.0));
+        for v in out.v.iter().filter(|v| v.uv.y >= CUTOUT.0) {
+            assert!(v.uv.x >= 40. / ATLAS as f32 && v.uv.x <= 80. / ATLAS as f32);
+            assert!(v.p.distance(Vec3::new(v.uv.x, v.uv.y, 0.)) < 1e-6);
+        }
+    }
 
     #[test]
     fn every_rung_meets_its_budget_and_keeps_the_ground_origin() {
