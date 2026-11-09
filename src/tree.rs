@@ -15,6 +15,11 @@ pub fn bark_texture(s: &Settings) -> &'static [u8] {
     &bark(s).color
 }
 
+/// The bark cavity, one byte per texel of `bark_texture` (see reference::BarkImages).
+pub fn bark_cavity(s: &Settings) -> &'static [u8] {
+    &bark(s).cavity
+}
+
 pub fn leaf_color(s: &Settings, variant: usize) -> [f32; 4] {
     let t = variant as f32 / 3.;
     let palette = crate::reference::palette(s);

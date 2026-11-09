@@ -277,7 +277,8 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
             })
             .map_err(|err| err.to_string())
     };
-    let bark_pixels = load(tree::bark_texture(s))?;
+    let mut bark_pixels = load(tree::bark_texture(s))?;
+    fold_cavity(&mut bark_pixels, tree::bark_cavity(s));
     let (_, normal_bytes) = tree::relief_textures(s);
     let mut bark_normal = load(normal_bytes)?;
     for p in bark_normal.pixels_mut() {
@@ -487,6 +488,23 @@ fn trunk_collision(s: &Settings) -> Part {
         part.i.extend([0, j, j + 1, 8, j + 9, j + 8]);
     }
     part
+}
+
+/// The game ladder's bark albedo with Solstice's cavity folded in. Solstice darkens the indirect
+/// light by mix(1, cavity, 0.7) (deferred.wgsl); a game whose bark has no cavity channel lights the
+/// furrows like the ridges, so the bark reads flat and pale under a canopy, where nearly all the light
+/// is indirect. The same factor on the albedo (in linear light) keeps the furrows dark there.
+fn fold_cavity(color: &mut RgbaImage, cavity: &[u8]) {
+    if cavity.len() != (color.width() * color.height()) as usize {
+        return;
+    }
+    for (p, &c) in color.pixels_mut().zip(cavity) {
+        let k = 1.0 - 0.7 * (1.0 - c as f32 / 255.0);
+        for ch in &mut p.0[..3] {
+            let linear = (*ch as f32 / 255.0).powf(2.2) * k;
+            *ch = (linear.powf(1.0 / 2.2) * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
 }
 
 fn paa(mut image: RgbaImage, compression: CompressionVariant, alpha: bool) -> Vec<u8> {
