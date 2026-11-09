@@ -393,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "grove-studio"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "block_compression",
  "glam 0.30.10",

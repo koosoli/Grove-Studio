@@ -531,6 +531,8 @@ struct Editor {
     path: String,
     format: String,
     all_lods: bool,
+    game_lods: bool,
+    trim_cards: bool,
     path_focus: bool,
     status: String,
     status_until: f64,
@@ -579,6 +581,8 @@ impl Editor {
             path: "exports/oak.gltf".into(),
             format: "gltf".into(),
             all_lods: true,
+            game_lods: false,
+            trim_cards: true,
             path_focus: false,
             status: "Ready. Make something that grows.".into(),
             status_until: 0.,
@@ -669,6 +673,14 @@ impl Editor {
         let base = Path::new(&self.path);
         if base.as_os_str().is_empty() {
             return Err("Enter an output filename.".into());
+        }
+        if self.format == "p3d" && self.game_lods {
+            if base.extension().and_then(|s| s.to_str()) != Some("p3d") {
+                return Err("Game LOD export needs a .p3d filename.".into());
+            }
+            let options = crate::poseidon::GameOptions { prefix: None, forest_proxy: false, budgets: None, opaque_leaves: false, trim_cards: self.trim_cards };
+            crate::poseidon::export_game(&self.s, base, &options)?;
+            return Ok(vec![base.to_path_buf()]);
         }
         let lods = if self.all_lods {
             vec![0, 1, 2]
@@ -2223,7 +2235,9 @@ fn modal(ui: &Ui, e: &mut Editor, m: Modal) {
             }
         }
         if ui.button(
-            if e.all_lods {
+            if e.format == "p3d" && e.game_lods { "[x]  Game LOD ladder (alpha cards)" }
+            else if e.format == "p3d" { "[ ]  Game LOD ladder (alpha cards)" }
+            else if e.all_lods {
                 "[x]  Export all three detail levels"
             } else {
                 "[ ]  Export all three detail levels"
@@ -2231,23 +2245,32 @@ fn modal(ui: &Ui, e: &mut Editor, m: Modal) {
             Rect::new(442., 491., 554., 33.),
             0,
         ) {
-            e.all_lods = !e.all_lods
+            if e.format == "p3d" { e.game_lods = !e.game_lods; } else { e.all_lods = !e.all_lods; }
         }
+        if e.format == "p3d" && e.game_lods && ui.button(
+            if e.trim_cards { "[x]  Trim transparent card edges" } else { "[ ]  Trim transparent card edges" },
+            Rect::new(442., 525., 554., 25.), 0) { e.trim_cards = !e.trim_cards; }
+        if e.format == "p3d" && !e.game_lods && ui.button(
+            if e.all_lods { "[x]  Export all three detail levels" } else { "[ ]  Export all three detail levels" },
+            Rect::new(442., 525., 554., 25.), 0) { e.all_lods = !e.all_lods; }
         ui.text(
             match e.format.as_str() {
                 "gltf" => "Includes a .bin buffer per model. Keep it beside the .gltf file.",
+                "p3d" if e.game_lods => "Game cards are not shown in the current Solstice preview.",
                 "p3d" => "One native model with texture, material and packing sidecars.",
                 _ => "Includes a material file. Import foliage as double sided.",
             },
             442.,
-            547.,
+            560.,
             12.,
             muted(),
         );
         ui.text(
-            "Files with the same names will be replaced.",
+            if e.format == "p3d" && e.game_lods && e.trim_cards {
+                "Trimming increases triangle counts; measure performance in game."
+            } else { "Files with the same names will be replaced." },
             442.,
-            569.,
+            580.,
             11.,
             muted(),
         );

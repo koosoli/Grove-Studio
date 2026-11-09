@@ -24,6 +24,14 @@ pub fn sidecars(path: &Path) -> [PathBuf; 7] {
     SIDECARS.map(|name| path.with_extension(name))
 }
 
+pub fn game_sidecars(path: &Path) -> Vec<PathBuf> {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+    let dir = path.parent().unwrap_or(Path::new("."));
+    ["bark_co.paa", "bark_co_nohq.paa", "leaves_ca.paa", "leaves_ca_nohq.paa",
+     "leaves_co.paa", "leaves_co_nohq.paa", "bark.rvmat", "leaves.rvmat", "poseidon.json"]
+        .iter().map(|suffix| dir.join(format!("{stem}_{suffix}"))).collect()
+}
+
 fn name(path: &Path) -> Result<&str, String> {
     let name = path
         .file_stem()
@@ -149,6 +157,8 @@ pub struct GameOptions {
     /// per cluster with distance (GROVE-OPAQUE), and the very far spray level, which casts the
     /// shadows (`shadowcoarser`) and stands for the tree in the far forest.
     pub opaque_leaves: bool,
+    /// Trim alpha-card outlines using the generated atlas.
+    pub trim_cards: bool,
 }
 
 /// The native Poseidon tree with the game LOD ladder (near, mid, far, very far; see gamelod.rs)
@@ -184,7 +194,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
         texture: reference(&leaves),
         material: String::new(),
     };
-    let ladder = if options.opaque_leaves {
+    let mut ladder = if options.opaque_leaves {
         crate::gamelod::ladder_with(s, &crate::gamelod::opaque_rungs(options.budgets.as_deref())?)
     } else {
         match &options.budgets {
@@ -192,6 +202,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
             None => crate::gamelod::ladder(s),
         }
     };
+    if options.trim_cards { crate::gamelod::trim_cards(&mut ladder); }
     let opaque_leaves = file("leaves_co.paa");
     let opaque_leaves_n = file("leaves_co_nohq.paa");
     let opaque_surface = Surface {
@@ -297,7 +308,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
     let asset = json!({
         "path": path, "format": "MLOD 1.1 / P3DM", "settings": s,
         "pboPrefix": prefix, "model": reference(path), "levels": counts,
-        "forestProxy": options.forest_proxy, "opaqueLeaves": options.opaque_leaves,
+        "forestProxy": options.forest_proxy, "opaqueLeaves": options.opaque_leaves, "trimCards": options.trim_cards,
         "geometryLod": "Convex trunk collision",
         "wind": {"map":"tree","height":"model-space Y, meters"},
         "sidecars": [&bark, &bark_n, &leaves, &leaves_n, &bark_mat, &leaf_mat],
@@ -530,6 +541,7 @@ mod tests {
             forest_proxy: true,
             budgets: None,
             opaque_leaves: false,
+            trim_cards: true,
         };
         export_game(&s, &path, &options).unwrap();
         let model = std::fs::read(&path).unwrap();
@@ -556,6 +568,7 @@ mod tests {
             forest_proxy: true,
             budgets: Some(vec![40_000, 400]),
             opaque_leaves: true,
+            trim_cards: true,
         };
         let asset = export_game(&s, &path, &options).unwrap();
         assert_eq!(asset["levels"].as_array().unwrap().len(), 2);
