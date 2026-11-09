@@ -50,6 +50,8 @@ pub struct PassView {
     /// anywhere along the line from it away from the light.
     pub eye_light: Vec3,
     pub wind_time: f32,
+    pub wind_parameters: Vec4,
+    pub wind_dynamics: Vec4,
 }
 
 /// Which instances a view draws. Twin of the `INSTANCES_` constants in `vg/pass_view.wgsl`.
@@ -121,6 +123,8 @@ impl PassView {
             receiver_planes: [Vec4::ZERO; 6],
             eye_light: Vec3::Y,
             wind_time: 0.0,
+            wind_parameters: Vec4::ZERO,
+            wind_dynamics: Vec4::ZERO,
         }
     }
 

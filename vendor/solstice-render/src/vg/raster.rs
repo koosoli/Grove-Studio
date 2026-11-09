@@ -110,6 +110,11 @@ impl Rasterizer {
             .storage_read()
             .storage_read()
             .storage_read()
+            .storage_read()
+            .sampler()
+            .texture_array()
+            .texture_array()
+            .texture_array()
             .build(gpu, "raster");
         let vis_layout = LayoutBuilder::new()
             .visibility(wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT)
@@ -318,6 +323,11 @@ impl Rasterizer {
                     scene.triangles.as_entire_binding(),
                     work.visible.as_entire_binding(),
                     work.state().as_entire_binding(),
+                    scene.materials.as_entire_binding(),
+                    wgpu::BindingResource::Sampler(&scene.material_sampler),
+                    wgpu::BindingResource::TextureView(&scene.textures.base.color_view),
+                    wgpu::BindingResource::TextureView(&scene.textures.middle.color_view),
+                    wgpu::BindingResource::TextureView(&scene.textures.top.color_view),
                 ],
             ),
         }

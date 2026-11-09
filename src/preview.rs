@@ -27,6 +27,12 @@ pub struct SceneKey {
     pub grid: bool,
     pub bark: bool,
     pub leaves: bool,
+    pub game_cards: bool,
+    pub trim_cards: bool,
+    pub random_mix: bool,
+    pub leaf_specular: bool,
+    pub leaf_roughness: f32,
+    pub leaf_transmission: f32,
 }
 
 pub const SPECIES: [&str; crate::catalog::IDS.len()] = crate::catalog::IDS;
@@ -146,6 +152,11 @@ pub struct Request {
     pub debug: DebugView,
     pub wind_time: Option<f32>,
     pub wind_direction: f32,
+    pub wind_strength: f32,
+    pub wind_gust: f32,
+    pub leaf_flutter: f32,
+    pub branch_sway: f32,
+    pub branch_springiness: f32,
     pub sky: bool,
     pub skybox: Weather,
     pub lighting: Lighting,
@@ -351,6 +362,8 @@ fn run_worker(
         renderer.settings_mut().vegetation_wind = request
             .wind_time
             .map(|t| t % 10000. + ((request.wind_direction / 22.5).round() % 16.) * 10000.);
+        renderer.settings_mut().vegetation_wind_parameters = glam::Vec4::new(request.wind_strength, request.wind_gust, request.leaf_flutter, request.branch_sway);
+        renderer.settings_mut().vegetation_wind_dynamics = glam::Vec4::new(request.branch_springiness, 0., 0., 0.);
         renderer.settings_mut().show_sky = request.sky;
         renderer.settings_mut().clouds = request.sky;
         // A fixed skybox: the renderer's own weather cycle stays off while the editor drives it.
@@ -441,6 +454,42 @@ fn to_mesh(part: &Part) -> Mesh {
             .collect(),
         indices: part.i.clone(),
     }
+}
+
+/// Give each disconnected preview leaf a stable phase without changing its fractional atlas UV.
+/// The renderer's repeat sampler keeps the same texture; game exports never use this encoding.
+fn foliage_mesh(part: &Part, game_cards: bool) -> Mesh {
+    let mut parent: Vec<usize> = (0..part.v.len()).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i { parent[i] = parent[parent[i]]; i = parent[i]; }
+        i
+    }
+    for triangle in part.i.chunks_exact(3) {
+        let a = root(&mut parent, triangle[0] as usize);
+        for &index in &triangle[1..] {
+            let b = root(&mut parent, index as usize);
+            if a != b { parent[b] = a; }
+        }
+    }
+    let mut anchors = vec![None::<usize>; part.v.len()];
+    for i in 0..part.v.len() {
+        let r = root(&mut parent, i);
+        if anchors[r].is_none_or(|old| part.v[i].uv.y < part.v[old].uv.y) { anchors[r] = Some(i); }
+    }
+    let mut mesh = to_mesh(part);
+    for i in 0..part.v.len() {
+        let r = root(&mut parent, i);
+        if let Some(anchor) = anchors[r] {
+            let p = part.v[anchor].p;
+            let x = (p.x * 1000.).round() as i32 as u32;
+            let y = (p.y * 1000.).round() as i32 as u32;
+            let z = (p.z * 1000.).round() as i32 as u32;
+            let hash = x.wrapping_mul(0x9e3779b1) ^ y.wrapping_mul(0x85ebca6b) ^ z.wrapping_mul(0xc2b2ae35);
+            let phase = ((hash ^ (hash >> 16)) % 16) as f32;
+            mesh.vertices[i].uv.x += phase + if game_cards { 0. } else { 16. };
+        }
+    }
+    mesh
 }
 
 fn layer(color: Vec<u8>, normal: Vec<u8>, data: Vec<u8>) -> TextureLayer {
@@ -541,6 +590,20 @@ pub fn place_forest(count: u32, weights: &[u32], spacing: f32) -> Vec<(usize, Ma
     out
 }
 
+/// Shuffle assigned species, preserving the exact weighted counts and tree positions.
+pub fn shuffle_forest(placed: &mut [(usize, Mat4)], seed: u32) {
+    let mut state = u64::from(seed) ^ 0x9e3779b97f4a7c15;
+    for i in (1..placed.len()).rev() {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let j = (state.wrapping_mul(0x2545f4914f6cdd1d) % (i as u64 + 1)) as usize;
+        let k = placed[i].0;
+        placed[i].0 = placed[j].0;
+        placed[j].0 = k;
+    }
+}
+
 /// How many species assets to keep. Editing a tree's settings makes new ones, so the cache is
 /// cleared when it grows past this, instead of growing without limit.
 const SPECIES_CACHE_LIMIT: usize = 64;
@@ -566,14 +629,16 @@ pub fn build_progress() -> (u32, u32) {
 }
 
 /// The species' geometry and textures, grown and meshed on first use and reused after that.
-fn species_asset(settings: &Settings, lod: u32) -> Result<SpeciesAsset, String> {
-    let key = format!("{settings:?}|{lod}");
+fn species_asset(settings: &Settings, lod: u32, game_cards: bool, trim_cards: bool, leaf_specular: bool, leaf_roughness: f32, leaf_transmission: f32) -> Result<SpeciesAsset, String> {
+    let key = format!("{settings:?}|{lod}|{game_cards}|{trim_cards}|{leaf_specular}|{leaf_roughness}|{leaf_transmission}");
     let cache = SPECIES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(hit) = cache.lock().map_err(|e| e.to_string())?.get(&key) {
         return Ok(hit.clone());
     }
     let started = std::time::Instant::now();
-    let tree = tree::generate(settings, lod);
+    let mut game = game_cards.then(|| crate::gamelod::ladder(settings));
+    if trim_cards { if let Some(ladder) = game.as_mut() { crate::gamelod::trim_cards(ladder); } }
+    let tree = tree::generate(settings, lod.min(2));
     crate::log::log(format!(
         "Solstice: grew {} LOD {lod} in {:.2} s ({} triangles)",
         settings.species,
@@ -583,24 +648,30 @@ fn species_asset(settings: &Settings, lod: u32) -> Result<SpeciesAsset, String> 
     let opts = BuildOptions::default();
     let part = |foliage: bool, data: &Part| -> Result<(VirtualMesh, TextureLayer, Material), String> {
         let meshing = std::time::Instant::now();
-        let mesh = build_virtual_mesh(&to_mesh(data), &opts);
+        let source = if foliage { foliage_mesh(data, game_cards) } else { to_mesh(data) };
+        let mesh = build_virtual_mesh(&source, &opts);
         crate::log::log(format!(
             "Solstice: {} {} meshed in {:.2} s",
             settings.species,
             if foliage { "leaves" } else { "bark" },
             meshing.elapsed().as_secs_f32()
         ));
-        let layer = if foliage {
+        let layer = if foliage && game_cards {
+            let atlas = image::RgbaImage::from_raw(crate::gamelod::ATLAS, crate::gamelod::ATLAS, game.as_ref().unwrap().atlas.clone()).unwrap();
+            let color = image::imageops::resize(&atlas, TEX_SIZE, TEX_SIZE, FilterType::Triangle).into_raw();
+            let n = (TEX_SIZE * TEX_SIZE * 2) as usize;
+            layer(color, vec![128; n], vec![128; n])
+        } else if foliage {
             leaf_layer(settings)
         } else {
             bark_layer(settings)?
         };
         let material = Material {
             base_color: [1.; 4],
-            roughness: if foliage { 0.78 } else { 0.92 },
+            roughness: if foliage { leaf_roughness } else { 0.92 },
             flags: solstice_render::scene::MATERIAL_WIND
                 | if foliage {
-                    Material::TWO_SIDED | Material::FOLIAGE
+                    Material::TWO_SIDED | Material::FOLIAGE | 128 | ((leaf_transmission * 100.).round() as u32) << 16 | if game_cards { solstice_render::scene::MATERIAL_ALPHA_TEST } else { 0 } | if !leaf_specular { solstice_render::scene::MATERIAL_NO_SPECULAR } else { 0 }
                 } else {
                     ((settings.parallax_depth * 1000.).round() as u32) << 8
                 },
@@ -610,9 +681,13 @@ fn species_asset(settings: &Settings, lod: u32) -> Result<SpeciesAsset, String> 
         };
         Ok((mesh, layer, material))
     };
+    let (bark, leaves) = if let Some(ref ladder) = game {
+        let level = &ladder.levels[(lod as usize).min(ladder.levels.len()-1)];
+        (&level.bark, &level.leaves)
+    } else { (&tree.bark, &tree.leaves) };
     let asset = SpeciesAsset {
-        bark: part(false, &tree.bark)?,
-        leaves: part(true, &tree.leaves)?,
+        bark: part(false, bark)?,
+        leaves: part(true, leaves)?,
     };
     let mut cache = cache.lock().map_err(|e| e.to_string())?;
     if cache.len() >= SPECIES_CACHE_LIMIT {
@@ -684,7 +759,7 @@ fn build_scene(key: &SceneKey) -> Result<LoadedScene, String> {
     BUILD_TOTAL.store(trees.len() as u32, Ordering::Relaxed);
     BUILD_DONE.store(0, Ordering::Relaxed);
     for settings in &trees {
-        let asset = species_asset(settings, key.lod.unwrap_or(0))?;
+        let asset = species_asset(settings, key.lod.unwrap_or(0), key.game_cards, key.trim_cards, key.leaf_specular, key.leaf_roughness, key.leaf_transmission)?;
         let first = scene.meshes.len() as u32;
         for (mesh, layer, material) in [&asset.bark, &asset.leaves] {
             scene.meshes.push(mesh.clone());
@@ -720,7 +795,9 @@ fn build_scene(key: &SceneKey) -> Result<LoadedScene, String> {
             .filter(|(index, _)| key.forest & (1 << index) != 0)
             .map(|(index, _)| key.ratios[index])
             .collect();
-        for (kind, transform) in place_forest(key.count, &weights, spacing) {
+        let mut placed = place_forest(key.count, &weights, spacing);
+        if key.random_mix { shuffle_forest(&mut placed, key.settings.seed); }
+        for (kind, transform) in placed {
             place(assets[kind], transform);
         }
     }
@@ -732,13 +809,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn foliage_phase_is_shared_within_each_piece_and_keeps_atlas_coordinates() {
+        let v = |x: f32, u: f32, v: f32| crate::tree::V { p: macroquad::prelude::vec3(x, v, 0.), n: macroquad::prelude::Vec3::Y, uv: macroquad::prelude::vec2(u,v), c: [1.;4] };
+        let part = Part { v: vec![v(0.,0.1,0.),v(0.1,0.2,0.),v(0.05,0.15,1.),v(2.,0.1,0.),v(2.1,0.2,0.),v(2.05,0.15,1.)], i: vec![0,1,2,3,4,5] };
+        let mesh = foliage_mesh(&part, false);
+        for group in mesh.vertices.chunks_exact(3) {
+            assert_eq!(group[0].uv.x.floor(), group[1].uv.x.floor());
+            assert_eq!(group[1].uv.x.floor(), group[2].uv.x.floor());
+        }
+        assert_ne!(mesh.vertices[0].uv.x.floor(), mesh.vertices[3].uv.x.floor());
+        for (original, encoded) in part.v.iter().zip(&mesh.vertices) {
+            assert!((original.uv.x - encoded.uv.x.fract()).abs() < 0.00001);
+        }
+    }
+
+    #[test]
     fn species_assets_are_reused_not_rebuilt() {
         let s = Settings::preset("solstice-bush").unwrap();
         let first = std::time::Instant::now();
-        species_asset(&s, 2).unwrap();
+        species_asset(&s, 2, false, false, true, 0.55, 0.8).unwrap();
         let first = first.elapsed();
         let again = std::time::Instant::now();
-        species_asset(&s, 2).unwrap();
+        species_asset(&s, 2, false, false, true, 0.55, 0.8).unwrap();
         assert!(again.elapsed() < first / 2 + std::time::Duration::from_millis(5), "first {first:?}, again {:?}", again.elapsed());
     }
 
@@ -753,6 +845,18 @@ mod tests {
         }
         assert!(place_forest(10, &[0, 0], 6.).is_empty());
         assert_eq!(place_forest(50, &[1, 1], 6.), place_forest(50, &[1, 1], 6.));
+    }
+
+    #[test]
+    fn random_mix_is_repeatable_and_preserves_shares_and_positions() {
+        let ordered = place_forest(40, &[3, 1], 6.);
+        let mut a = ordered.clone();
+        let mut b = ordered.clone();
+        shuffle_forest(&mut a, 42); shuffle_forest(&mut b, 42);
+        assert_eq!(a, b);
+        assert_ne!(a, ordered);
+        assert_eq!(a.iter().filter(|(k, _)| *k == 0).count(), 30);
+        assert!(a.iter().zip(&ordered).all(|(a,b)| a.1 == b.1));
     }
 
     #[test]

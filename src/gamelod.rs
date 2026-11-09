@@ -211,7 +211,9 @@ pub fn trim_cards(ladder: &mut Ladder) {
     for level in ladder.levels.iter_mut().skip(1) {
         let old = std::mem::take(&mut level.leaves);
         let mut result = Part::default();
-        for tri in old.i.chunks_exact(3) {
+        let mut offset = 0;
+        while offset + 2 < old.i.len() {
+            let tri = &old.i[offset..offset + 3];
             let vertices = [old.v[tri[0] as usize], old.v[tri[1] as usize], old.v[tri[2] as usize]];
             let uv = (vertices[0].uv + vertices[1].uv + vertices[2].uv) / 3.;
             let region = if (CUTOUT.0..=CUTOUT.1).contains(&uv.y) {
@@ -220,6 +222,20 @@ pub fn trim_cards(ladder: &mut Ladder) {
                 Some(4 + usize::from(uv.x >= 0.5))
             } else { None };
             let mut polygon = vertices.to_vec();
+            // A card consists of two triangles. If all attributes are affine across the
+            // diagonal, clip the quad once: this avoids splitting the resulting polygon at
+            // the old diagonal. Non-planar sprays retain their original triangle boundary.
+            if region.is_some() && offset + 5 < old.i.len()
+                && old.i[offset + 3] == tri[0] && old.i[offset + 4] == tri[2] {
+                let d = old.v[old.i[offset + 5] as usize];
+                let [a, b, c] = vertices;
+                let affine = (a.p + c.p - b.p - d.p).length_squared() < 1e-10
+                    && (a.n + c.n - b.n - d.n).length_squared() < 1e-10
+                    && (a.uv + c.uv - b.uv - d.uv).length_squared() < 1e-10
+                    && (0..4).all(|i| (a.c[i] + c.c[i] - b.c[i] - d.c[i]).abs() < 1e-5);
+                if affine { polygon.push(d); offset += 3; }
+            }
+            offset += 3;
             if let Some(hull) = region.map(|i| &hulls[i]).filter(|h| h.len() >= 3) {
                 for edge in 0..hull.len() {
                     let a = hull[edge]; let b = hull[(edge + 1) % hull.len()];
@@ -439,7 +455,7 @@ fn column_u(variant: f32, across: f32) -> f32 {
     (variant + 0.5 + across * 0.47) / 4.
 }
 
-/// The source pieces (needle fans), every n-th, grown about their centres; UVs remapped into the
+/// The source pieces (needle fans), every n-th, grown about their stalk; UVs remapped into the
 /// opaque region.
 fn thin_pieces(part: &Part, verts: usize, budget: usize) -> Part {
     let count = part.v.len() / verts;
@@ -449,11 +465,11 @@ fn thin_pieces(part: &Part, verts: usize, budget: usize) -> Part {
         if k % n != 0 {
             continue;
         }
-        let center = piece.iter().map(|v| v.p).sum::<Vec3>() / verts as f32;
+        let anchor = if verts == 3 { (piece[0].p + piece[1].p) * 0.5 } else { piece[0].p };
         let first = out.v.len() as u32;
         for v in piece {
             let mut v = *v;
-            v.p = center + (v.p - center) * grow;
+            v.p = anchor + (v.p - anchor) * grow;
             v.uv = vec2(v.uv.x, uv_in(OPAQUE, v.uv.y));
             out.v.push(v);
         }
@@ -468,7 +484,7 @@ fn thin_pieces(part: &Part, verts: usize, budget: usize) -> Part {
 }
 
 /// The source leaf pieces (`verts` vertices each, their own triangles), every n-th kept and grown
-/// about its centre so the kept ones cover what all of them covered; UVs into the opaque band.
+/// about its stalk so the kept ones cover what all of them covered; UVs into the opaque band.
 fn opaque_pieces(part: &Part, verts: usize, budget: usize) -> Part {
     let count = part.v.len() / verts;
     if count == 0 {
@@ -488,11 +504,11 @@ fn opaque_pieces(part: &Part, verts: usize, budget: usize) -> Part {
         if k % n != 0 || tris[k].is_empty() {
             continue;
         }
-        let center = piece.iter().map(|v| v.p).sum::<Vec3>() / verts as f32;
+        let anchor = if verts == 3 { (piece[0].p + piece[1].p) * 0.5 } else { piece[0].p };
         let first = out.v.len() as u32;
         for v in piece {
             let mut v = *v;
-            v.p = center + (v.p - center) * grow;
+            v.p = anchor + (v.p - anchor) * grow;
             v.uv = vec2(v.uv.x, uv_in(OPAQUE, v.uv.y));
             out.v.push(v);
         }
@@ -511,10 +527,9 @@ fn cards(leaves: &[Leaf], budget: usize, folded: bool) -> Part {
     let (n, grow) = stride(leaves.len(), each, budget);
     let mut out = Part::default();
     for leaf in leaves.iter().step_by(n) {
-        let center = leaf.center();
-        let scale = |p: Vec3| center + (p - center) * grow;
         let half = leaf.side * (leaf.width * 0.5 * grow);
-        let (base, tip) = (scale(leaf.base), scale(leaf.tip));
+        let base = leaf.base;
+        let tip = base + (leaf.tip - base) * grow;
         let lift = leaf.face * (leaf.width * 0.12 * grow);
         let vertex = |p: Vec3, n: Vec3, across: f32, along: f32| V {
             p,
@@ -987,6 +1002,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn enlarged_cards_keep_the_original_leaf_base() {
+        let leaf = Leaf { base: Vec3::new(1.,2.,3.), tip: Vec3::new(1.,3.,3.), side: Vec3::X, face: Vec3::Z,
+            width: 0.2, variant: 0., n_base: Vec3::Z, n_mid: Vec3::Z, n_tip: Vec3::Z, color: [1.;4] };
+        for folded in [false, true] {
+            let part = cards(&[leaf, leaf], if folded { 4 } else { 2 }, folded);
+            let base = if folded { part.v[1].p } else { (part.v[0].p + part.v[1].p) * 0.5 };
+            assert!(base.distance(leaf.base) < 1e-6);
+        }
+    }
+
+    #[test]
     fn trimming_preserves_opaque_pieces_and_clips_empty_card_corners() {
         let vertex = |u: f32, v: f32| V { p: Vec3::new(u, v, 0.), n: Vec3::Z, uv: vec2(u,v), c: [1.; 4] };
         let mut atlas = vec![0; (ATLAS * ATLAS * 4) as usize];
@@ -998,6 +1024,7 @@ mod tests {
         trim_cards(&mut ladder);
         let out = &ladder.levels[1].leaves;
         assert!(out.i.len() >= 9);
+        assert!(out.i.len() <= 12, "a planar card should not be split at its old diagonal");
         assert!(out.v.iter().any(|v| v.uv.y == OPAQUE.0));
         for v in out.v.iter().filter(|v| v.uv.y >= CUTOUT.0) {
             assert!(v.uv.x >= 40. / ATLAS as f32 && v.uv.x <= 80. / ATLAS as f32);

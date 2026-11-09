@@ -86,6 +86,10 @@ pub struct RendererSettings {
     pub debug_view: DebugView,
     /// Grove vegetation preview clock in seconds. None displays the rest pose.
     pub vegetation_wind: Option<f32>,
+    /// Preview sway strength, gust amount, leaf flutter and branch response.
+    pub vegetation_wind_parameters: Vec4,
+    /// Springiness in x, remaining lanes reserved for future wind dynamics.
+    pub vegetation_wind_dynamics: Vec4,
     pub show_sky: bool,
     /// Blend each frame with reprojected history. Off, aliasing returns, but every frame
     /// shows exactly what was rendered, which is what diagnostics and tests want.
@@ -117,6 +121,8 @@ impl Default for RendererSettings {
             render_scale: 1.0,
             debug_view: DebugView::Lit,
             vegetation_wind: None,
+            vegetation_wind_parameters: Vec4::new(1., 0.2, 1., 1.),
+            vegetation_wind_dynamics: Vec4::new(0.5, 0., 0., 0.),
             show_sky: true,
             temporal_accumulation: true,
             clouds: true,
@@ -782,6 +788,8 @@ impl Renderer {
             0.5 * render_size.1 as f32 * camera.projection(aspect).y_axis.y,
             &self.scene.instance_table.moving_spheres(),
             wind,
+            self.settings.vegetation_wind_parameters,
+            self.settings.vegetation_wind_dynamics,
         );
         let volume_work = self
             .volume
@@ -1219,6 +1227,8 @@ impl Renderer {
             },
             moon_disc: environment.moon_disc.unwrap_or(Vec3::NEG_Y),
             wind_time: self.settings.vegetation_wind.map_or(0.0, |t| 1.0 + t),
+            wind_parameters: self.settings.vegetation_wind_parameters,
+            wind_dynamics: self.settings.vegetation_wind_dynamics,
             daylight_illuminance: environment.daylight(),
         };
         gpu.queue
@@ -1253,6 +1263,8 @@ impl Renderer {
             receiver_planes: [Vec4::ZERO; 6],
             eye_light: Vec3::Y,
             wind_time: frame.wind_time,
+            wind_parameters: frame.wind_parameters,
+            wind_dynamics: frame.wind_dynamics,
         };
         self.view_slots.write(
             gpu,

@@ -42,6 +42,8 @@ struct Frame {
     sea_level: f32,
     moon_disc: vec3f,
     wind_time: f32,
+    wind_parameters: vec4f,
+    wind_dynamics: vec4f,
 }
 
 const DEBUG_NONE: u32 = 0u;

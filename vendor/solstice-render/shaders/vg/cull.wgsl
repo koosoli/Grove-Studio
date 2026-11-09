@@ -199,7 +199,7 @@ fn request_texture_detail(cluster: Cluster, instance: Instance, distance: f32) {
 fn try_emit(entry: QueueEntry, cluster_index: u32, instance: Instance) {
     let cluster = clusters[cluster_index];
     let center = transform_point(instance, cluster.center);
-    let radius = cluster.radius * instance.max_scale + vegetation_padding(instance, cluster.center.y + cluster.radius, view.wind_time);
+    let radius = cluster.radius * instance.max_scale + vegetation_padding(instance, cluster.center, cluster.radius, view.wind_time, view.wind_parameters);
     if !in_frustum(center, radius) {
         return;
     }
@@ -287,7 +287,7 @@ fn process(@builtin(global_invocation_id) id: vec3u) {
     }
 
     let center = transform_point(instance, node.center);
-    let radius = node.radius * instance.max_scale + vegetation_padding(instance, node.center.y + node.radius, view.wind_time);
+    let radius = node.radius * instance.max_scale + vegetation_padding(instance, node.center, node.radius, view.wind_time, view.wind_parameters);
     if !in_frustum(center, radius) {
         return;
     }

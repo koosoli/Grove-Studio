@@ -22,7 +22,8 @@ const MAX_EXTENT_PX: f32 = 512.0;
 // Matches MAX_CLUSTER_VERTICES.
 const MAX_VERTICES: u32 = 256u;
 
-var<workgroup> screen: array<vec3f, MAX_VERTICES>;
+var<workgroup> screen: array<vec4f, MAX_VERTICES>;
+var<workgroup> card_uv: array<vec2f, MAX_VERTICES>;
 var<workgroup> cluster_count: u32;
 
 @compute @workgroup_size(GROUP_SIZE)
@@ -46,14 +47,16 @@ fn main(
         let vertex_count = cluster_vertex_count(cluster);
         for (var v = lane; v < vertex_count; v += GROUP_SIZE) {
             let packed = vertices[cluster.vertex_offset + v];
-            let world = transform_vegetation(instance, decode_position(instance, packed), view.wind_time);
+            let world = transform_vegetation(instance, decode_position(instance, packed), decode_uv(instance, packed), view.wind_time, view.wind_parameters, view.wind_dynamics);
             let clip = view.raster_view_proj * vec4f(world, 1.0);
             let ndc = clip.xyz / clip.w;
-            screen[v] = vec3f(
+            screen[v] = vec4f(
                 (ndc.x * 0.5 + 0.5) * view.viewport.x,
                 (0.5 - ndc.y * 0.5) * view.viewport.y,
                 ndc.z,
+                1.0 / clip.w,
             );
+            card_uv[v] = decode_uv(instance, packed);
         }
         workgroupBarrier();
 
@@ -65,6 +68,8 @@ fn main(
                 screen[local_vertex(packed, 2u)],
                 encode_id(visible_index, lane),
                 instance_two_sided(instance),
+                card_uv[local_vertex(packed, 0u)], card_uv[local_vertex(packed, 1u)], card_uv[local_vertex(packed, 2u)],
+                instance_material(instance),
             );
         }
         // The next cluster reuses the vertex memory.
@@ -89,13 +94,16 @@ fn fill_bias(a: vec2i, b: vec2i) -> i32 {
     return select(-1, 0, is_top || is_left);
 }
 
-fn rasterize_triangle(a_in: vec3f, b_given: vec3f, c_given: vec3f, id: u32, two_sided: bool) {
+fn rasterize_triangle(a_in: vec4f, b_given: vec4f, c_given: vec4f, id: u32, two_sided: bool,
+                      uv_a: vec2f, uv_b: vec2f, uv_c: vec2f, material: u32) {
     var b_in = b_given;
     var c_in = c_given;
+    var b_uv = uv_b; var c_uv = uv_c;
     // A back face of a two-sided material is drawn as the front face it is from behind.
     if two_sided && edge_f(a_in.xy, b_in.xy, c_in.xy) > 0.0 {
         b_in = c_given;
         c_in = b_given;
+        b_uv = uv_c; c_uv = uv_b;
     }
     let bounds_min = floor(min(min(a_in.xy, b_in.xy), c_in.xy));
     let bounds_max = ceil(max(max(a_in.xy, b_in.xy), c_in.xy));
@@ -130,7 +138,7 @@ fn rasterize_triangle(a_in: vec3f, b_given: vec3f, c_given: vec3f, id: u32, two_
     if first.x > last.x || first.y > last.y {
         return;
     }
-    let bias = depth_bias(a_in, b_in, c_in);
+    let bias = depth_bias(a_in.xyz, b_in.xyz, c_in.xyz);
 
     let bias0 = fill_bias(p1, p2);
     let bias1 = fill_bias(p2, p0);
@@ -161,7 +169,9 @@ fn rasterize_triangle(a_in: vec3f, b_given: vec3f, c_given: vec3f, id: u32, two_
                 let w2 = f32(e2 - bias2) * inv_area;
                 let depth = w0 * z0 + w1 * z1 + w2 * z2;
                 // Tested before the bias, as the hardware clips before it biases.
-                if depth > 0.0 {
+                let q0 = w0 * a_in.w; let q1 = w1 * c_in.w; let q2 = w2 * b_in.w;
+                let uv = (q0 * uv_a + q1 * c_uv + q2 * b_uv) / (q0 + q1 + q2);
+                if depth > 0.0 && card_visible(material, uv) {
                     write_visibility(u32(y) * width + u32(x), depth + bias, id);
                 }
             }

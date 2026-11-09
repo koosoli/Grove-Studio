@@ -241,7 +241,7 @@ impl ShadowMaps {
                     },
                 }),
                 multisample: Default::default(),
-                fragment: None,
+                fragment: Some(wgpu::FragmentState { module: &rasterizer.hardware_module, entry_point: Some("fs_depth"), compilation_options: Default::default(), targets: &[] }),
                 multiview_mask: None,
                 cache: None,
             });
@@ -305,6 +305,8 @@ impl ShadowMaps {
         eye_lod_scale: f32,
         moving: &[(Vec3, f32)],
         wind_time: f32,
+        wind_parameters: Vec4,
+        wind_dynamics: Vec4,
     ) -> ShadowWork {
         let fits: [(Mat4, Vec3, f32); CASCADE_COUNT] = std::array::from_fn(|cascade| {
             let near = if cascade == 0 {
@@ -388,6 +390,8 @@ impl ShadowMaps {
             view.allow_software = 1;
             view.stamp = self.software_stamp;
             view.wind_time = wind_time;
+            view.wind_parameters = wind_parameters;
+            view.wind_dynamics = wind_dynamics;
             self.software_stamp += 1;
             self.drawn[cascade] = Some(Drawn {
                 view_proj,
@@ -423,7 +427,7 @@ impl ShadowMaps {
         };
         for cascade in (0..CASCADE_COUNT).filter(|&c| moving_due[c]) {
             let (center, radius) = self.extents[cascade];
-            let view = seen(PassView::orthographic(
+            let mut view = seen(PassView::orthographic(
                 self.data.view_proj[cascade],
                 center,
                 Vec2::splat(MOVING_RESOLUTION as f32),
@@ -431,6 +435,9 @@ impl ShadowMaps {
                 lod_threshold,
             ))
             .drawing(InstanceFilter::Movable);
+            view.wind_time = wind_time;
+            view.wind_parameters = wind_parameters;
+            view.wind_dynamics = wind_dynamics;
             slots.write(gpu, first_moving_slot + cascade as u32, &view);
         }
         // One cull serves every touched cascade, since the traversal's fixed cost outweighs the

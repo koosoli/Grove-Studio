@@ -24,7 +24,7 @@ impl fmt::Display for GpuError {
 impl std::error::Error for GpuError {}
 
 /// Storage buffers the heaviest pass binds in a single shader stage.
-const REQUIRED_STORAGE_BUFFERS: u32 = 8;
+const REQUIRED_STORAGE_BUFFERS: u32 = 9;
 /// Storage textures the G-buffer resolve binds in a single shader stage.
 const REQUIRED_STORAGE_TEXTURES: u32 = 5;
 

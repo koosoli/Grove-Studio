@@ -31,7 +31,7 @@
 // Fraction of light a leaf or blade passes on to its far side, relative to what it reflects.
 // Measured leaf spectra transmit about as much as they reflect across visible light (Jacquemoud
 // and Ustin 2019), slightly less towards blue.
-const FOLIAGE_TRANSMITTANCE: vec3f = vec3f(0.8, 0.8, 0.6);
+const FOLIAGE_TRANSMITTANCE_TINT: vec3f = vec3f(1.0, 1.0, 0.75);
 
 // A short ray through the depth buffer towards the sun. Catches the small-scale shadowing
 // of dense geometry, which is finer than any shadow map texel.
@@ -69,7 +69,7 @@ fn contact_shadow(world: vec3f, normal: vec3f, view: vec3f, distance: f32, noise
     return 1.0;
 }
 
-fn local_light(light: Light, s: Surface, view: vec3f, world: vec3f) -> vec3f {
+fn local_light(light: Light, s: Surface, view: vec3f, world: vec3f, no_specular: bool) -> vec3f {
     let to_light = light.position - world;
     let distance = length(to_light);
     if distance >= light.range {
@@ -90,7 +90,8 @@ fn local_light(light: Light, s: Surface, view: vec3f, world: vec3f) -> vec3f {
         max(distance - voxel * 2.5, 0.0),
         16u,
     );
-    return shade_light(s, view, direction) * light.intensity * falloff * open;
+    let lit = select(shade_light(s, view, direction), s.diffuse / PI * max(dot(s.normal, direction), 0.0), no_specular);
+    return lit * light.intensity * falloff * open;
 }
 
 @compute @workgroup_size(8, 8)
@@ -105,6 +106,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let emissive_model = textureLoad(emissive_tex, pixel, 0);
     let emissive = emissive_model.rgb;
     let foliage = emissive_model.a > 0.5;
+    let no_specular = emissive_model.a > 3.5;
+    let transmission = select(max(emissive_model.a - 2.0, 0.0), max(emissive_model.a - 4.0, 0.0), no_specular);
 
     if depth <= 0.0 {
         let ndc = pixel_to_ndc(center, frame.inv_viewport);
@@ -158,11 +161,12 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         if shadow > 0.0 && distance < 40.0 {
             shadow *= contact_shadow(world, normal, view, distance, noise);
         }
-        color += shade_light(surface, view, frame.sun_direction) * sun_irradiance_at(world) * shadow;
+        let sun_lit = select(shade_light(surface, view, frame.sun_direction), surface.diffuse / PI * max(sun_facing, 0.0), no_specular);
+        color += sun_lit * sun_irradiance_at(world) * shadow;
     } else if foliage {
         // Sunlight through a leaf from behind. The shadow is looked up for the lit side.
         let shadow = sun_shadow(world, -normal, distance, noise);
-        let transmitted = surface.diffuse * FOLIAGE_TRANSMITTANCE / PI * -sun_facing;
+        let transmitted = surface.diffuse * FOLIAGE_TRANSMITTANCE_TINT * transmission / PI * -sun_facing;
         color += transmitted * sun_irradiance_at(world) * shadow;
     }
 
@@ -170,7 +174,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let tile = light_tile_base(id.xy / TILE_SIZE, size);
     let tile_lights = light_tiles[tile];
     for (var i = 0u; i < tile_lights; i++) {
-        color += local_light(lights[light_tiles[tile + 1u + i]], surface, view, world);
+        color += local_light(lights[light_tiles[tile + 1u + i]], surface, view, world, no_specular);
     }
 
     // Indirect diffuse. Cavity darkens crevices the probes are too coarse to resolve.
@@ -181,7 +185,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     if foliage {
         // Skylight through the leaf. Probes only know the light arriving at its front, so the
         // back is estimated from the same, as it is for most foliage in a canopy.
-        color += surface.diffuse * FOLIAGE_TRANSMITTANCE / PI * irradiance * occlusion * 0.5;
+        color += surface.diffuse * FOLIAGE_TRANSMITTANCE_TINT * transmission / PI * irradiance * occlusion * 0.5;
     }
 
     // Indirect specular. Rough surfaces did not trace, and their blurry reflection is
@@ -196,7 +200,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     // accumulated light is divided by its weight rather than read as is, which would darken it.
     let traced = reflection.rgb / max(reflection.a, 1.0e-3);
     let incoming = mix(rough_estimate, traced * frame.gi_intensity, traced_weight);
-    color += incoming * specular_scale * occlusion;
+    if !no_specular { color += incoming * specular_scale * occlusion; }
 
     color += emissive;
 

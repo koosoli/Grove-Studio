@@ -81,7 +81,14 @@ pub fn grow(s: &Settings, lod: u32) -> Option<Tree> {
     let leaf_scale = s.leaf_size / original_leaf_size;
     let height_scale = s.height / species.height;
     species.trunk_radius = s.trunk_radius;
+    species.trunk_gnarl = species.trunk_gnarl * 2. * (1. - s.trunk_straightness)
+        + 0.03 * (0.5 - s.trunk_straightness).max(0.);
     species.levels[0].per_metre *= s.branches as f32 / Settings::default().branches as f32;
+    for level in &mut species.levels {
+        level.angle.0 = (level.angle.0 * s.branch_angle).clamp(0., 180.);
+        level.angle.1 = (level.angle.1 * s.branch_angle).clamp(0., 180.);
+        level.droop = level.droop * s.branch_droop + 0.1 * (s.branch_droop - 1.).max(0.);
+    }
     species.leaves.per_metre *= s.density;
     species.leaves.length.0 *= leaf_scale;
     species.leaves.length.1 *= leaf_scale;
@@ -127,14 +134,16 @@ pub fn grow(s: &Settings, lod: u32) -> Option<Tree> {
         if i % stride != 0 || (winter && (i + s.seed as usize % 29) % 29 != 0) {
             continue;
         }
-        let center = piece.iter().map(|v| v.position).sum::<glam::Vec3>() / verts as f32;
+        // Scale thinned leaves about the stalk, not the centre: otherwise their attachment
+        // moves away from the twig as the LOD changes.
+        let anchor = if needle { (piece[0].position + piece[1].position) * 0.5 } else { piece[0].position };
         let grow = [1., 1.25, 1.63][lod as usize];
         let offset = leaves.v.len() as u32;
         for v in piece {
             let variant = ((v.uv.x * 4.) as usize).min(3);
             let color = colors[variant];
             let mut vertex = convert(v, color);
-            let p = center + (v.position - center) * grow;
+            let p = anchor + (v.position - anchor) * grow;
             vertex.p = vec3(p.x * s.spread, p.y * height_scale, p.z * s.spread);
             leaves.v.push(vertex);
         }

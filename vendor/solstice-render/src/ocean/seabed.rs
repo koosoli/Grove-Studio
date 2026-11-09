@@ -128,7 +128,7 @@ impl SeabedMap {
                     bias: Default::default(),
                 }),
                 multisample: Default::default(),
-                fragment: None,
+                fragment: Some(wgpu::FragmentState { module: &rasterizer.hardware_module, entry_point: Some("fs_depth"), compilation_options: Default::default(), targets: &[] }),
                 multiview_mask: None,
                 cache: None,
             });

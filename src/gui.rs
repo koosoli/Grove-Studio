@@ -14,6 +14,37 @@ const W: f32 = 1440.;
 const H: f32 = 900.;
 // Distance change per wheel notch, as a fraction (0.05 is about 5 %; 14 notches double the range).
 const ZOOM_PER_NOTCH: f32 = 0.05;
+/// Smooth wind starts/stops and keep phase continuous when the speed slider changes.
+#[derive(Default)]
+struct WindPlayback { phase: f32, envelope: f32 }
+impl WindPlayback {
+    fn step(&mut self, enabled: bool, speed: f32, springiness: f32, dt: f32) {
+        let dt = dt.clamp(0., 0.2);
+        let active = enabled && speed > 0.001;
+        let target = if active { 1. } else { 0. };
+        let tau = if active { 0.2 } else { 0.45 + springiness * 1.1 };
+        self.envelope += (target - self.envelope) * (1. - (-dt / tau).exp());
+        if self.envelope > 0.001 {
+            self.phase = (self.phase + dt * if active { speed } else { speed.max(0.6) }) % 10000.;
+        } else if !active { self.envelope = 0.; }
+    }
+}
+
+#[cfg(test)]
+mod wind_playback_tests {
+    use super::WindPlayback;
+    #[test]
+    fn wind_starts_smoothly_and_rings_down_without_restarting_phase() {
+        let mut wind = WindPlayback::default();
+        wind.step(true, 1., 0.8, 0.1);
+        assert!(wind.envelope > 0. && wind.envelope < 1.);
+        let previous_phase = wind.phase;
+        wind.step(false, 1., 0.8, 0.1);
+        assert!(wind.envelope > 0. && wind.phase > previous_phase);
+        for _ in 0..200 { wind.step(false, 0., 0.8, 0.1); }
+        assert_eq!(wind.envelope, 0.);
+    }
+}
 // Species labels, in the order of preview::SPECIES.
 const LIBRARY_PAGE: usize = 5;
 const FOREST_PAGE: usize = 7;
@@ -235,7 +266,7 @@ impl Ui {
     }
     fn text(&self, s: &str, x: f32, y: f32, size: f32, c: Color) {
         let marker = match s {
-            "GAME MESH" => 1,
+            "GAME MESH" | "SOURCE MESH" => 1,
             "Auto LOD   0" => 2,
             "VARIATION SEED" => 4,
             _ => 0,
@@ -501,6 +532,7 @@ struct Editor {
     lod: u32,
     auto_lod: bool,
     forest: bool,
+    forest_random: bool,
     // Each species' share of the stand, 0 to 1. Shares are relative: the mix is normalised.
     forest_share: [f32; crate::catalog::GROUPS.len()],
     forest_count: u32,
@@ -509,8 +541,17 @@ struct Editor {
     forest_page: usize,
     sky: bool,
     skybox: usize,
+    cloud_cover: f32,
+    leaf_specular: bool,
+    leaf_roughness: f32,
+    leaf_transmission: f32,
     wind_speed: f32,
     wind_direction: f32,
+    wind_strength: f32,
+    wind_gust: f32,
+    leaf_flutter: f32,
+    branch_sway: f32,
+    branch_springiness: f32,
     debug: solstice_render::DebugView,
     lighting: preview::Lighting,
     yaw: f32,
@@ -532,6 +573,7 @@ struct Editor {
     format: String,
     all_lods: bool,
     game_lods: bool,
+    game_preview: bool,
     trim_cards: bool,
     path_focus: bool,
     status: String,
@@ -552,6 +594,7 @@ impl Editor {
             lod: 0,
             auto_lod: true,
             forest: false,
+            forest_random: true,
             forest_share: std::array::from_fn(|i| if i < 5 { 0.2 } else { 0. }),
             forest_count: 200,
             library_cwa: false,
@@ -559,8 +602,17 @@ impl Editor {
             forest_page: 0,
             sky: true,
             skybox: 1,
+            cloud_cover: preview::skybox("fair").expect("fair weather").coverage,
+            leaf_specular: true,
+            leaf_roughness: 0.55,
+            leaf_transmission: 0.8,
             wind_speed: 1.,
             wind_direction: 68.,
+            wind_strength: 1.,
+            wind_gust: 0.2,
+            leaf_flutter: 1.,
+            branch_sway: 1.,
+            branch_springiness: 0.5,
             debug: solstice_render::DebugView::Lit,
             lighting: preview::Lighting::default(),
             yaw: 0.65,
@@ -582,6 +634,7 @@ impl Editor {
             format: "gltf".into(),
             all_lods: true,
             game_lods: false,
+            game_preview: true,
             trim_cards: true,
             path_focus: false,
             status: "Ready. Make something that grows.".into(),
@@ -685,7 +738,7 @@ impl Editor {
         let lods = if self.all_lods {
             vec![0, 1, 2]
         } else {
-            vec![self.lod]
+            vec![self.lod.min(2)]
         };
         agent::export_lods(&self.s, &lods, &self.format, base, None, None)?
             .iter()
@@ -805,7 +858,12 @@ pub async fn run(args: Vec<String>) {
     let mut worker = (!classic).then(preview::Worker::start);
     let mut preview_texture = None;
     let mut preview_frame: Option<(preview::SceneKey, solstice_render::DebugView, u32, u32)> = None;
+    let mut preview_fps = 0.0f64;
+    let mut preview_fps_start = get_time();
+    let mut preview_fps_frames = 0u32;
+    let mut preview_last_frame = 0.0f64;
     let mut preview_error = None;
+    let mut wind_playback = WindPlayback::default();
     let initial_yaw = e.yaw;
     let initial_seed = e.s.seed;
     let initial_mesh = e.model.tree.leaves.v.first().map(|v| v.p);
@@ -984,6 +1042,7 @@ pub async fn run(args: Vec<String>) {
         if e.rotate && e.modal.is_none() {
             e.yaw += get_frame_time() * 0.20;
         }
+        wind_playback.step(e.wind, e.wind_speed, e.branch_springiness, get_frame_time());
         let center = vec3(0., e.scene_height() * 0.49, 0.) + e.pan;
         let pos = center
             + vec3(
@@ -993,18 +1052,40 @@ pub async fn run(args: Vec<String>) {
             ) * e.distance;
         let scene = preview::SceneKey {
             settings: e.s.clone(),
-            lod: (!e.auto_lod).then_some(e.lod),
+            lod: if e.auto_lod && e.game_preview {
+                Some(if e.distance > e.scene_height() * 10. { 3 } else if e.distance > e.scene_height() * 5. { 2 } else if e.distance > e.scene_height() * 2.8 { 1 } else { 0 })
+            } else { (!e.auto_lod).then_some(e.lod) },
             forest: if e.forest { e.forest_mask() } else { 0 },
             count: e.forest_count,
             ratios: e.forest_ratios(),
             grid: e.grid && !e.forest,
             bark: e.bark,
             leaves: e.leaves,
+            game_cards: e.game_preview,
+            trim_cards: e.trim_cards,
+            random_mix: e.forest_random,
+            leaf_specular: e.leaf_specular,
+            leaf_roughness: e.leaf_roughness,
+            leaf_transmission: e.leaf_transmission,
         };
         let use_solstice = e.view == 0;
         if let Some(renderer) = worker.as_mut() {
             match renderer.poll() {
                 Some(Ok(frame)) => {
+                    let now = get_time();
+                    if preview_last_frame == 0.0 || now - preview_last_frame > 2.0 {
+                        preview_fps_start = now;
+                        preview_fps_frames = 0;
+                        preview_fps = 0.0;
+                    }
+                    preview_last_frame = now;
+                    preview_fps_frames += 1;
+                    let elapsed = now - preview_fps_start;
+                    if elapsed >= 1.0 {
+                        preview_fps = preview_fps_frames as f64 / elapsed;
+                        preview_fps_frames = 0;
+                        preview_fps_start = now;
+                    }
                     let (w, h) = preview::SIZE;
                     if let Some(texture) = &preview_texture {
                         Texture2D::update_from_bytes(texture, w, h, &frame.pixels);
@@ -1041,11 +1122,19 @@ pub async fn run(args: Vec<String>) {
                         near: 0.05,
                     },
                     debug: e.debug,
-                    wind_time: e.wind.then_some(get_time() as f32 * e.wind_speed),
+                    wind_time: (wind_playback.envelope > 0.).then_some(wind_playback.phase),
                     wind_direction: e.wind_direction,
+                    wind_strength: e.wind_strength * wind_playback.envelope,
+                    wind_gust: e.wind_gust,
+                    leaf_flutter: e.leaf_flutter,
+                    branch_sway: e.branch_sway,
+                    branch_springiness: e.branch_springiness,
                     sky: e.sky,
-                    skybox: preview::skybox(preview::SKYBOXES[e.skybox].0)
-                        .expect("listed skybox"),
+                    skybox: {
+                        let mut weather = preview::skybox(preview::SKYBOXES[e.skybox].0).expect("listed skybox");
+                        weather.coverage = e.cloud_cover;
+                        weather
+                    },
                     lighting: e.lighting,
                 });
             }
@@ -1110,13 +1199,13 @@ pub async fn run(args: Vec<String>) {
                 let wind_time = if self_test.is_some() && frames >= 130 {
                     (frames - 130) as f32 * 0.2
                 } else {
-                    get_time() as f32 * e.wind_speed
+                    wind_playback.phase
                 };
                 tree_material.set_uniform(
                     "Wind",
                     (
                         wind_time,
-                        if e.wind { 1_f32 } else { 0_f32 },
+                        if self_test.is_some() { if e.wind { 1. } else { 0. } } else { e.wind_strength * wind_playback.envelope },
                         e.wind_direction.to_radians(),
                         0_f32,
                     ),
@@ -1131,7 +1220,7 @@ pub async fn run(args: Vec<String>) {
                     "Wind",
                     (
                         wind_time,
-                        if e.wind { 1_f32 } else { 0_f32 },
+                        if self_test.is_some() { if e.wind { 1. } else { 0. } } else { e.wind_strength * wind_playback.envelope },
                         e.wind_direction.to_radians(),
                         1_f32,
                     ),
@@ -1184,6 +1273,7 @@ pub async fn run(args: Vec<String>) {
             solstice_stats,
             renderer_label,
             worker.is_some(),
+            if use_solstice && preview_fps > 0.0 && get_time() - preview_last_frame < 2.0 { Some(preview_fps) } else { None },
         );
         // Small corner notice while the Solstice frame for the current settings is still rendering.
         let rendering = use_solstice && worker.is_some() && solstice_stats.is_none();
@@ -1546,11 +1636,11 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
         muted(),
     );
     rounded(Rect::new(p, 157., 262., 35.), 6., col(0xeef1e9));
-    if !gpu && e.tab == 2 {
+    if !gpu && e.tab >= 2 {
         e.tab = 0;
     }
     let labels: &[_] = if gpu {
-        &["Structure", "Foliage", "Lighting", "Forest"]
+        &["Shape", "Leaf", "Light", "Forest", "Render", "Weather"]
     } else {
         &["Structure", "Foliage"]
     };
@@ -1559,39 +1649,41 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
         let r = Rect::new(p + 3. + i as f32 * tab_width, 160., tab_width - 4., 29.);
         if e.tab == i as u32 {
             rounded(r, 4., col(0xffffff));
-            ui.center(label, r, 13., ink());
+            ui.center(label, r, 11., ink());
         } else {
-            ui.center(label, r, 13., muted());
+            ui.center(label, r, 11., muted());
         }
         if ui.over(r) && is_mouse_button_pressed(MouseButton::Left) {
             e.tab = i as u32
         }
     }
     if e.tab == 0 {
-        ui.heading("01", "Silhouette", p, 229.);
+        ui.heading("01", "Tree shape", p, 223.);
         let shrub = e.s.species == "solstice-bush";
         ui.slider(
             "Trunk length",
             &mut e.s.height,
             if shrub { 0.25 } else { 3. },
-            if shrub { 0.65 } else { 16. },
+            if shrub { 0.65 } else { 40. },
             p,
-            265.,
+            250.,
             "m",
         );
-        ui.slider("Canopy spread", &mut e.s.spread, 0.4, 1.6, p, 329., "%");
-        ui.heading("02", "Branch architecture", p, 412.);
+        ui.slider("Canopy spread", &mut e.s.spread, 0.4, 1.6, p, 293., "%");
+        ui.slider("Trunk straightness", &mut e.s.trunk_straightness, 0., 1., p, 336., "%");
         let mut branches = e.s.branches as f32;
-        if ui.slider("Primary branches", &mut branches, 5., 20., p, 449., "") {
+        if ui.slider("Primary branches", &mut branches, 5., 20., p, 379., "") {
             e.s.branches = branches.round() as u32;
         }
+        ui.slider("Branch angle", &mut e.s.branch_angle, 0.5, 1.5, p, 422., "%");
+        ui.slider("Branch droop", &mut e.s.branch_droop, 0., 2., p, 465., "%");
         ui.slider(
             "Trunk radius",
             &mut e.s.trunk_radius,
             0.05,
             0.45,
             p,
-            495.,
+            508.,
             "m",
         );
         ui.slider(
@@ -1600,7 +1692,7 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
             0.,
             0.08,
             p,
-            541.,
+            551.,
             "%",
         );
     } else if e.tab == 1 {
@@ -1687,44 +1779,65 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
                 e.debug = solstice_render::DebugView::Lit;
             }
         }
-        // Skybox presets, as the reference viewer's weather menu, then sky and reset.
+    } else if e.tab == 5 {
+        ui.heading("01", "Sky and clouds", p, 218.);
+        ui.slider("Cloud cover", &mut e.cloud_cover, 0., 1., p, 240., "%");
+        // Skybox presets adjust cloud type and other weather characteristics as well as cover.
         for (i, (_, label)) in preview::SKYBOXES.iter().enumerate() {
-            let r = Rect::new(p + (i % 4) as f32 * 66., 446. + (i / 4) as f32 * 34., 62., 28.);
+            let r = Rect::new(p + (i % 4) as f32 * 66., 281. + (i / 4) as f32 * 31., 62., 27.);
             if ui.button(label, r, if e.skybox == i { 2 } else { 0 }) {
                 e.skybox = i;
+                e.cloud_cover = preview::skybox(preview::SKYBOXES[i].0).expect("listed skybox").coverage;
             }
         }
         if ui.button(
             if e.sky { "Sky on" } else { "Sky off" },
-            Rect::new(p + 132., 480., 62., 28.),
+            Rect::new(p + 132., 312., 62., 27.),
             0,
         ) {
             e.sky = !e.sky;
         }
-        if ui.button("Reset", Rect::new(p + 198., 480., 62., 28.), 0) {
-            e.lighting = preview::Lighting::default();
+        if ui.button("Reset", Rect::new(p + 198., 312., 62., 27.), 0) {
             e.skybox = 1;
+            e.cloud_cover = preview::skybox("fair").expect("fair weather").coverage;
             e.sky = true;
+            e.wind_speed = 1.; e.wind_strength = 1.; e.wind_gust = 0.2; e.leaf_flutter = 1.; e.branch_sway = 1.; e.branch_springiness = 0.5; e.wind_direction = 68.;
         }
-        ui.slider("Wind speed", &mut e.wind_speed, 0., 3., p, 534., "x");
-        ui.slider(
-            "Wind direction",
-            &mut e.wind_direction,
-            0.,
-            360.,
-            p,
-            568.,
-            "°",
-        );
+        ui.heading("02", "Wind", p, 365.);
+        if ui.button(if e.wind { "Wind ON" } else { "Wind OFF" }, Rect::new(p + 150., 347., 102., 27.), if e.wind { 2 } else { 0 }) { e.wind = !e.wind; }
+        ui.slider("Wind speed", &mut e.wind_speed, 0., 3., p, 390., "x");
+        ui.slider("Wind strength", &mut e.wind_strength, 0., 2., p, 419., "%");
+        ui.slider("Branch sway", &mut e.branch_sway, 0., 2., p, 448., "%");
+        ui.slider("Springiness", &mut e.branch_springiness, 0., 1., p, 477., "%");
+        ui.slider("Gust strength", &mut e.wind_gust, 0., 1., p, 506., "%");
+        ui.slider("Leaf flutter", &mut e.leaf_flutter, 0., 2., p, 535., "%");
+        ui.slider("Wind direction", &mut e.wind_direction, 0., 360., p, 564., "°");
+    } else if e.tab == 4 {
+        ui.heading("01", "Leaf lighting", p, 229.);
+        if ui.button(if e.leaf_specular { "Leaf specular: ON" } else { "Leaf specular: OFF" }, Rect::new(p, 250., 252., 32.), if e.leaf_specular { 2 } else { 0 }) {
+            e.leaf_specular = !e.leaf_specular;
+        }
+        ui.slider("Leaf roughness", &mut e.leaf_roughness, 0.05, 1., p, 320., "%");
+        ui.slider("Leaf translucency", &mut e.leaf_transmission, 0., 1., p, 387., "%");
+        ui.text("Lower roughness makes highlights sharper.", p, 450., 11., muted());
+        ui.text("Lighting settings affect the preview.", p, 474., 11., muted());
+        if ui.button("Reset render settings", Rect::new(p, 510., 252., 30.), 0) {
+            e.leaf_specular = true;
+            e.leaf_roughness = 0.55;
+            e.leaf_transmission = 0.8;
+        }
     } else {
         ui.heading("01", "Forest composition", p, 222.);
         ui.text(
-            "Each share is that species' percentage of the stand.",
+            "Species shares:",
             p,
             245.,
             11.,
             muted(),
         );
+        if ui.button(if e.forest_random { "Random mix" } else { "Even mix" }, Rect::new(p + 138., 229., 124., 24.), if e.forest_random { 2 } else { 0 }) {
+            e.forest_random = !e.forest_random;
+        }
         let mut count = e.forest_count as f32;
         if ui.slider("Trees in the stand", &mut count, 10., 1000., p, 262., "") {
             e.forest_count = count.round() as u32;
@@ -1787,7 +1900,7 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
         e.s.seed = e.s.seed.wrapping_mul(1664525).wrapping_add(1013904223)
     }
     rounded(Rect::new(p, 666., 262., 128.), 7., col(0xeaf0e2));
-    ui.text("GAME MESH", p + 14., 690., 10., green());
+    ui.text("SOURCE MESH", p + 14., 690., 10., green());
     let count = e.model.tree.triangles();
     ui.text(
         &format!("{} triangles", commas(count)),
@@ -1823,7 +1936,7 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
         e.frame();
     }
 }
-fn viewport_ui(ui: &Ui, e: &mut Editor, stats: Option<(u32, u32)>, renderer: &str, gpu: bool) {
+fn viewport_ui(ui: &Ui, e: &mut Editor, stats: Option<(u32, u32)>, renderer: &str, gpu: bool, preview_fps: Option<f64>) {
     rounded(
         Rect::new(274., 93., 284., 112.),
         8.,
@@ -1871,6 +1984,23 @@ fn viewport_ui(ui: &Ui, e: &mut Editor, stats: Option<(u32, u32)>, renderer: &st
         col(0x819176),
     );
     ui.text(renderer, 285., 192., 10., ink());
+    let fps = preview_fps.map(|n| format!("Preview {n:.0} FPS  /  UI {} FPS", get_fps()))
+        .unwrap_or_else(|| format!("Preview -- FPS  /  UI {} FPS", get_fps()));
+    rounded(Rect::new(914., 172., 184., 25.), 5., col(0xf7f9f2));
+    ui.center(&fps, Rect::new(914., 172., 184., 25.), 10., ink());
+    if gpu && ui.button(if e.game_preview { "Game cards" } else { "Original leaves" }, Rect::new(783., 136., 145., 29.), if e.game_preview { 2 } else { 0 }) {
+        e.game_preview = !e.game_preview;
+        if !e.game_preview && e.lod > 2 { e.lod = 2; }
+        e.view = 0;
+    }
+    if gpu && e.game_preview && ui.button(if e.trim_cards { "Trim ON" } else { "Trim OFF" }, Rect::new(936., 136., 162., 29.), if e.trim_cards { 2 } else { 0 }) {
+        e.trim_cards = !e.trim_cards;
+        e.view = 0;
+    }
+    if gpu && e.game_preview && ((!e.auto_lod && e.lod == 0) || (e.auto_lod && e.distance <= e.scene_height() * 2.8)) {
+        rounded(Rect::new(914., 201., 184., 24.), 5., col(0xf7f9f2));
+        ui.center("Trim applies from Mid onward", Rect::new(914., 201., 184., 24.), 10., ink());
+    }
     if gpu
         && ui.button(
             if e.forest { "Single tree" } else { "Forest" },
@@ -1922,6 +2052,7 @@ fn viewport_ui(ui: &Ui, e: &mut Editor, stats: Option<(u32, u32)>, renderer: &st
     }
     let views = [
         (solstice_render::DebugView::Lit, "Lighting"),
+        (solstice_render::DebugView::Triangles, "Triangles"),
         (solstice_render::DebugView::Clusters, "Clusters"),
         (solstice_render::DebugView::DiffuseGi, "Indirect light"),
         (solstice_render::DebugView::Voxels, "GI voxels"),
@@ -1994,15 +2125,14 @@ fn lod_strip(ui: &Ui, e: &mut Editor) {
     ) {
         e.auto_lod = true;
     }
-    for (i, (name, desc)) in [
-        ("LOD 0", "Close up"),
-        ("LOD 1", "Mid distance"),
-        ("LOD 2", "Far distance"),
-    ]
+    let labels: &[(&str, &str)] = if e.game_preview {
+        &[("Near", "Folded leaves"), ("Mid", "Flat leaves"), ("Far", "Spray cards"), ("Distant", "Spray cards")]
+    } else { &[("LOD 0", "Close up"), ("LOD 1", "Mid distance"), ("LOD 2", "Far distance")] };
+    for (i, (name, desc)) in labels
     .iter()
     .enumerate()
     {
-        let r = Rect::new(467. + i as f32 * 209., 813., 199., 44.);
+        let r = if e.game_preview { Rect::new(450. + i as f32 * 165., 813., 157., 44.) } else { Rect::new(467. + i as f32 * 209., 813., 199., 44.) };
         let active = !e.auto_lod && e.lod == i as u32;
         rounded(r, 6., if active { col(0xe0ead6) } else { col(0xebeee5) });
         ui.text(
@@ -2013,7 +2143,7 @@ fn lod_strip(ui: &Ui, e: &mut Editor) {
             if active { green() } else { ink() },
         );
         ui.text(desc, r.x + 12., r.y + 33., 10., muted());
-        let count = commas(e.model.lod_counts[i]);
+        let count = if e.game_preview { String::new() } else { commas(e.model.lod_counts[i]) };
         ui.text(
             &count,
             r.x + r.w - 12. - ui.width(&count, 15.),
@@ -2256,7 +2386,7 @@ fn modal(ui: &Ui, e: &mut Editor, m: Modal) {
         ui.text(
             match e.format.as_str() {
                 "gltf" => "Includes a .bin buffer per model. Keep it beside the .gltf file.",
-                "p3d" if e.game_lods => "Game cards are not shown in the current Solstice preview.",
+                "p3d" if e.game_lods => "Game cards and trimming can be compared in the viewer.",
                 "p3d" => "One native model with texture, material and packing sidecars.",
                 _ => "Includes a material file. Import foliage as double sided.",
             },

@@ -52,6 +52,10 @@ const INSTANCE_WIND: u32 = 1 << 27;
 const INSTANCE_WIND_LEAF: u32 = 1 << 26;
 /// This material belongs to a tree using the Grove/Poseidon wind convention.
 pub const MATERIAL_WIND: u32 = 1 << 4;
+/// Alpha-tested card material, sampled during visibility and shadow rasterization.
+pub const MATERIAL_ALPHA_TEST: u32 = 1 << 5;
+/// Suppress direct and indirect specular light for preview foliage.
+pub const MATERIAL_NO_SPECULAR: u32 = 1 << 6;
 
 impl GpuInstance {
     /// Places the instance at `world`. Where it was drawn last stays as `prev_world`.

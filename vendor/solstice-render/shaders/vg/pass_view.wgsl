@@ -38,6 +38,8 @@ struct PassView {
     // Towards the light, for a shadow view.
     eye_light: vec3f,
     wind_time: f32,
+    wind_parameters: vec4f,
+    wind_dynamics: vec4f,
 }
 
 // Twins of `InstanceFilter` in vg/culling.rs.

@@ -1,7 +1,7 @@
 //! The camera and the per-frame constants derived from it.
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec2, Vec3};
+use glam::{Mat4, Vec2, Vec3, Vec4};
 
 /// A perspective camera with reversed depth and an infinite far plane.
 ///
@@ -214,6 +214,8 @@ pub struct FrameUniform {
     pub sea_level: f32,
     pub moon_disc: Vec3,
     pub wind_time: f32,
+    pub wind_parameters: Vec4,
+    pub wind_dynamics: Vec4,
 }
 
 /// Sub-pixel offset for frame `index`, from the Halton (2, 3) sequence, in `-0.5..0.5`.

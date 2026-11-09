@@ -137,31 +137,104 @@ fn transform_point_prev(i: Instance, p: vec3f) -> vec3f {
     return vec3f(dot(i.prev_world_0, h), dot(i.prev_world_1, h), dot(i.prev_world_2, h));
 }
 
-fn vegetation_wind(i: Instance, model_y: f32, clock: f32, origin_xz: vec2f) -> vec3f {
-    if clock <= 0.0 || (i.material & INSTANCE_WIND) == 0u {
+fn vegetation_angle(i: Instance, p: vec3f, clock: f32, origin_xz: vec2f, params: vec4f) -> f32 {
+    if clock <= 0.0 || params.x <= 0.0 || (i.material & INSTANCE_WIND) == 0u {
+        return 0.0;
+    }
+    let encoded = clock - 1.0;
+    let t = encoded % 10000.0;
+    let phase = dot(origin_xz, vec2f(0.37, 0.29));
+    // Slow, coherent bending: the whole crown follows the trunk, with only a slight
+    // spatial phase variation. Growing the angle with height keeps the foot planted.
+    let spatial = dot(p.xz, vec2f(0.025, 0.02));
+    let sway = sin(t * 0.55 + phase + spatial) * 0.7 + sin(t * 0.93 + phase * 1.7 + spatial) * 0.3;
+    let gust = 1.0 + params.y * (0.5 + 0.5 * sin(t * 0.19 + phase));
+    let height = pow(clamp(max(p.y, 0.0) / 12.0, 0.0, 3.0), 0.6);
+    return clamp(0.025 * params.x * gust * height * sway, -0.3, 0.3);
+}
+
+// Steady-state response of a damped oscillator to a sinusoidal wind component. This
+// introduces a spring-like phase lag without frame-rate-dependent integration.
+fn spring_response(phase: f32, drive: f32, natural: f32, damping: f32) -> f32 {
+    let real = natural * natural - drive * drive;
+    let imag = 2.0 * damping * natural * drive;
+    let gain = min(natural * natural / max(length(vec2f(real, imag)), 0.001), 1.6);
+    return gain * sin(phase - atan2(imag, real));
+}
+
+fn vegetation_wind(i: Instance, p: vec3f, uv: vec2f, clock: f32, origin_xz: vec2f, params: vec4f, dynamics: vec4f) -> vec3f {
+    if clock <= 0.0 || params.x <= 0.0 || (i.material & INSTANCE_WIND) == 0u {
         return vec3f(0.0);
     }
     let encoded = clock - 1.0;
-    let angle = floor(encoded / 10000.0) * 0.3926990817;
+    let direction = floor(encoded / 10000.0) * 0.3926990817;
     let t = encoded % 10000.0;
-    let dir = vec2f(sin(angle), cos(angle));
+    let dir = vec2f(sin(direction), cos(direction));
     let side = vec2f(-dir.y, dir.x);
     let phase = dot(origin_xz, vec2f(0.37, 0.29));
-    let height = pow(clamp(model_y / 12.0, 0.0, 3.0), 1.6);
-    let sway = sin(t * 0.9 + phase) * 0.65 + sin(t * 1.63 + phase * 1.7) * 0.35;
-    var offset = dir * sway;
-    return 0.35 * height * vec3f(offset.x, 0.0, offset.y);
+    let angle = vegetation_angle(i, p, clock, origin_xz, params);
+    let world = transform_point(i, p) - vec3f(i.world_0.w, i.world_1.w, i.world_2.w);
+    let along = dot(world.xz, dir);
+    let bend_x = along * (cos(angle) - 1.0) + world.y * sin(angle);
+    let bend_y = world.y * (cos(angle) - 1.0) - along * sin(angle);
+    var bend = vec3f(dir.x * bend_x, bend_y, dir.y * bend_x);
+    // A low-amplitude, continuous crown field adds locally different branch responses.
+    // It fades in away from the trunk; wood and leaf bases at the same place use the
+    // same displacement. Without the source branch hierarchy this is an approximation,
+    // not a separate rotation about each branch joint.
+    let reach = smoothstep(0.25, 2.5, length(p.xz));
+    let exposure = clamp(max(p.y, 0.0) / 8.0, 0.0, 1.0);
+    let branch_phase = dot(p.xz, vec2f(0.72, 0.53)) + p.y * 0.21 + phase;
+    let branch_gust = 1.0 + params.y * (0.5 + 0.5 * sin(t * 0.19 + phase));
+    let spring = clamp(dynamics.x, 0.0, 1.0);
+    let natural = mix(3.5, 1.7, spring) * mix(1.0, 1.2, reach);
+    let damping = mix(0.8, 0.42, spring);
+    let along_response = spring_response(t * 1.31 + branch_phase, 1.31, natural, damping);
+    let cross_response = spring_response(t * 1.73 + branch_phase * 1.3, 1.73, natural, damping);
+    let branch_sway = dir * along_response + side * 0.45 * cross_response;
+    let branch_motion = 0.085 * params.x * params.w * branch_gust * reach * exposure * branch_sway;
+    bend += vec3f(branch_motion.x, 0.0, branch_motion.y);
+    // Each preview leaf has a stable phase in the integer portion of its U coordinate.
+    // At v=0 its flutter is zero, so the stalk follows exactly the same bend as its branch.
+    // Baked spray cards represent clusters, so they deliberately receive no tip flutter.
+    if (i.material & INSTANCE_WIND_LEAF) != 0u {
+        let id = floor(uv.x + 0.001);
+        let individual = id * 2.39996323 + phase + dot(p.xz, vec2f(0.71, 1.13));
+        var tip = 0.0;
+        if id >= 16.0 { tip = clamp(uv.y, 0.0, 1.0); }
+        else if uv.y >= 0.27 && uv.y <= 0.48 { tip = clamp((uv.y - 0.27) / 0.21, 0.0, 1.0); }
+        let flutter = dir * sin(t * 4.0 + individual) + side * sin(t * 3.1 + individual * 1.37);
+        let exposure = clamp(max(p.y, 0.0) / 4.0, 0.0, 1.0);
+        let leaf_motion = 0.004 * params.x * params.z * (1.0 + params.y) * exposure * tip * tip * flutter;
+        bend += vec3f(leaf_motion.x, 0.0, leaf_motion.y);
+    }
+    return bend;
 }
 
-fn transform_vegetation(i: Instance, p: vec3f, clock: f32) -> vec3f {
-    return transform_point(i, p) + vegetation_wind(i, p.y, clock, vec2f(i.world_0.w, i.world_2.w));
+fn transform_wind_normal(i: Instance, n: vec3f, p: vec3f, clock: f32, params: vec4f) -> vec3f {
+    let normal = transform_normal(i, n);
+    let angle = vegetation_angle(i, p, clock, vec2f(i.world_0.w, i.world_2.w), params);
+    let direction = floor(max(clock - 1.0, 0.0) / 10000.0) * 0.3926990817;
+    let dir = vec2f(sin(direction), cos(direction));
+    let along = dot(normal.xz, dir);
+    let bent_x = along * cos(angle) + normal.y * sin(angle);
+    return normalize(vec3f(normal.x + dir.x * (bent_x - along), normal.y * cos(angle) - along * sin(angle), normal.z + dir.y * (bent_x - along)));
 }
 
-fn vegetation_padding(i: Instance, top: f32, clock: f32) -> f32 {
-    if clock <= 0.0 || (i.material & INSTANCE_WIND) == 0u {
+fn transform_vegetation(i: Instance, p: vec3f, uv: vec2f, clock: f32, params: vec4f, dynamics: vec4f) -> vec3f {
+    return transform_point(i, p) + vegetation_wind(i, p, uv, clock, vec2f(i.world_0.w, i.world_2.w), params, dynamics);
+}
+
+fn vegetation_padding(i: Instance, center: vec3f, radius: f32, clock: f32, params: vec4f) -> f32 {
+    if clock <= 0.0 || params.x <= 0.0 || (i.material & INSTANCE_WIND) == 0u {
         return 0.0;
     }
-    return 0.47 * pow(clamp(top / 12.0, 0.0, 3.0), 1.6);
+    let height = pow(clamp(max(center.y + radius, 0.0) / 12.0, 0.0, 3.0), 0.6);
+    let max_angle = min(0.025 * params.x * (1.0 + params.y) * height, 0.3);
+    let sweep = 2.0 * sin(max_angle * 0.5) * (length(center) + radius) * i.max_scale;
+    let flutter = 0.006 * params.x * params.z * (1.0 + params.y);
+    let branches = 0.16 * params.x * params.w * (1.0 + params.y);
+    return sweep + flutter + branches;
 }
 
 fn transform_normal(i: Instance, n: vec3f) -> vec3f {

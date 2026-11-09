@@ -9,12 +9,16 @@
 struct VertexOutput {
     @builtin(position) position: vec4f,
     @location(0) @interpolate(flat) id: u32,
+    @location(1) uv: vec2f,
+    @location(2) @interpolate(flat) material: u32,
 }
 
 fn cluster_vertex(vertex_index: u32, instance_index: u32) -> VertexOutput {
     var out: VertexOutput;
     out.position = vec4f(0.0);
     out.id = 0u;
+    out.uv = vec2f(0.0);
+    out.material = 0u;
 
     let visible_index = arrayLength(&visible) - 1u - (state.hw_base + instance_index);
     let entry = visible[visible_index];
@@ -29,7 +33,7 @@ fn cluster_vertex(vertex_index: u32, instance_index: u32) -> VertexOutput {
     var clip: array<vec4f, 3>;
     for (var corner = 0u; corner < 3u; corner++) {
         let vertex = vertices[cluster.vertex_offset + local_vertex(packed_triangle, corner)];
-        let world = transform_vegetation(instance, decode_position(instance, vertex), view.wind_time);
+        let world = transform_vegetation(instance, decode_position(instance, vertex), decode_uv(instance, vertex), view.wind_time, view.wind_parameters, view.wind_dynamics);
         clip[corner] = view.raster_view_proj * vec4f(world, 1.0);
     }
 
@@ -43,6 +47,8 @@ fn cluster_vertex(vertex_index: u32, instance_index: u32) -> VertexOutput {
 
     out.position = clip[vertex_index % 3u];
     out.id = encode_id(visible_index, triangle);
+    out.uv = decode_uv(instance, vertices[cluster.vertex_offset + local_vertex(packed_triangle, vertex_index % 3u)]);
+    out.material = instance_material(instance);
     return out;
 }
 
@@ -53,6 +59,6 @@ fn vs_visibility(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32)
 
 // Depth-only entry point, used by shadow maps.
 @vertex
-fn vs_depth(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> @builtin(position) vec4f {
-    return cluster_vertex(v, i).position;
+fn vs_depth(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> VertexOutput {
+    return cluster_vertex(v, i);
 }

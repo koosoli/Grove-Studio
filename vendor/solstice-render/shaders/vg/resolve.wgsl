@@ -168,9 +168,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let local0 = decode_position(instance, v0);
     let local1 = decode_position(instance, v1);
     let local2 = decode_position(instance, v2);
-    let world0 = transform_vegetation(instance, local0, frame.wind_time);
-    let world1 = transform_vegetation(instance, local1, frame.wind_time);
-    let world2 = transform_vegetation(instance, local2, frame.wind_time);
+    let world0 = transform_vegetation(instance, local0, decode_uv(instance, v0), frame.wind_time, frame.wind_parameters, frame.wind_dynamics);
+    let world1 = transform_vegetation(instance, local1, decode_uv(instance, v1), frame.wind_time, frame.wind_parameters, frame.wind_dynamics);
+    let world2 = transform_vegetation(instance, local2, decode_uv(instance, v2), frame.wind_time, frame.wind_parameters, frame.wind_dynamics);
     let clip = array<vec4f, 3>(
         frame.view_proj * vec4f(world0, 1.0),
         frame.view_proj * vec4f(world1, 1.0),
@@ -198,9 +198,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     var normal = normalize(interp3(
         b,
-        transform_normal(instance, decode_normal(v0)),
-        transform_normal(instance, decode_normal(v1)),
-        transform_normal(instance, decode_normal(v2)),
+        transform_wind_normal(instance, decode_normal(v0), local0, frame.wind_time, frame.wind_parameters),
+        transform_wind_normal(instance, decode_normal(v1), local1, frame.wind_time, frame.wind_parameters),
+        transform_wind_normal(instance, decode_normal(v2), local2, frame.wind_time, frame.wind_parameters),
     ));
     // Seen from behind, a two-sided surface is lit as its other side.
     let face = cross(world1 - world0, world2 - world0);
@@ -278,7 +278,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let local = interp3(b, local0, local1, local2);
     let prev_time = select(0.0, max(1.0, frame.wind_time - frame.frame_seconds), frame.wind_time > 0.0);
     let prev_world = transform_point_prev(instance, local) + vegetation_wind(
-        instance, local.y, prev_time, vec2f(instance.prev_world_0.w, instance.prev_world_2.w),
+        instance, local, uv / material.uv_scale, prev_time, vec2f(instance.prev_world_0.w, instance.prev_world_2.w), frame.wind_parameters, frame.wind_dynamics,
     );
     let prev_clip = frame.prev_view_proj * vec4f(prev_world, 1.0);
     let current_clip = frame.unjittered_view_proj * vec4f(world, 1.0);
@@ -324,6 +324,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     textureStore(out_albedo, pixel, vec4f(albedo, cavity));
     textureStore(out_normal, pixel, vec4f(oct_encode(normal), roughness, metallic));
     // Alpha holds the shading model for the lighting pass.
-    textureStore(out_emissive, pixel, vec4f(emissive, f32(material.flags & MATERIAL_FOLIAGE)));
+    let transmission = select(0.8, f32((material.flags >> 16u) & 255u) / 100.0, (material.flags & 128u) != 0u);
+    let foliage_model = select(2.0, 4.0, (material.flags & 64u) != 0u) + transmission;
+    let model = select(0.0, foliage_model, (material.flags & MATERIAL_FOLIAGE) != 0u);
+    textureStore(out_emissive, pixel, vec4f(emissive, model));
     textureStore(out_motion, pixel, vec4f(motion, 0.0, 0.0));
 }

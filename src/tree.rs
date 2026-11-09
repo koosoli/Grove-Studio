@@ -59,6 +59,9 @@ pub struct Settings {
     pub density: f32,
     pub leaf_size: f32,
     pub trunk_radius: f32,
+    pub trunk_straightness: f32,
+    pub branch_angle: f32,
+    pub branch_droop: f32,
     pub season: u32,
     pub parallax_depth: f32,
 }
@@ -73,6 +76,9 @@ impl Default for Settings {
             density: 1.,
             leaf_size: 0.23,
             trunk_radius: 0.23,
+            trunk_straightness: 0.5,
+            branch_angle: 1.,
+            branch_droop: 1.,
             season: 0,
             parallax_depth: 0.035,
         }
@@ -108,6 +114,9 @@ impl Settings {
             ("density", self.density, 0.25, 1.8),
             ("leaf_size", self.leaf_size, 0.025, 0.40),
             ("trunk_radius", self.trunk_radius, 0.05, 0.45),
+            ("trunk_straightness", self.trunk_straightness, 0., 1.),
+            ("branch_angle", self.branch_angle, 0.5, 1.5),
+            ("branch_droop", self.branch_droop, 0., 2.),
             ("parallax_depth", self.parallax_depth, 0., 0.08),
         ] {
             if !v.is_finite() || v < lo || v > hi {
@@ -404,6 +413,37 @@ fn export_gltf(t: &Tree, path: &Path, s: &Settings) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simplified_leaf_pieces_keep_their_stalk_positions() {
+        for (species, needle) in [("solstice-oak", false), ("solstice-fir", true)] {
+            let settings = Settings::preset(species).unwrap();
+            let full = generate(&settings, 0);
+            let coarse = generate(&settings, 2);
+            let anchor = |part: &Part| if needle { (part.v[0].p + part.v[1].p) * 0.5 } else { part.v[0].p };
+            assert!(anchor(&full.leaves).distance(anchor(&coarse.leaves)) < 1e-5, "{species}");
+        }
+    }
+
+    #[test]
+    fn shape_controls_change_generated_wood_and_old_projects_get_defaults() {
+        let old: Settings = serde_json::from_str(r#"{"species":"solstice-oak"}"#).unwrap();
+        assert_eq!(old.trunk_straightness, 0.5);
+        assert_eq!(old.branch_angle, 1.);
+        assert_eq!(old.branch_droop, 1.);
+        let original = generate(&old, 2);
+        for variant in 0..3 {
+            let mut changed = old.clone();
+            match variant {
+                0 => changed.trunk_straightness = 1.,
+                1 => changed.branch_angle = 0.65,
+                _ => changed.branch_droop = 1.8,
+            }
+            changed.validate().unwrap();
+            let altered = generate(&changed, 2);
+            assert!(original.bark.v.len() != altered.bark.v.len() || original.bark.v.iter().zip(&altered.bark.v).any(|(a,b)| a.p.distance_squared(b.p) > 1e-8), "control {variant}");
+        }
+    }
     #[test]
     fn trees_are_deterministic_finite_and_lods_reduce() {
         for name in crate::reference::IDS.iter().copied().step_by(6) {
