@@ -207,6 +207,9 @@ pub struct BarkImages {
     pub color: Vec<u8>,
     pub normal: Vec<u8>,
     pub height: Vec<u8>,
+    /// Solstice's bark cavity (the bake's colour alpha), one byte per texel of `color`: 255 on
+    /// the open bark, darker in the furrows. Solstice darkens the indirect light with it.
+    pub cavity: Vec<u8>,
 }
 
 pub fn bark_images(s: &Settings) -> Option<&'static BarkImages> {
@@ -217,7 +220,9 @@ pub fn bark_images(s: &Settings) -> Option<&'static BarkImages> {
         let mut layer = species(s).unwrap().bark.surface(0).bake(EDGE);
         let mut color = layer.color_mips.remove(0);
         let mut height = Vec::new();
+        let mut cavity = Vec::new();
         for p in color.chunks_exact_mut(4) {
+            cavity.push(p[3]);
             // Cavity and albedo approximate a matching relief map from the upstream bake.
             let light = (u32::from(p[0]) + 2 * u32::from(p[1]) + u32::from(p[2])) / 4;
             height.push((light * u32::from(p[3]) / 255) as u8);
@@ -257,6 +262,7 @@ pub fn bark_images(s: &Settings) -> Option<&'static BarkImages> {
             height: encode(image::DynamicImage::ImageLuma8(
                 ImageBuffer::from_raw(EDGE, EDGE, height).unwrap(),
             )),
+            cavity,
         }
     }))
 }
