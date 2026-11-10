@@ -33,7 +33,7 @@ fn cluster_vertex(vertex_index: u32, instance_index: u32) -> VertexOutput {
     var clip: array<vec4f, 3>;
     for (var corner = 0u; corner < 3u; corner++) {
         let vertex = vertices[cluster.vertex_offset + local_vertex(packed_triangle, corner)];
-        let world = transform_vegetation(instance, decode_position(instance, vertex), decode_uv(instance, vertex), view.wind_time, view.wind_parameters, view.wind_dynamics);
+        let world = transform_vegetation(instance, decode_position(instance, vertex), decode_uv(instance, vertex), vertex, view.wind_time, view.wind_parameters, view.wind_dynamics);
         clip[corner] = view.raster_view_proj * vec4f(world, 1.0);
     }
 

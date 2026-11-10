@@ -17,6 +17,7 @@ macro_rules! shader_table {
 pub const SOURCES: &[(&str, &str)] = shader_table![
     "common/math.wgsl",
     "common/scene.wgsl",
+    "common/hierarchy_wind.wgsl",
     "common/frame.wgsl",
     "common/wetness.wgsl",
     "common/brdf.wgsl",

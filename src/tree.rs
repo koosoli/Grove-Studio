@@ -7,12 +7,38 @@ use std::{fs, path::Path};
 fn bark(s: &Settings) -> &'static crate::reference::BarkImages {
     crate::reference::bark_images(s).expect("validated Solstice species")
 }
-pub fn relief_textures(s: &Settings) -> (&'static [u8], &'static [u8]) {
-    let bark = bark(s);
-    (&bark.height, &bark.normal)
+fn selected_png(path: &Option<String>, default: &[u8]) -> Result<Vec<u8>, String> {
+    match path {
+        Some(path) => {
+            let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+            image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+                .map_err(|e| format!("{path}: invalid PNG: {e}"))?;
+            Ok(bytes)
+        }
+        None => Ok(default.to_vec()),
+    }
 }
-pub fn bark_texture(s: &Settings) -> &'static [u8] {
-    &bark(s).color
+pub fn relief_textures(s: &Settings) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let bark = bark(s);
+    Ok((selected_png(&s.bark_height_path, &bark.height)?, selected_png(&s.bark_normal_path, &bark.normal)?))
+}
+pub fn bark_texture(s: &Settings) -> Result<Vec<u8>, String> {
+    let bytes = selected_png(&s.bark_color_path, &bark(s).color)?;
+    if s.bark_weathering <= 0. { return Ok(bytes); }
+    let mut image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).map_err(|e| e.to_string())?.into_rgba8();
+    let (width, height) = image.dimensions();
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        let u = x as f32 / width as f32 * std::f32::consts::TAU;
+        let v = y as f32 / height as f32 * std::f32::consts::TAU;
+        let pattern = (u.sin() * 2. + v.cos() * 3. + (u * 3. + v * 2.).sin()).sin();
+        let amount = ((pattern - 0.15) / 0.85).clamp(0., 1.) * s.bark_weathering * 0.55;
+        for (ch, tint) in [42., 63., 28.].iter().enumerate() {
+            pixel[ch] = (pixel[ch] as f32 * (1. - amount) + tint * amount) as u8;
+        }
+    }
+    let mut result = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image).write_to(&mut result, image::ImageOutputFormat::Png).map_err(|e| e.to_string())?;
+    Ok(result.into_inner())
 }
 
 pub fn leaf_color(s: &Settings, variant: usize) -> [f32; 4] {
@@ -56,6 +82,8 @@ pub struct Settings {
     pub height: f32,
     pub spread: f32,
     pub branches: u32,
+    /// Relative development stage: 1 preserves the species preset's mature dimensions.
+    pub maturity: f32,
     pub density: f32,
     pub leaf_size: f32,
     pub trunk_radius: f32,
@@ -64,6 +92,11 @@ pub struct Settings {
     pub branch_droop: f32,
     pub season: u32,
     pub parallax_depth: f32,
+    pub bark_weathering: f32,
+    pub bark_color_path: Option<String>,
+    pub bark_height_path: Option<String>,
+    pub bark_normal_path: Option<String>,
+    pub leaf_atlas_path: Option<String>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -73,6 +106,7 @@ impl Default for Settings {
             height: 8.,
             spread: 1.,
             branches: 11,
+            maturity: 1.,
             density: 1.,
             leaf_size: 0.23,
             trunk_radius: 0.23,
@@ -81,6 +115,11 @@ impl Default for Settings {
             branch_droop: 1.,
             season: 0,
             parallax_depth: 0.035,
+            bark_weathering: 0.,
+            bark_color_path: None,
+            bark_height_path: None,
+            bark_normal_path: None,
+            leaf_atlas_path: None,
         }
     }
 }
@@ -111,6 +150,7 @@ impl Settings {
                 if shrub { 0.65 } else { 40. },
             ),
             ("spread", self.spread, 0.4, 1.6),
+            ("maturity", self.maturity, 0.4, 1.2),
             ("density", self.density, 0.25, 1.8),
             ("leaf_size", self.leaf_size, 0.025, 0.40),
             ("trunk_radius", self.trunk_radius, 0.05, 0.45),
@@ -118,6 +158,7 @@ impl Settings {
             ("branch_angle", self.branch_angle, 0.5, 1.5),
             ("branch_droop", self.branch_droop, 0., 2.),
             ("parallax_depth", self.parallax_depth, 0., 0.08),
+            ("bark_weathering", self.bark_weathering, 0., 1.),
         ] {
             if !v.is_finite() || v < lo || v > hi {
                 return Err(format!("{name} must be between {lo} and {hi}"));
@@ -125,6 +166,13 @@ impl Settings {
         }
         if !(5..=20).contains(&self.branches) || self.season > 3 {
             return Err("Branches must be 5..20; season must be 0..3 (winter is 3)".into());
+        }
+        for path in [&self.bark_color_path, &self.bark_height_path, &self.bark_normal_path, &self.leaf_atlas_path].into_iter().flatten() {
+            let reader = image::io::Reader::open(path).map_err(|e| format!("{path}: {e}"))?.with_guessed_format().map_err(|e| e.to_string())?;
+            if reader.format() != Some(image::ImageFormat::Png) { return Err(format!("{path}: material images must be PNG")); }
+            let dimensions = reader.into_dimensions().map_err(|e| format!("{path}: {e}"))?;
+            if dimensions.0 == 0 || dimensions.1 == 0 || dimensions.0 > 8192 || dimensions.1 > 8192 { return Err(format!("{path}: image dimensions must be 1..8192 pixels")); }
+            image::open(path).map_err(|e| format!("{path}: invalid PNG: {e}"))?;
         }
         Ok(())
     }
@@ -136,6 +184,8 @@ pub struct V {
     pub n: Vec3,
     pub c: [f32; 4],
     pub uv: Vec2,
+    /// Index into the originating tree's growth hierarchy.
+    pub branch: u32,
 }
 #[derive(Clone, Default)]
 pub struct Part {
@@ -178,10 +228,19 @@ impl Part {
             .collect()
     }
 }
+#[derive(Clone, Serialize)]
+pub struct Branch {
+    pub parent: Option<usize>,
+    pub points: Vec<[f32; 3]>,
+    pub radii: Vec<f32>,
+}
 pub struct Tree {
     pub bark: Part,
     pub leaves: Part,
     pub lod: u32,
+    pub branches: Vec<Branch>,
+    pub bark_branch: Vec<u32>,
+    pub leaf_branch: Vec<u32>,
 }
 impl Tree {
     pub fn triangles(&self) -> usize {
@@ -277,10 +336,11 @@ fn export_obj(t: &Tree, path: &Path, s: &Settings) -> Result<(), String> {
     for (name, p) in [("Bark", &t.bark), ("Foliage", &t.leaves)] {
         writeln!(text, "o {name}\nusemtl {name}").unwrap();
         for v in &p.v {
+            let color = if name == "Foliage" && s.leaf_atlas_path.is_some() { [1.; 4] } else { v.c };
             writeln!(
                 text,
                 "v {:.6} {:.6} {:.6} {:.4} {:.4} {:.4}",
-                v.p.x, v.p.y, v.p.z, v.c[0], v.c[1], v.c[2]
+                v.p.x, v.p.y, v.p.z, color[0], color[1], color[2]
             )
             .unwrap()
         }
@@ -299,19 +359,24 @@ fn export_obj(t: &Tree, path: &Path, s: &Settings) -> Result<(), String> {
         offset += p.v.len() as u32;
     }
     let bark_path = path.with_extension("bark.png");
-    write(&bark_path, bark_texture(s))?;
-    let (height, normal) = relief_textures(s);
+    write(&bark_path, bark_texture(s)?)?;
+    let (height, normal) = relief_textures(s)?;
     let height_path = path.with_extension("bark-height.png");
     let normal_path = path.with_extension("bark-normal.png");
     write(&height_path, height)?;
     write(&normal_path, normal)?;
-    let materials = format!(
+    let mut materials = format!(
         "newmtl Bark\nKd 1 1 1\nmap_Kd {}\nbump -bm {} {}\ndisp {}\nnorm {}\nnewmtl Foliage\nKd 1 1 1\n",
         bark_path.file_name().unwrap().to_string_lossy(), s.parallax_depth,
         height_path.file_name().unwrap().to_string_lossy(),
         height_path.file_name().unwrap().to_string_lossy(),
         normal_path.file_name().unwrap().to_string_lossy(),
     );
+    if let Some(path_to_atlas) = &s.leaf_atlas_path {
+        let leaf_path = path.with_extension("leaves.png");
+        write(&leaf_path, fs::read(path_to_atlas).map_err(|e| format!("{path_to_atlas}: {e}"))?)?;
+        materials.push_str(&format!("map_Kd {}\nmap_d {}\n", leaf_path.file_name().unwrap().to_string_lossy(), leaf_path.file_name().unwrap().to_string_lossy()));
+    }
     write(&mtl, materials)?;
     write(path, text)
 }
@@ -339,8 +404,8 @@ fn export_gltf(t: &Tree, path: &Path, s: &Settings) -> Result<(), String> {
                     "POSITION" => vec![v.p.x, v.p.y, v.p.z],
                     "NORMAL" => vec![v.n.x, v.n.y, v.n.z],
                     "TANGENT" => tangents[vertex].to_array().to_vec(),
-                    "COLOR_0" => v.c.to_vec(),
-                    "_WIND" => wind_weights(v, s.height, material == 1).to_vec(),
+                    "COLOR_0" => if material == 1 && s.leaf_atlas_path.is_some() { vec![1.; 4] } else { v.c.to_vec() },
+                    "_WIND" => wind_weights(v, s.height * s.maturity, material == 1).to_vec(),
                     _ => vec![v.uv.x, v.uv.y],
                 };
                 for (i, f) in data.iter().enumerate() {
@@ -355,6 +420,14 @@ fn export_gltf(t: &Tree, path: &Path, s: &Settings) -> Result<(), String> {
             access.push(json!({"bufferView":view,"componentType":5126,"count":p.v.len(),"type":kind,"min":lo,"max":hi}));
             attrs.insert(semantic.into(), json!(id));
         }
+        let owners = if material == 0 { &t.bark_branch } else { &t.leaf_branch };
+        let offset = bin.len();
+        for owner in owners { bin.extend(owner.to_le_bytes()); }
+        let view = views.len();
+        views.push(json!({"buffer":0,"byteOffset":offset,"byteLength":bin.len()-offset,"target":34962}));
+        let id = access.len();
+        access.push(json!({"bufferView":view,"componentType":5125,"count":owners.len(),"type":"SCALAR"}));
+        attrs.insert("_BRANCH".into(), json!(id));
         let offset = bin.len();
         for i in &p.i {
             bin.extend(i.to_le_bytes())
@@ -386,9 +459,10 @@ fn export_gltf(t: &Tree, path: &Path, s: &Settings) -> Result<(), String> {
         .collect::<String>();
     let mut images = vec![];
     let mut texture_defs = vec![];
-    let (height, normal) = relief_textures(s);
+    let (height, normal) = relief_textures(s)?;
+    let bark_color = bark_texture(s)?;
     let height_index = 1;
-    for data in [bark_texture(s), height, normal] {
+    for data in [&bark_color, &height, &normal] {
         while bin.len() % 4 != 0 {
             bin.push(0);
         }
@@ -403,9 +477,21 @@ fn export_gltf(t: &Tree, path: &Path, s: &Settings) -> Result<(), String> {
         {"name":"Bark","pbrMetallicRoughness":{"baseColorFactor":[1,1,1,1],"baseColorTexture":{"index":0},"metallicFactor":0,"roughnessFactor":0.92}},
         {"name":"Foliage","doubleSided":true,"pbrMetallicRoughness":{"baseColorFactor":[1,1,1,1],"metallicFactor":0,"roughnessFactor":0.85}}
     ]);
+    if let Some(path_to_atlas) = &s.leaf_atlas_path {
+        let data = fs::read(path_to_atlas).map_err(|e| format!("{path_to_atlas}: {e}"))?;
+        while bin.len() % 4 != 0 { bin.push(0); }
+        let offset = bin.len();
+        bin.extend_from_slice(&data);
+        let view = views.len();
+        views.push(json!({"buffer":0,"byteOffset":offset,"byteLength":data.len()}));
+        images.push(json!({"bufferView":view,"mimeType":"image/png"}));
+        texture_defs.push(json!({"source":images.len()-1,"sampler":0}));
+        materials[1]["pbrMetallicRoughness"]["baseColorTexture"] = json!({"index":texture_defs.len()-1});
+        materials[1]["alphaMode"] = json!("MASK");
+    }
     materials[0]["normalTexture"] = json!({"index":height_index+1});
     materials[0]["extras"] = json!({"parallax":{"heightTexture":{"index":height_index,"texCoord":0},"scale":s.parallax_depth,"layers":16,"heightConvention":"white is raised; depth = 1 - height","requiresEngineShader":true}});
-    let doc = json!({"asset":{"version":"2.0","generator":"Grove Studio"},"scene":0,"scenes":[{"nodes":[0]}],"nodes":[{"mesh":0,"name":format!("Tree_LOD{}",t.lod)}],"meshes":[{"primitives":primitives}],"materials":materials,"images":images,"textures":texture_defs,"samplers":[{"magFilter":9729,"minFilter":9987,"wrapS":10497,"wrapT":10497}],"buffers":[{"uri":buffer_uri,"byteLength":bin.len()}],"bufferViews":views,"accessors":access,"extras":{"units":"meters","upAxis":"Y","lod":t.lod,"settings":s,"wind":{"attribute":"_WIND","components":["normalized height squared","foliage flutter weight"],"requiresEngineShader":true}}});
+    let doc = json!({"asset":{"version":"2.0","generator":"Grove Studio"},"scene":0,"scenes":[{"nodes":[0]}],"nodes":[{"mesh":0,"name":format!("Tree_LOD{}",t.lod)}],"meshes":[{"primitives":primitives}],"materials":materials,"images":images,"textures":texture_defs,"samplers":[{"magFilter":9729,"minFilter":9987,"wrapS":10497,"wrapT":10497}],"buffers":[{"uri":buffer_uri,"byteLength":bin.len()}],"bufferViews":views,"accessors":access,"extras":{"units":"meters","upAxis":"Y","lod":t.lod,"settings":s,"wind":{"attribute":"_WIND","components":["normalized height squared","foliage flutter weight"],"branchAttribute":"_BRANCH","branches":t.branches,"requiresEngineShader":true}}});
     write(&buffer, bin)?;
     write(path, serde_json::to_vec_pretty(&doc).unwrap())
 }
@@ -413,6 +499,31 @@ fn export_gltf(t: &Tree, path: &Path, s: &Settings) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_materials_and_branch_hierarchy_export() {
+        let dir = std::env::temp_dir().join(format!("grove-material-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let atlas = dir.join("leaf.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([40, 90, 20, 255])).save(&atlas).unwrap();
+        let mut s = Settings::preset("solstice-oak").unwrap();
+        s.leaf_atlas_path = Some(atlas.to_string_lossy().into_owned());
+        s.bark_color_path = s.leaf_atlas_path.clone();
+        s.validate().unwrap();
+        let model = dir.join("tree.gltf");
+        export(&s, 2, "gltf", &model).unwrap();
+        let doc: Value = serde_json::from_slice(&fs::read(model).unwrap()).unwrap();
+        assert_eq!(doc["images"].as_array().unwrap().len(), 4);
+        assert_eq!(doc["materials"][1]["pbrMetallicRoughness"]["baseColorTexture"]["index"], 3);
+        assert!(doc["extras"]["wind"]["branches"].as_array().unwrap().len() > 1);
+        for primitive in doc["meshes"][0]["primitives"].as_array().unwrap() {
+            let accessor = primitive["attributes"]["_BRANCH"].as_u64().unwrap() as usize;
+            assert_eq!(doc["accessors"][accessor]["componentType"], 5125);
+            assert_eq!(doc["accessors"][accessor]["count"], doc["accessors"][primitive["attributes"]["POSITION"].as_u64().unwrap() as usize]["count"]);
+        }
+        s.leaf_atlas_path = Some(dir.join("missing.png").to_string_lossy().into_owned());
+        assert!(s.validate().is_err());
+    }
 
     #[test]
     fn simplified_leaf_pieces_keep_their_stalk_positions() {

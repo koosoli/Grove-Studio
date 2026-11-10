@@ -138,6 +138,7 @@ struct Leaf {
     n_mid: Vec3,
     n_tip: Vec3,
     color: [f32; 4],
+    branch: u32,
 }
 
 impl Leaf {
@@ -154,6 +155,7 @@ pub struct Ladder {
     pub levels: Vec<Level>,
     /// The leaf atlas: ATLAS x ATLAS RGBA, sRGB colour with the cutout alpha.
     pub atlas: Vec<u8>,
+    pub branches: Vec<crate::tree::Branch>,
 }
 
 /// Clip alpha cards to a padded convex hull of the base atlas alpha. Opaque pieces are kept.
@@ -248,7 +250,7 @@ pub fn trim_cards(ladder: &mut Ladder) {
                         let dc = side(current.uv);
                         if (dp >= 0.) != (dc >= 0.) {
                             let t = dp / (dp - dc);
-                            polygon.push(V { p: previous.p.lerp(current.p,t), n: previous.n.lerp(current.n,t),
+                            polygon.push(V { p: previous.p.lerp(current.p,t), n: previous.n.lerp(current.n,t), branch: previous.branch,
                                 uv: previous.uv.lerp(current.uv,t), c: std::array::from_fn(|i| previous.c[i] + (current.c[i]-previous.c[i])*t) });
                         }
                         if dc >= 0. { polygon.push(current); }
@@ -322,6 +324,7 @@ pub fn ladder_with(s: &Settings, rungs: &[Rung]) -> Ladder {
     for v in full.bark.v.iter_mut().chain(&mut full.leaves.v) {
         v.p.y -= foot;
     }
+    for branch in &mut full.branches { for point in &mut branch.points { point[1] -= foot; } }
     let kind = crate::reference::leaf_kind(s).unwrap_or(LeafKind::Broadleaf);
     let needles = kind == LeafKind::Needles;
     let colors = crate::preview::leaf_rgba(s);
@@ -352,14 +355,14 @@ pub fn ladder_with(s: &Settings, rungs: &[Rung]) -> Ladder {
         let foliage = match style {
             LeafStyle::Folded => cards(&leaves, left, true),
             LeafStyle::Flat => cards(&leaves, left, false),
-            LeafStyle::Clusters => spray_cards(&leaves, &cluster(&leaves, left / 6, card_scale), crown),
+            LeafStyle::Clusters => spray_cards(&leaves, &cluster(&leaves, left / 6, card_scale), crown, &full.branches),
             LeafStyle::Opaque => opaque_pieces(&full.leaves, pieces, left),
             LeafStyle::PiecesOverSprays => {
                 // the mid level's spray cards as the body of the crown, and needle fans in the
                 // rest of the budget for the close-up detail: near hands over to mid without
                 // the crown thinning out
                 let body = rungs.get(1).map_or(LADDER[1].budget, |r| r.budget) * 3 / 4;
-                let mut part = spray_cards(&leaves, &cluster(&leaves, body / 6, card_scale), crown);
+                let mut part = spray_cards(&leaves, &cluster(&leaves, body / 6, card_scale), crown, &full.branches);
                 let fans = thin_pieces(&full.leaves, pieces, left.saturating_sub(body));
                 let first = part.v.len() as u32;
                 part.v.extend(fans.v);
@@ -369,7 +372,7 @@ pub fn ladder_with(s: &Settings, rungs: &[Rung]) -> Ladder {
         };
         levels.push(Level { rung, bark, leaves: foliage });
     }
-    Ladder { levels, atlas }
+    Ladder { levels, atlas, branches: full.branches }
 }
 
 /// Inspection statistics for a ladder.
@@ -410,6 +413,7 @@ fn read_leaves(part: &Part, kind: LeafKind) -> Vec<Leaf> {
                 n_mid: piece[2].n,
                 n_tip: piece[2].n,
                 color: piece[0].c,
+                branch: piece[0].branch,
             });
         }
         return out;
@@ -432,6 +436,7 @@ fn read_leaves(part: &Part, kind: LeafKind) -> Vec<Leaf> {
             n_mid: piece[2].n,
             n_tip: piece[7].n,
             color: piece[0].c,
+            branch: piece[0].branch,
         });
     }
     out
@@ -535,6 +540,7 @@ fn cards(leaves: &[Leaf], budget: usize, folded: bool) -> Part {
             p,
             n,
             c: leaf.color,
+            branch: leaf.branch,
             uv: vec2(column_u(leaf.variant, across), uv_in(CUTOUT, along)),
         };
         let first = out.v.len() as u32;
@@ -641,8 +647,12 @@ fn orthonormal(n: Vec3) -> (Vec3, Vec3) {
 
 /// Three crossed spray cards per cluster: facing out of the crown, across it and up. Their
 /// normals lean out from the crown's centre, as the source leaves' do.
-fn spray_cards(leaves: &[Leaf], clusters: &[Cluster], crown: Vec3) -> Part {
+fn spray_cards(leaves: &[Leaf], clusters: &[Cluster], crown: Vec3, branches: &[crate::tree::Branch]) -> Part {
     let mut out = Part::default();
+    let mut depths = vec![0usize; branches.len()];
+    for (i, branch) in branches.iter().enumerate() {
+        if let Some(parent) = branch.parent { depths[i] = depths[parent] + 1; }
+    }
     for (k, c) in clusters.iter().enumerate() {
         let h = hash(k as u32 * 3 + 1);
         let mut out_dir = Vec3::new(c.center.x, 0., c.center.z);
@@ -654,6 +664,15 @@ fn spray_cards(leaves: &[Leaf], clusters: &[Cluster], crown: Vec3) -> Part {
         let up = (Vec3::Y * 0.8 + c.normal * 0.2).normalize_or(Vec3::Y);
         let lit = (c.center - crown).normalize_or(Vec3::Y);
         let color = leaves[c.members[0]].color;
+        // A distant card represents several shoots. Attach it to their lowest shared ancestor
+        // rather than pretending that the whole cluster belongs to one individual twig.
+        let mut owner = leaves[c.members[0]].branch as usize;
+        for &member in &c.members[1..] {
+            let mut b = leaves[member].branch as usize;
+            while depths[owner] > depths[b] { owner = branches[owner].parent.unwrap(); }
+            while depths[b] > depths[owner] { b = branches[b].parent.unwrap(); }
+            while owner != b { owner = branches[owner].parent.unwrap(); b = branches[b].parent.unwrap(); }
+        }
         let spray = SPRAY_U[(h & 1) as usize];
         // A card never hangs below its cluster's lowest leaf: big far cards otherwise drop a
         // curtain of foliage to head height under the crowns (2026-11-08, in game).
@@ -676,6 +695,7 @@ fn spray_cards(leaves: &[Leaf], clusters: &[Cluster], crown: Vec3) -> Part {
                     p,
                     n,
                     c: color,
+                    branch: owner as u32,
                     uv: vec2(
                         spray.0 + (spray.1 - spray.0) * (x * 0.5 + 0.5),
                         uv_in(SPRAY, y * 0.5 + 0.5),
@@ -849,7 +869,7 @@ fn leaf_atlas(colors: &[u8], kind: LeafKind) -> Vec<u8> {
         let x = ((u * 256.) as usize).min(255);
         let y = ((v * 256.) as usize).min(255);
         let i = (y * 256 + x) * 4;
-        [colors[i], colors[i + 1], colors[i + 2]]
+        [colors[i], colors[i + 1], colors[i + 2], colors[i + 3]]
     };
     for y in 0..edge {
         let vy = (y as f32 + 0.5) / edge as f32;
@@ -861,8 +881,8 @@ fn leaf_atlas(colors: &[u8], kind: LeafKind) -> Vec<u8> {
                     continue;
                 }
                 let v = (vy - region.0) / (region.1 - region.0);
-                let rgb = sample(u, v);
-                out[i..i + 3].copy_from_slice(&rgb);
+                let rgba = sample(u, v);
+                out[i..i + 3].copy_from_slice(&rgba[..3]);
                 let alpha = if cut {
                     let across = (((u * 4.).fract()) - 0.5) / 0.47;
                     let limit = if kind == LeafKind::Needles {
@@ -874,7 +894,7 @@ fn leaf_atlas(colors: &[u8], kind: LeafKind) -> Vec<u8> {
                 } else {
                     true
                 };
-                out[i + 3] = if alpha { 255 } else { 0 };
+                out[i + 3] = if alpha { rgba[3] } else { 0 };
             }
         }
     }
@@ -949,11 +969,12 @@ fn bake_sprays(
                     if z <= *slotd {
                         return;
                     }
-                    *slotd = z;
                     let uv: Vec2 = ua * l0 + ub * l1 + uc * l2;
                     let sx = ((uv.x * 256.) as usize).min(255);
                     let sy = ((uv.y * 256.) as usize).min(255);
                     let si = (sy * 256 + sx) * 4;
+                    if colors[si + 3] < 128 { return; }
+                    *slotd = z;
                     // deeper leaves are in the shade of the ones above them
                     let shade = 0.6 + 0.4 * ((z / deepest) * 0.5 + 0.5).clamp(0., 1.);
                     let o = ((y0 + py) * edge + x0 + px) * 4;
@@ -1004,7 +1025,7 @@ mod tests {
     #[test]
     fn enlarged_cards_keep_the_original_leaf_base() {
         let leaf = Leaf { base: Vec3::new(1.,2.,3.), tip: Vec3::new(1.,3.,3.), side: Vec3::X, face: Vec3::Z,
-            width: 0.2, variant: 0., n_base: Vec3::Z, n_mid: Vec3::Z, n_tip: Vec3::Z, color: [1.;4] };
+            width: 0.2, variant: 0., n_base: Vec3::Z, n_mid: Vec3::Z, n_tip: Vec3::Z, color: [1.;4], branch: 0 };
         for folded in [false, true] {
             let part = cards(&[leaf, leaf], if folded { 4 } else { 2 }, folded);
             let base = if folded { part.v[1].p } else { (part.v[0].p + part.v[1].p) * 0.5 };
@@ -1014,13 +1035,13 @@ mod tests {
 
     #[test]
     fn trimming_preserves_opaque_pieces_and_clips_empty_card_corners() {
-        let vertex = |u: f32, v: f32| V { p: Vec3::new(u, v, 0.), n: Vec3::Z, uv: vec2(u,v), c: [1.; 4] };
+        let vertex = |u: f32, v: f32| V { p: Vec3::new(u, v, 0.), n: Vec3::Z, uv: vec2(u,v), c: [1.; 4], branch: 0 };
         let mut atlas = vec![0; (ATLAS * ATLAS * 4) as usize];
         for y in 170..190 { for x in 45..75 { atlas[((y * ATLAS + x) * 4 + 3) as usize] = 255; } }
         let leaves = Part { v: vec![vertex(0.01, CUTOUT.0), vertex(0.24, CUTOUT.0), vertex(0.24, CUTOUT.1), vertex(0.01, CUTOUT.1),
                                       vertex(0.01, OPAQUE.0), vertex(0.1, OPAQUE.0), vertex(0.1, OPAQUE.1)],
                             i: vec![0,1,2, 0,2,3, 4,5,6] };
-        let mut ladder = Ladder { atlas, levels: vec![Level { rung: LADDER[0], bark: Part::default(), leaves: Part::default() }, Level { rung: LADDER[1], bark: Part::default(), leaves }] };
+        let mut ladder = Ladder { atlas, branches: vec![], levels: vec![Level { rung: LADDER[0], bark: Part::default(), leaves: Part::default() }, Level { rung: LADDER[1], bark: Part::default(), leaves }] };
         trim_cards(&mut ladder);
         let out = &ladder.levels[1].leaves;
         assert!(out.i.len() >= 9);

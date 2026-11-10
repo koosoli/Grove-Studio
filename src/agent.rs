@@ -19,11 +19,13 @@ Species file: --species-file species/forest/forest-beech.species --preset solsti
 PNG preview: grove-studio --headless --preview --out exports/forest.png --forest solstice-oak,solstice-fir
 
 Presets: solstice-oak, solstice-birch, solstice-fir, solstice-bush, solstice-poseidon-oak.
-Mesh options: --preset NAME, --config FILE, --seed N, --height METERS, --density .25..1.8,
---season summer|autumn|spring|winter, --parallax-depth 0..0.08,
+Material PNGs: --bark-color FILE --bark-height FILE --bark-normal FILE --leaf-atlas FILE
+Mesh options: --preset NAME, --config FILE, --seed N, --height METERS, --maturity .4..1.2, --density .25..1.8,
+--season summer|autumn|spring|winter, --parallax-depth 0..0.08, --bark-weathering 0..1,
 --format gltf|obj|p3d, --lod 0|1|2|all, --count 1..100, --out FILE.
 Preview options: --forest SPECIES, --preview-view lit|clusters|gi|voxels|reflections,
 --distance METERS, --wind-time SECONDS, --lod auto|0|1|2|3 (game cards),
+--no-forest-floor, --even-mix, --structure (hide foliage),
 --time-of-day HOURS, --sun-azimuth DEGREES, --skybox clear|fair|broken|overcast|storm|cirrus,
 --cloud-cover 0..1, --leaf-roughness 0.05..1, --leaf-transmission 0..1,
 --wind-direction 0..360, --wind-strength 0..2, --wind-gust 0..1, --branch-sway 0..2, --branch-springiness 0..1, --leaf-flutter 0..2, --no-leaf-specular,
@@ -78,8 +80,8 @@ fn headless(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--headless" | "--inspect" | "--preview" | "--forest-proxy" | "--opaque-leaves" | "--no-trim-cards" | "--original-leaves" | "--no-leaf-specular" => i += 1,
-            "--preset" | "--seed" | "--height" | "--density" | "--format" | "--lod" | "--count"
+            "--headless" | "--inspect" | "--preview" | "--forest-proxy" | "--opaque-leaves" | "--no-trim-cards" | "--original-leaves" | "--no-leaf-specular" | "--no-forest-floor" | "--even-mix" | "--structure" => i += 1,
+            "--bark-weathering" | "--bark-color" | "--bark-height" | "--bark-normal" | "--leaf-atlas" | "--preset" | "--seed" | "--height" | "--maturity" | "--density" | "--format" | "--lod" | "--count"
             | "--prefix" | "--species-file" | "--budgets"
             | "--config" | "--out" | "--season" | "--parallax-depth" | "--forest"
             | "--preview-view" | "--distance" | "--wind-time" | "--time-of-day" | "--forest-count"
@@ -109,6 +111,9 @@ fn headless(args: &[String]) -> Result<(), String> {
     if let Some(v) = option(args, "--height") {
         s.height = v.parse().map_err(|_| "Invalid height")?
     }
+    if let Some(v) = option(args, "--maturity") {
+        s.maturity = v.parse().map_err(|_| "Invalid maturity")?
+    }
     if let Some(v) = option(args, "--density") {
         s.density = v.parse().map_err(|_| "Invalid density")?
     }
@@ -124,6 +129,11 @@ fn headless(args: &[String]) -> Result<(), String> {
     if let Some(v) = option(args, "--parallax-depth") {
         s.parallax_depth = v.parse().map_err(|_| "Invalid parallax depth")?;
     }
+    if let Some(v) = option(args, "--bark-weathering") { s.bark_weathering = v.parse().map_err(|_| "Invalid bark weathering")?; }
+    if let Some(v) = option(args, "--bark-color") { s.bark_color_path = Some(v); }
+    if let Some(v) = option(args, "--bark-height") { s.bark_height_path = Some(v); }
+    if let Some(v) = option(args, "--bark-normal") { s.bark_normal_path = Some(v); }
+    if let Some(v) = option(args, "--leaf-atlas") { s.leaf_atlas_path = Some(v); }
     s.validate()?;
     if args.iter().any(|a| a == "--preview") {
         if ["--inspect", "--format", "--count"]
@@ -138,6 +148,9 @@ fn headless(args: &[String]) -> Result<(), String> {
         if args.iter().any(|a| a == "--no-trim-cards") { preview["trimCards"] = json!(false); }
         if args.iter().any(|a| a == "--original-leaves") { preview["gameCards"] = json!(false); }
         if args.iter().any(|a| a == "--no-leaf-specular") { preview["leafSpecular"] = json!(false); }
+        if args.iter().any(|a| a == "--no-forest-floor") { preview["forestFloor"] = json!(false); }
+        if args.iter().any(|a| a == "--even-mix") { preview["randomMix"] = json!(false); }
+        if args.iter().any(|a| a == "--structure") { preview["structure"] = json!(true); }
         for (flag, key) in [
             ("--forest", "forest"),
             ("--preview-view", "view"),
@@ -191,6 +204,9 @@ fn headless(args: &[String]) -> Result<(), String> {
         "--branch-springiness",
         "--leaf-flutter",
         "--no-leaf-specular",
+        "--no-forest-floor",
+        "--even-mix",
+        "--structure",
         "--time-of-day",
         "--sun-azimuth",
     ]
@@ -388,14 +404,14 @@ pub fn parse_lods(s: &str) -> Result<Vec<u32>, String> {
     }
 }
 fn schema() -> Value {
-    json!({"type":"object","additionalProperties":false,"properties":{"species":{"type":"string","enum":crate::preview::SPECIES.as_slice()},"seed":{"type":"integer","minimum":0,"maximum":4294967295u64},"height":{"type":"number","minimum":0.25,"maximum":40},"spread":{"type":"number","minimum":0.4,"maximum":1.6},"branches":{"type":"integer","minimum":5,"maximum":20},"density":{"type":"number","minimum":0.25,"maximum":1.8},"leaf_size":{"type":"number","minimum":0.025,"maximum":0.4},"trunk_radius":{"type":"number","minimum":0.05,"maximum":0.45},"trunk_straightness":{"type":"number","minimum":0,"maximum":1},"branch_angle":{"type":"number","minimum":0.5,"maximum":1.5},"branch_droop":{"type":"number","minimum":0,"maximum":2},"season":{"type":"integer","minimum":0,"maximum":3},"parallax_depth":{"type":"number","minimum":0,"maximum":0.08}}})
+    json!({"type":"object","additionalProperties":false,"properties":{"species":{"type":"string","enum":crate::preview::SPECIES.as_slice()},"seed":{"type":"integer","minimum":0,"maximum":4294967295u64},"height":{"type":"number","minimum":0.25,"maximum":40},"maturity":{"type":"number","minimum":0.4,"maximum":1.2,"default":1},"spread":{"type":"number","minimum":0.4,"maximum":1.6},"branches":{"type":"integer","minimum":5,"maximum":20},"density":{"type":"number","minimum":0.25,"maximum":1.8},"leaf_size":{"type":"number","minimum":0.025,"maximum":0.4},"trunk_radius":{"type":"number","minimum":0.05,"maximum":0.45},"trunk_straightness":{"type":"number","minimum":0,"maximum":1},"branch_angle":{"type":"number","minimum":0.5,"maximum":1.5},"branch_droop":{"type":"number","minimum":0,"maximum":2},"season":{"type":"integer","minimum":0,"maximum":3},"parallax_depth":{"type":"number","minimum":0,"maximum":0.08},"bark_weathering":{"type":"number","minimum":0,"maximum":1},"bark_color_path":{"type":["string","null"]},"bark_height_path":{"type":["string","null"]},"bark_normal_path":{"type":["string","null"]},"leaf_atlas_path":{"type":["string","null"]}}})
 }
 pub fn tools_list() -> Value {
     json!({"tools":[
         {"name":"tree_presets","description":"List the available tree species and their default generation settings.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"tree_inspect","description":"Generate tree statistics for all detail levels without opening a window or writing files.","inputSchema":{"type":"object","properties":{"settings":schema()},"additionalProperties":false}},
         {"name":"tree_generate","description":"Generate a deterministic tree and export glTF, OBJ or Poseidon P3D beneath the output root.","inputSchema":{"type":"object","properties":{"settings":schema(),"output":{"type":"string","description":"Relative output name, e.g. oak.p3d"},"format":{"type":"string","enum":["gltf","obj","p3d"]},"lod":{"type":"string","enum":["all","0","1","2","game"]},"trimCards":{"type":"boolean","default":true,"description":"Trim alpha card outlines for game LOD P3D exports."}},"required":["output"],"additionalProperties":false}},
-        {"name":"tree_preview","description":"Render a Solstice PNG and return measured visible triangle and cluster counts. Requires a compatible GPU, with no window.","inputSchema":{"type":"object","properties":{"settings":schema(),"windStrength":{"type":"number","minimum":0,"maximum":2,"default":1},"branchSpringiness":{"type":"number","minimum":0,"maximum":1,"default":0.5},"branchSway":{"type":"number","minimum":0,"maximum":2,"default":1},"windGust":{"type":"number","minimum":0,"maximum":1,"default":0.2},"leafFlutter":{"type":"number","minimum":0,"maximum":2,"default":1},"leafTransmission":{"type":"number","minimum":0,"maximum":1,"default":0.8},"cloudCover":{"type":"number","minimum":0,"maximum":1},"leafSpecular":{"type":"boolean","default":true},"leafRoughness":{"type":"number","minimum":0.05,"maximum":1,"default":0.55},"randomMix":{"type":"boolean","default":true},"gameCards":{"type":"boolean","default":true},"trimCards":{"type":"boolean","default":true},"output":{"type":"string","description":"Relative PNG filename"},"forest":{"type":"string","description":"Comma-separated species, e.g. solstice-oak,solstice-fir"},"lod":{"type":"string","enum":["auto","0","1","2","3"]},"view":{"type":"string","enum":["lit","clusters","triangles","gi","reflections","voxels","albedo","normals"]},"distance":{"type":"number","minimum":0.15,"maximum":500},"sky":{"type":"boolean"},"skybox":{"type":"string","enum":["clear","fair","broken","overcast","storm","cirrus"]},"windDirection":{"type":"number","minimum":0,"maximum":360},"treeCount":{"type":"integer","minimum":1,"maximum":1000},"ratios":{"type":"array","minItems":crate::preview::SPECIES.len(),"maxItems":crate::preview::SPECIES.len(),"items":{"type":"integer","minimum":0,"maximum":100}},"windTime":{"type":"number","minimum":0,"maximum":86400},"timeOfDay":{"type":"number","minimum":0,"maximum":24},"sunAzimuth":{"type":"number","minimum":0,"maximum":360}},"required":["output"],"additionalProperties":false}}
+        {"name":"tree_preview","description":"Render a Solstice PNG and return measured visible triangle and cluster counts. Requires a compatible GPU, with no window.","inputSchema":{"type":"object","properties":{"settings":schema(),"windStrength":{"type":"number","minimum":0,"maximum":2,"default":1},"branchSpringiness":{"type":"number","minimum":0,"maximum":1,"default":0.5},"branchSway":{"type":"number","minimum":0,"maximum":2,"default":1},"windGust":{"type":"number","minimum":0,"maximum":1,"default":0.2},"leafFlutter":{"type":"number","minimum":0,"maximum":2,"default":1},"leafTransmission":{"type":"number","minimum":0,"maximum":1,"default":0.8},"cloudCover":{"type":"number","minimum":0,"maximum":1},"leafSpecular":{"type":"boolean","default":true},"leafRoughness":{"type":"number","minimum":0.05,"maximum":1,"default":0.55},"structure":{"type":"boolean","default":false},"forestFloor":{"type":"boolean","default":true},"randomMix":{"type":"boolean","default":true},"gameCards":{"type":"boolean","default":true},"trimCards":{"type":"boolean","default":true},"output":{"type":"string","description":"Relative PNG filename"},"forest":{"type":"string","description":"Comma-separated species, e.g. solstice-oak,solstice-fir"},"lod":{"type":"string","enum":["auto","0","1","2","3"]},"view":{"type":"string","enum":["lit","clusters","triangles","gi","reflections","voxels","albedo","normals"]},"distance":{"type":"number","minimum":0.15,"maximum":500},"sky":{"type":"boolean"},"skybox":{"type":"string","enum":["clear","fair","broken","overcast","storm","cirrus"]},"windDirection":{"type":"number","minimum":0,"maximum":360},"treeCount":{"type":"integer","minimum":1,"maximum":1000},"ratios":{"type":"array","minItems":crate::preview::SPECIES.len(),"maxItems":crate::preview::SPECIES.len(),"items":{"type":"integer","minimum":0,"maximum":100}},"windTime":{"type":"number","minimum":0,"maximum":86400},"timeOfDay":{"type":"number","minimum":0,"maximum":24},"sunAzimuth":{"type":"number","minimum":0,"maximum":360}},"required":["output"],"additionalProperties":false}}
     ]})
 }
 fn settings_from(v: &Value) -> Result<Settings, String> {
@@ -437,6 +453,8 @@ pub fn call_tool(name: &str, args: &Value, root: &Path) -> Result<Value, String>
             "gameCards",
             "trimCards",
             "randomMix",
+            "forestFloor",
+            "structure",
             "cloudCover",
             "leafSpecular",
             "leafRoughness",
@@ -637,10 +655,11 @@ fn capture_preview(s: Settings, args: &Value, path: &Path) -> Result<Value, Stri
                 ratios,
                 grid: forest == 0,
                 bark: true,
-                leaves: true,
+                leaves: !args.get("structure").map(|v| v.as_bool().ok_or("structure must be boolean")).transpose()?.unwrap_or(false),
                 game_cards: args.get("gameCards").map(|v| v.as_bool().ok_or("gameCards must be boolean")).transpose()?.unwrap_or(true),
                 trim_cards: args.get("trimCards").map(|v| v.as_bool().ok_or("trimCards must be boolean")).transpose()?.unwrap_or(true),
                 random_mix: args.get("randomMix").map(|v| v.as_bool().ok_or("randomMix must be boolean")).transpose()?.unwrap_or(true),
+                forest_floor: args.get("forestFloor").map(|v| v.as_bool().ok_or("forestFloor must be boolean")).transpose()?.unwrap_or(true),
                 leaf_specular,
                 leaf_roughness,
                 leaf_transmission,

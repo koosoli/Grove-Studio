@@ -11,14 +11,16 @@
 @group(0) @binding(4) var<storage, read> triangles: array<u32>;
 @group(0) @binding(5) var<storage, read> visible: array<VisibleCluster>;
 @group(0) @binding(6) var<storage, read> state: CullStateRead;
-@group(0) @binding(7) var<storage, read> raster_materials: array<Material>;
+@group(0) @binding(7) var<storage, read> wind_records: array<Material>;
 @group(0) @binding(8) var raster_sampler: sampler;
 @group(0) @binding(9) var raster_base_color: texture_2d_array<f32>;
 @group(0) @binding(10) var raster_middle_color: texture_2d_array<f32>;
 @group(0) @binding(11) var raster_top_color: texture_2d_array<f32>;
 
+#include "common/hierarchy_wind.wgsl"
+
 fn card_visible(material_id: u32, uv: vec2f) -> bool {
-    let material = raster_materials[material_id];
+    let material = wind_records[material_id];
     if (material.flags & 32u) == 0u || material.texture_layer < 0 { return true; }
     let coord = uv * material.uv_scale;
     let slot = i32(material.texture_slot);

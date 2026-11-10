@@ -30,6 +30,7 @@ pub struct SceneKey {
     pub game_cards: bool,
     pub trim_cards: bool,
     pub random_mix: bool,
+    pub forest_floor: bool,
     pub leaf_specular: bool,
     pub leaf_roughness: f32,
     pub leaf_transmission: f32,
@@ -69,9 +70,9 @@ pub fn forest_mask(names: &str) -> Result<u128, String> {
 
 pub fn height_hint(settings: &Settings) -> f32 {
     if settings.species == "solstice-bush" {
-        settings.height * 6.
+        settings.height * settings.maturity * 6.
     } else {
-        settings.height
+        settings.height * settings.maturity
     }
 }
 
@@ -506,17 +507,17 @@ fn bark_layer(settings: &Settings) -> Result<TextureLayer, String> {
             .map(|img| img.resize_exact(TEX_SIZE, TEX_SIZE, FilterType::Triangle))
             .map_err(|err| err.to_string())
     };
-    let mut color = load(tree::bark_texture(settings))?.into_rgba8();
+    let mut color = load(&tree::bark_texture(settings)?)?.into_rgba8();
     for pixel in color.pixels_mut() {
         pixel.0[3] = 255;
     }
-    let (height, normal) = tree::relief_textures(settings);
-    let normal = load(normal)?
+    let (height, normal) = tree::relief_textures(settings)?;
+    let normal = load(&normal)?
         .into_rgb8()
         .pixels()
         .flat_map(|p| [p[0], p[1]])
         .collect();
-    let data = load(height)?
+    let data = load(&height)?
         .into_luma8()
         .pixels()
         .flat_map(|p| [128, p[0]])
@@ -525,6 +526,12 @@ fn bark_layer(settings: &Settings) -> Result<TextureLayer, String> {
 }
 
 pub(crate) fn leaf_rgba(settings: &Settings) -> Vec<u8> {
+    if let Some(path) = &settings.leaf_atlas_path {
+        match image::open(path) {
+            Ok(image) => return image.resize_exact(TEX_SIZE, TEX_SIZE, FilterType::Triangle).into_rgba8().into_raw(),
+            Err(err) => crate::log::log(format!("Could not load leaf atlas {path}: {err}; using generated atlas")),
+        }
+    }
     if settings.season == 0 {
         if let Some(atlas) = crate::reference::leaf_atlas(settings) {
             return atlas.to_vec();
@@ -604,6 +611,99 @@ pub fn shuffle_forest(placed: &mut [(usize, Mat4)], seed: u32) {
     }
 }
 
+/// Seeded forest placement with local minimum spacing and a smaller understory age class.
+/// Species counts remain the same as the ordered placement. A bounded retry gradually relaxes
+/// spacing for unusually dense stands, so every requested instance is still placed.
+pub fn natural_forest(count: u32, weights: &[u32], spacing: f32, seed: u32) -> Vec<(usize, Mat4)> {
+    let mut placed = place_forest(count, weights, spacing);
+    shuffle_forest(&mut placed, seed);
+    if placed.is_empty() { return placed; }
+    let mut state = u64::from(seed) ^ 0x6a09e667f3bcc909;
+    let mut random = || {
+        state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+        ((state.wrapping_mul(0x2545f4914f6cdd1d) >> 40) as u32) as f32 / (1u32 << 24) as f32
+    };
+    let edge = (count as f32).sqrt().ceil() * spacing;
+    let min_distance = spacing * 0.45;
+    let cell_size = min_distance.max(0.001);
+    let mut grid: HashMap<(i32,i32), Vec<Vec2>> = HashMap::new();
+    for (_, transform) in &mut placed {
+        let mut point = Vec2::ZERO;
+        for attempt in 0..160 {
+            point = Vec2::new((random() - 0.5) * edge, (random() - 0.5) * edge);
+            let separation = min_distance * (1. - (attempt / 40) as f32 * 0.3).max(0.);
+            let cell = ((point.x / cell_size).floor() as i32, (point.y / cell_size).floor() as i32);
+            let mut clear = true;
+            for dx in -1..=1 { for dy in -1..=1 {
+                if grid.get(&(cell.0 + dx,cell.1 + dy)).is_some_and(|points| points.iter().any(|p| p.distance_squared(point) < separation * separation)) { clear = false; }
+            }}
+            if clear || attempt == 159 { break; }
+        }
+        let cell = ((point.x / cell_size).floor() as i32, (point.y / cell_size).floor() as i32);
+        grid.entry(cell).or_default().push(point);
+        let young = random() < 0.18;
+        let scale = if young { 0.45 + random() * 0.25 } else { 0.82 + random() * 0.36 };
+        let rotation = glam::Quat::from_rotation_y(random() * std::f32::consts::TAU);
+        *transform = Mat4::from_scale_rotation_translation(Vec3::splat(scale), rotation, Vec3::new(point.x, 0., point.y));
+    }
+    placed
+}
+
+/// Procedural soil, moss and fallen leaves for the forest preview (sRGB RGBA).
+fn forest_floor_texture(seed: u32, season: u32) -> Vec<u8> {
+    let edge = TEX_SIZE as usize;
+    let noise = |x: usize, y: usize| -> u32 {
+        let mut h = (x as u32).wrapping_mul(0x8da6b343) ^ (y as u32).wrapping_mul(0xd8163841) ^ seed;
+        h ^= h >> 13; h = h.wrapping_mul(0x85ebca6b); h ^ (h >> 16)
+    };
+    let mut pixels = vec![0u8; edge * edge * 4];
+    for y in 0..edge { for x in 0..edge {
+        let fine = (noise(x,y) % 15) as i32 - 7;
+        let patch = noise(x/12,y/12) % 100;
+        let base = if patch < 27 { [45, 59, 31] } else { [65, 53, 40] };
+        let i = (y * edge + x) * 4;
+        for c in 0..3 { pixels[i+c] = (base[c] + fine).clamp(0,255) as u8; }
+        pixels[i+3] = 255;
+    }}
+    for n in 0..260usize {
+        let h = noise(n, 7919); let cx = (h as usize) % edge; let cy = ((h >> 8) as usize) % edge;
+        let angle = (h >> 16) as f32 / 65535. * std::f32::consts::TAU;
+        let (sn,cs) = angle.sin_cos();
+        let color: [u8;3] = if season == 2 { [104,91,49] } else if season == 1 { [143,94,45] } else { [104,76,45] };
+        for dy in -5i32..=5 { for dx in -5i32..=5 {
+            let u = dx as f32 * cs + dy as f32 * sn; let v = -dx as f32 * sn + dy as f32 * cs;
+            if u*u / 20. + v*v / 3.0 <= 1. {
+                let x = (cx as i32 + dx).rem_euclid(edge as i32) as usize;
+                let y = (cy as i32 + dy).rem_euclid(edge as i32) as usize;
+                let i = (y * edge + x) * 4;
+                pixels[i..i+3].copy_from_slice(&color);
+            }
+        }}
+    }
+    pixels
+}
+
+/// A lightweight clump of individual, opaque understory leaves for forest context.
+fn understory_mesh() -> Mesh {
+    let mut mesh = Mesh { vertices: Vec::new(), indices: Vec::new() };
+    for k in 0..12u32 {
+        let angle = k as f32 * 2.399963;
+        let (sn, cs) = angle.sin_cos();
+        let radial = Vec3::new(cs, 0., sn);
+        let side = Vec3::new(-sn, 0., cs);
+        let length = 0.22 + (k % 5) as f32 * 0.04;
+        let base = Vec3::new(0., 0.02, 0.);
+        let middle = base + radial * length * 0.55 + Vec3::Y * (0.16 + (k % 3) as f32 * 0.03);
+        let tip = base + radial * length + Vec3::Y * 0.13;
+        let first = mesh.vertices.len() as u32;
+        for (position, uv) in [(base, Vec2::new(0.5,0.)), (middle-side*0.035, Vec2::new(0.,0.5)), (middle+side*0.035, Vec2::new(1.,0.5)), (tip,Vec2::new(0.5,1.))] {
+            mesh.vertices.push(Vertex { position, normal: Vec3::Y, uv });
+        }
+        mesh.indices.extend([first,first+1,first+2, first+1,first+3,first+2]);
+    }
+    mesh
+}
+
 /// How many species assets to keep. Editing a tree's settings makes new ones, so the cache is
 /// cleared when it grows past this, instead of growing without limit.
 const SPECIES_CACHE_LIMIT: usize = 64;
@@ -613,6 +713,93 @@ const SPECIES_CACHE_LIMIT: usize = 64;
 struct SpeciesAsset {
     bark: (VirtualMesh, TextureLayer, Material),
     leaves: (VirtualMesh, TextureLayer, Material),
+    branches: Vec<tree::Branch>,
+}
+
+/// Retain a source stem id in the unused word of each packed vertex. The builder's edge
+/// collapses select source positions; coincident positions use their shared ancestor so they
+/// cannot tear apart when the tree moves.
+fn attach_branch_ids(mesh: &mut VirtualMesh, source: &Part, branches: &[tree::Branch]) {
+    if branches.len() >= u16::MAX as usize || mesh.quant_step <= 0. { return; }
+    let mut depths = vec![0usize; branches.len()];
+    for (i, b) in branches.iter().enumerate() { if let Some(p) = b.parent { depths[i] = depths[p] + 1; } }
+    let mut owners: HashMap<[u16; 3], u32> = HashMap::new();
+    for vertex in &source.v {
+        let p = (Vec3::from_array(vertex.p.to_array()) - mesh.quant_origin) / mesh.quant_step;
+        let key = [p.x.round().clamp(0.,65535.) as u16, p.y.round().clamp(0.,65535.) as u16, p.z.round().clamp(0.,65535.) as u16];
+        owners.entry(key).and_modify(|owner| {
+            let mut a = *owner as usize; let mut b = vertex.branch as usize;
+            while depths[a] > depths[b] { a = branches[a].parent.unwrap(); }
+            while depths[b] > depths[a] { b = branches[b].parent.unwrap(); }
+            while a != b { a = branches[a].parent.unwrap(); b = branches[b].parent.unwrap(); }
+            *owner = a as u32;
+        }).or_insert(vertex.branch);
+    }
+    // Coarse DAG levels can move entire leaf pieces away from their original positions.
+    // Associate such positions with the nearest source stem within a bounded neighbourhood.
+    let cell_size = (mesh.quant_step * 128.).max(0.12);
+    let mut cells: HashMap<(i32,i32,i32), Vec<(Vec3,u32)>> = HashMap::new();
+    for vertex in &source.v {
+        let p = Vec3::from_array(vertex.p.to_array());
+        let cell = (p / cell_size).floor().as_ivec3();
+        cells.entry((cell.x, cell.y, cell.z)).or_default().push((p, vertex.branch));
+    }
+    for vertex in &mut mesh.vertices {
+        if let Some(owner) = owners.get(&[vertex.data[0], vertex.data[1], vertex.data[2]]) {
+            vertex.data[7] = *owner as u16 + 1;
+            continue;
+        }
+        let p = mesh.quant_origin + Vec3::new(vertex.data[0] as f32, vertex.data[1] as f32, vertex.data[2] as f32) * mesh.quant_step;
+        let cell = (p / cell_size).floor().as_ivec3();
+        let mut best = f32::MAX;
+        let mut owner = None;
+        for radius in 1i32..=3 {
+            for dx in -radius..=radius { for dy in -radius..=radius { for dz in -radius..=radius {
+                if let Some(points) = cells.get(&(cell.x+dx, cell.y+dy, cell.z+dz)) {
+                    for (candidate, branch) in points {
+                        let distance = p.distance_squared(*candidate);
+                        if distance < best { best = distance; owner = Some(*branch); }
+                    }
+                }
+            }}}
+            if best <= (radius as f32 * cell_size).powi(2) { break; }
+        }
+        if let Some(owner) = owner {
+            vertex.data[7] = owner as u16 + 1;
+        }
+    }
+    // One disconnected leaf or twig component must move rigidly even when a coarse DAG
+    // vertex was matched to a different nearby shoot. Use the shared ancestor throughout
+    // the connected component; this favours stable attachment over spurious fine motion.
+    for cluster in &mesh.clusters {
+        let count = cluster.vertex_count() as usize;
+        let start = cluster.vertex_offset as usize;
+        let mut roots: Vec<usize> = (0..count).collect();
+        fn root(roots: &mut [usize], mut n: usize) -> usize {
+            while roots[n] != n { roots[n] = roots[roots[n]]; n = roots[n]; } n
+        }
+        for packed in &mesh.triangles[cluster.triangle_offset as usize..cluster.triangle_offset as usize + cluster.triangle_count() as usize] {
+            let tri = [(*packed & 255) as usize, ((*packed >> 8) & 255) as usize, ((*packed >> 16) & 255) as usize];
+            let a = root(&mut roots, tri[0]);
+            for &v in &tri[1..] { let b = root(&mut roots, v); if a != b { roots[b] = a; } }
+        }
+        let mut common = vec![None::<usize>; count];
+        for v in 0..count {
+            let r = root(&mut roots, v);
+            let id = mesh.vertices[start+v].data[7];
+            let mut b = if id == 0 { 0 } else { id as usize - 1 };
+            if let Some(mut a) = common[r] {
+                while depths[a] > depths[b] { a = branches[a].parent.unwrap(); }
+                while depths[b] > depths[a] { b = branches[b].parent.unwrap(); }
+                while a != b { a = branches[a].parent.unwrap(); b = branches[b].parent.unwrap(); }
+                common[r] = Some(a);
+            } else { common[r] = Some(b); }
+        }
+        for v in 0..count {
+            let r = root(&mut roots, v);
+            mesh.vertices[start+v].data[7] = common[r].unwrap_or(0) as u16 + 1;
+        }
+    }
 }
 
 static SPECIES_CACHE: OnceLock<Mutex<HashMap<String, SpeciesAsset>>> = OnceLock::new();
@@ -639,6 +826,7 @@ fn species_asset(settings: &Settings, lod: u32, game_cards: bool, trim_cards: bo
     let mut game = game_cards.then(|| crate::gamelod::ladder(settings));
     if trim_cards { if let Some(ladder) = game.as_mut() { crate::gamelod::trim_cards(ladder); } }
     let tree = tree::generate(settings, lod.min(2));
+    let branches = game.as_ref().map_or(&tree.branches, |ladder| &ladder.branches);
     crate::log::log(format!(
         "Solstice: grew {} LOD {lod} in {:.2} s ({} triangles)",
         settings.species,
@@ -649,7 +837,8 @@ fn species_asset(settings: &Settings, lod: u32, game_cards: bool, trim_cards: bo
     let part = |foliage: bool, data: &Part| -> Result<(VirtualMesh, TextureLayer, Material), String> {
         let meshing = std::time::Instant::now();
         let source = if foliage { foliage_mesh(data, game_cards) } else { to_mesh(data) };
-        let mesh = build_virtual_mesh(&source, &opts);
+        let mut mesh = build_virtual_mesh(&source, &opts);
+        attach_branch_ids(&mut mesh, data, branches);
         crate::log::log(format!(
             "Solstice: {} {} meshed in {:.2} s",
             settings.species,
@@ -671,7 +860,7 @@ fn species_asset(settings: &Settings, lod: u32, game_cards: bool, trim_cards: bo
             roughness: if foliage { leaf_roughness } else { 0.92 },
             flags: solstice_render::scene::MATERIAL_WIND
                 | if foliage {
-                    Material::TWO_SIDED | Material::FOLIAGE | 128 | ((leaf_transmission * 100.).round() as u32) << 16 | if game_cards { solstice_render::scene::MATERIAL_ALPHA_TEST } else { 0 } | if !leaf_specular { solstice_render::scene::MATERIAL_NO_SPECULAR } else { 0 }
+                    Material::TWO_SIDED | Material::FOLIAGE | 128 | ((leaf_transmission * 100.).round() as u32) << 16 | if game_cards || settings.leaf_atlas_path.is_some() { solstice_render::scene::MATERIAL_ALPHA_TEST } else { 0 } | if !leaf_specular { solstice_render::scene::MATERIAL_NO_SPECULAR } else { 0 }
                 } else {
                     ((settings.parallax_depth * 1000.).round() as u32) << 8
                 },
@@ -688,6 +877,7 @@ fn species_asset(settings: &Settings, lod: u32, game_cards: bool, trim_cards: bo
     let asset = SpeciesAsset {
         bark: part(false, bark)?,
         leaves: part(true, leaves)?,
+        branches: branches.clone(),
     };
     let mut cache = cache.lock().map_err(|e| e.to_string())?;
     if cache.len() >= SPECIES_CACHE_LIMIT {
@@ -713,19 +903,19 @@ fn build_scene(key: &SceneKey) -> Result<LoadedScene, String> {
         indices: vec![0, 1, 2, 0, 2, 3],
     };
     let n = (TEX_SIZE * TEX_SIZE * 2) as usize;
-    let grid = (0..TEX_SIZE)
+    let grid: Vec<u8> = if key.forest != 0 && key.forest_floor {
+        forest_floor_texture(key.settings.seed, key.settings.season)
+    } else { (0..TEX_SIZE)
         .flat_map(|y| {
             (0..TEX_SIZE).flat_map(move |x| {
                 if key.grid && (x < 3 || y < 3) {
                     [110, 110, 110, 255]
-                } else if key.forest != 0 {
-                    [109, 128, 91, 255]
                 } else {
                     [159, 159, 159, 255]
                 }
             })
         })
-        .collect();
+        .collect() };
     scene.textures.push(layer(grid, vec![128; n], vec![128; n]));
     scene.meshes.push(build_virtual_mesh(&ground, &opts));
     scene.materials.push(Material {
@@ -742,20 +932,24 @@ fn build_scene(key: &SceneKey) -> Result<LoadedScene, String> {
     });
 
     let mut trees = Vec::new();
+    let mut understory = Vec::new();
     if key.forest == 0 {
         trees.push(key.settings.clone());
     } else {
         for (i, species) in SPECIES.iter().enumerate() {
             if key.forest & (1 << i) != 0 {
-                trees.push(if key.settings.species == *species {
+                let mut tree = if key.settings.species == *species {
                     key.settings.clone()
                 } else {
                     Settings::preset(species)?
-                });
+                };
+                tree.season = key.settings.season;
+                trees.push(tree);
             }
         }
     }
     let mut assets = Vec::new();
+    let mut hierarchies = Vec::new();
     BUILD_TOTAL.store(trees.len() as u32, Ordering::Relaxed);
     BUILD_DONE.store(0, Ordering::Relaxed);
     for settings in &trees {
@@ -771,7 +965,24 @@ fn build_scene(key: &SceneKey) -> Result<LoadedScene, String> {
             });
         }
         assets.push(first);
+        hierarchies.push((first, asset.branches));
         BUILD_DONE.fetch_add(1, Ordering::Relaxed);
+    }
+    // Hierarchy records share the already-bound material buffer; only actual draw materials
+    // point at these records, so no extra per-stage storage binding is required.
+    for (first, branches) in hierarchies {
+        if branches.is_empty() || branches.len() >= u16::MAX as usize { continue; }
+        let base = scene.materials.len();
+        for branch in &branches {
+            let start = branch.points[0];
+            let end = *branch.points.last().unwrap();
+            scene.materials.push(Material { base_color: [start[0],start[1],start[2], branch.parent.map_or(0., |p| (p+1) as f32)],
+                emissive: end, roughness: branch.radii.first().copied().unwrap_or(0.01), ..Default::default() });
+        }
+        for index in [first as usize, first as usize + 1] {
+            scene.materials[index].flags |= 1 << 24;
+            scene.materials[index].emissive[0] = base as f32;
+        }
     }
     let mut place = |first, transform| {
         for (offset, visible) in [(0, key.bark), (1, key.leaves)] {
@@ -795,11 +1006,29 @@ fn build_scene(key: &SceneKey) -> Result<LoadedScene, String> {
             .filter(|(index, _)| key.forest & (1 << index) != 0)
             .map(|(index, _)| key.ratios[index])
             .collect();
-        let mut placed = place_forest(key.count, &weights, spacing);
-        if key.random_mix { shuffle_forest(&mut placed, key.settings.seed); }
+        let placed = if key.random_mix { natural_forest(key.count, &weights, spacing, key.settings.seed) } else { place_forest(key.count, &weights, spacing) };
         for (kind, transform) in placed {
             place(assets[kind], transform);
+            if key.forest_floor {
+                let position = transform.w_axis.truncate();
+                for k in 0..2 {
+                    let phase = (position.x * 13.31 + position.z * 19.17 + k as f32 * 2.4).sin();
+                    let offset = Vec3::new(phase * spacing * 0.22, 0., (phase * 8.3).cos() * spacing * 0.22);
+                    understory.push(Mat4::from_scale_rotation_translation(Vec3::splat(0.75 + phase.abs() * 0.7), glam::Quat::from_rotation_y(phase * 3.), position + offset));
+                }
+            }
         }
+    }
+    if !understory.is_empty() {
+        let mesh = build_virtual_mesh(&understory_mesh(), &opts);
+        let index = scene.meshes.len() as u32;
+        scene.meshes.push(mesh);
+        let color: Vec<u8> = (0..TEX_SIZE*TEX_SIZE).flat_map(|_| [54, 101, 39, 255]).collect();
+        scene.textures.push(layer(color, vec![128; n], vec![128; n]));
+        let material_index = scene.materials.len() as u32;
+        scene.materials.push(Material { base_color: [1.;4], roughness: 0.85, texture_layer: index as i32,
+            flags: Material::TWO_SIDED | Material::FOLIAGE, normal_strength: 0., ..Default::default() });
+        for transform in understory { scene.instances.push(Instance { mesh: index, material: material_index, transform }); }
     }
     Ok(paginate(&scene))
 }
@@ -810,7 +1039,7 @@ mod tests {
 
     #[test]
     fn foliage_phase_is_shared_within_each_piece_and_keeps_atlas_coordinates() {
-        let v = |x: f32, u: f32, v: f32| crate::tree::V { p: macroquad::prelude::vec3(x, v, 0.), n: macroquad::prelude::Vec3::Y, uv: macroquad::prelude::vec2(u,v), c: [1.;4] };
+        let v = |x: f32, u: f32, v: f32| crate::tree::V { p: macroquad::prelude::vec3(x, v, 0.), n: macroquad::prelude::Vec3::Y, uv: macroquad::prelude::vec2(u,v), c: [1.;4], branch: 0 };
         let part = Part { v: vec![v(0.,0.1,0.),v(0.1,0.2,0.),v(0.05,0.15,1.),v(2.,0.1,0.),v(2.1,0.2,0.),v(2.05,0.15,1.)], i: vec![0,1,2,3,4,5] };
         let mesh = foliage_mesh(&part, false);
         for group in mesh.vertices.chunks_exact(3) {
@@ -827,7 +1056,12 @@ mod tests {
     fn species_assets_are_reused_not_rebuilt() {
         let s = Settings::preset("solstice-bush").unwrap();
         let first = std::time::Instant::now();
-        species_asset(&s, 2, false, false, true, 0.55, 0.8).unwrap();
+        let asset = species_asset(&s, 2, false, false, true, 0.55, 0.8).unwrap();
+        for mesh in [&asset.bark.0, &asset.leaves.0] {
+            let assigned = mesh.vertices.iter().filter(|v| v.data[7] > 0).count();
+            assert!(assigned > mesh.vertices.len() * 95 / 100, "only {assigned}/{} vertices retained branch ownership", mesh.vertices.len());
+            assert!(mesh.vertices.iter().any(|v| v.data[7] > 1));
+        }
         let first = first.elapsed();
         let again = std::time::Instant::now();
         species_asset(&s, 2, false, false, true, 0.55, 0.8).unwrap();
@@ -857,6 +1091,20 @@ mod tests {
         assert_ne!(a, ordered);
         assert_eq!(a.iter().filter(|(k, _)| *k == 0).count(), 30);
         assert!(a.iter().zip(&ordered).all(|(a,b)| a.1 == b.1));
+    }
+
+    #[test]
+    fn natural_stand_is_seeded_spaced_and_keeps_species_counts() {
+        let a = natural_forest(80, &[3,1], 6., 123);
+        assert_eq!(a, natural_forest(80, &[3,1], 6., 123));
+        assert_ne!(a, natural_forest(80, &[3,1], 6., 124));
+        assert_eq!(a.iter().filter(|(kind,_)| *kind == 0).count(), 60);
+        for (i, (_, transform)) in a.iter().enumerate() {
+            for (_, other) in &a[..i] {
+                assert!(transform.w_axis.truncate().distance(other.w_axis.truncate()) >= 6. * 0.13);
+            }
+        }
+        assert!(a.iter().any(|(_, transform)| transform.x_axis.truncate().length() < 0.7));
     }
 
     #[test]

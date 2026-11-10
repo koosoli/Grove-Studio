@@ -18,7 +18,7 @@
 @group(0) @binding(5) var<storage, read> clusters: array<Cluster>;
 @group(0) @binding(6) var<storage, read> vertices: array<PackedVertex>;
 @group(0) @binding(7) var<storage, read> triangles: array<u32>;
-@group(0) @binding(8) var<storage, read> materials: array<Material>;
+@group(0) @binding(8) var<storage, read> wind_records: array<Material>;
 
 @group(1) @binding(0) var out_albedo: texture_storage_2d<rgba8unorm, write>;
 @group(1) @binding(1) var out_normal: texture_storage_2d<rgba16float, write>;
@@ -39,6 +39,8 @@
 // Where the sea has been, for how wet each surface is.
 @group(2) @binding(0) var<uniform> waterline: WaterlineParams;
 @group(2) @binding(1) var waterline_map: texture_2d<f32>;
+
+#include "common/hierarchy_wind.wgsl"
 
 const TIER_MIDDLE: u32 = 1u;
 const TIER_TOP: u32 = 2u;
@@ -158,7 +160,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let entry = visible[visible_index];
     let instance = instances[entry.instance];
     let cluster = clusters[entry.cluster];
-    let material = materials[instance_material(instance)];
+    let material = wind_records[instance_material(instance)];
 
     let packed = triangles[cluster.triangle_offset + triangle_index];
     let v0 = vertices[cluster.vertex_offset + (packed & 0xffu)];
@@ -168,9 +170,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let local0 = decode_position(instance, v0);
     let local1 = decode_position(instance, v1);
     let local2 = decode_position(instance, v2);
-    let world0 = transform_vegetation(instance, local0, decode_uv(instance, v0), frame.wind_time, frame.wind_parameters, frame.wind_dynamics);
-    let world1 = transform_vegetation(instance, local1, decode_uv(instance, v1), frame.wind_time, frame.wind_parameters, frame.wind_dynamics);
-    let world2 = transform_vegetation(instance, local2, decode_uv(instance, v2), frame.wind_time, frame.wind_parameters, frame.wind_dynamics);
+    let world0 = transform_vegetation(instance, local0, decode_uv(instance, v0), v0, frame.wind_time, frame.wind_parameters, frame.wind_dynamics);
+    let world1 = transform_vegetation(instance, local1, decode_uv(instance, v1), v1, frame.wind_time, frame.wind_parameters, frame.wind_dynamics);
+    let world2 = transform_vegetation(instance, local2, decode_uv(instance, v2), v2, frame.wind_time, frame.wind_parameters, frame.wind_dynamics);
     let clip = array<vec4f, 3>(
         frame.view_proj * vec4f(world0, 1.0),
         frame.view_proj * vec4f(world1, 1.0),
@@ -198,9 +200,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     var normal = normalize(interp3(
         b,
-        transform_wind_normal(instance, decode_normal(v0), local0, frame.wind_time, frame.wind_parameters),
-        transform_wind_normal(instance, decode_normal(v1), local1, frame.wind_time, frame.wind_parameters),
-        transform_wind_normal(instance, decode_normal(v2), local2, frame.wind_time, frame.wind_parameters),
+        transform_wind_normal(instance, hierarchy_local(instance, decode_normal(v0), v0, frame.wind_time, frame.wind_parameters, frame.wind_dynamics, true), local0, frame.wind_time, frame.wind_parameters),
+        transform_wind_normal(instance, hierarchy_local(instance, decode_normal(v1), v1, frame.wind_time, frame.wind_parameters, frame.wind_dynamics, true), local1, frame.wind_time, frame.wind_parameters),
+        transform_wind_normal(instance, hierarchy_local(instance, decode_normal(v2), v2, frame.wind_time, frame.wind_parameters, frame.wind_dynamics, true), local2, frame.wind_time, frame.wind_parameters),
     ));
     // Seen from behind, a two-sided surface is lit as its other side.
     let face = cross(world1 - world0, world2 - world0);
@@ -275,18 +277,18 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     normal = wet.normal;
 
     // Motion, in UV units from this pixel to where it was last frame.
-    let local = interp3(b, local0, local1, local2);
     let prev_time = select(0.0, max(1.0, frame.wind_time - frame.frame_seconds), frame.wind_time > 0.0);
-    let prev_world = transform_point_prev(instance, local) + vegetation_wind(
-        instance, local, uv / material.uv_scale, prev_time, vec2f(instance.prev_world_0.w, instance.prev_world_2.w), frame.wind_parameters, frame.wind_dynamics,
-    );
+    let prev_world = interp3(b,
+        transform_vegetation_prev(instance, local0, decode_uv(instance, v0), v0, prev_time, frame.wind_parameters, frame.wind_dynamics),
+        transform_vegetation_prev(instance, local1, decode_uv(instance, v1), v1, prev_time, frame.wind_parameters, frame.wind_dynamics),
+        transform_vegetation_prev(instance, local2, decode_uv(instance, v2), v2, prev_time, frame.wind_parameters, frame.wind_dynamics));
     let prev_clip = frame.prev_view_proj * vec4f(prev_world, 1.0);
     let current_clip = frame.unjittered_view_proj * vec4f(world, 1.0);
     let prev_ndc = prev_clip.xy / prev_clip.w;
     let current_ndc = current_clip.xy / current_clip.w;
     let motion = (prev_ndc - current_ndc) * vec2f(0.5, -0.5);
 
-    var emissive = material.emissive * instance.glow;
+    var emissive = select(material.emissive * instance.glow, vec3f(0.0), (material.flags & 0x01000000u) != 0u);
 
     switch frame.debug_mode {
         case DEBUG_CLUSTERS: {

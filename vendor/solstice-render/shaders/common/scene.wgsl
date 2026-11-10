@@ -221,10 +221,6 @@ fn transform_wind_normal(i: Instance, n: vec3f, p: vec3f, clock: f32, params: ve
     return normalize(vec3f(normal.x + dir.x * (bent_x - along), normal.y * cos(angle) - along * sin(angle), normal.z + dir.y * (bent_x - along)));
 }
 
-fn transform_vegetation(i: Instance, p: vec3f, uv: vec2f, clock: f32, params: vec4f, dynamics: vec4f) -> vec3f {
-    return transform_point(i, p) + vegetation_wind(i, p, uv, clock, vec2f(i.world_0.w, i.world_2.w), params, dynamics);
-}
-
 fn vegetation_padding(i: Instance, center: vec3f, radius: f32, clock: f32, params: vec4f) -> f32 {
     if clock <= 0.0 || params.x <= 0.0 || (i.material & INSTANCE_WIND) == 0u {
         return 0.0;
@@ -233,7 +229,8 @@ fn vegetation_padding(i: Instance, center: vec3f, radius: f32, clock: f32, param
     let max_angle = min(0.025 * params.x * (1.0 + params.y) * height, 0.3);
     let sweep = 2.0 * sin(max_angle * 0.5) * (length(center) + radius) * i.max_scale;
     let flutter = 0.006 * params.x * params.z * (1.0 + params.y);
-    let branches = 0.16 * params.x * params.w * (1.0 + params.y);
+    // Up to three nested joints, each clamped to 0.12 rad. Keep culling conservative.
+    let branches = 0.36 * (length(center) + radius) * i.max_scale * min(params.x * params.w * (1.0 + params.y), 1.0);
     return sweep + flutter + branches;
 }
 

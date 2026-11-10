@@ -47,7 +47,7 @@ fn main(
         let vertex_count = cluster_vertex_count(cluster);
         for (var v = lane; v < vertex_count; v += GROUP_SIZE) {
             let packed = vertices[cluster.vertex_offset + v];
-            let world = transform_vegetation(instance, decode_position(instance, packed), decode_uv(instance, packed), view.wind_time, view.wind_parameters, view.wind_dynamics);
+            let world = transform_vegetation(instance, decode_position(instance, packed), decode_uv(instance, packed), packed, view.wind_time, view.wind_parameters, view.wind_dynamics);
             let clip = view.raster_view_proj * vec4f(world, 1.0);
             let ndc = clip.xyz / clip.w;
             screen[v] = vec4f(

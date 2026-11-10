@@ -79,20 +79,34 @@ pub fn grow(s: &Settings, lod: u32) -> Option<Tree> {
     let mut species = species(s)?;
     let original_leaf_size = (species.leaves.length.0 + species.leaves.length.1) * 0.5;
     let leaf_scale = s.leaf_size / original_leaf_size;
-    let height_scale = s.height / species.height;
-    species.trunk_radius = s.trunk_radius;
+    let height_scale = s.height * s.maturity / species.height;
+    species.trunk_radius = s.trunk_radius * (0.55 + 0.45 * s.maturity);
     species.trunk_gnarl = species.trunk_gnarl * 2. * (1. - s.trunk_straightness)
         + 0.03 * (0.5 - s.trunk_straightness).max(0.);
-    species.levels[0].per_metre *= s.branches as f32 / Settings::default().branches as f32;
+    species.levels[0].per_metre *= s.branches as f32 / Settings::default().branches as f32 * (0.7 + 0.3 * s.maturity);
     for level in &mut species.levels {
         level.angle.0 = (level.angle.0 * s.branch_angle).clamp(0., 180.);
         level.angle.1 = (level.angle.1 * s.branch_angle).clamp(0., 180.);
         level.droop = level.droop * s.branch_droop + 0.1 * (s.branch_droop - 1.).max(0.);
     }
-    species.leaves.per_metre *= s.density;
-    species.leaves.length.0 *= leaf_scale;
-    species.leaves.length.1 *= leaf_scale;
+    let deciduous = species.leaves.kind != LeafKind::Needles;
+    let season_density = if deciduous { match s.season { 1 => 0.82, 2 => 0.80, _ => 1. } } else { 1. };
+    let season_leaf = if deciduous && s.season == 2 { 0.82 } else { 1. };
+    species.leaves.per_metre *= s.density * season_density;
+    species.leaves.length.0 *= leaf_scale * season_leaf;
+    species.leaves.length.1 *= leaf_scale * season_leaf;
     let plant = species.grow(s.seed);
+    let mut bark_branch = vec![0; plant.wood.vertices.len()];
+    let mut original_leaf_branch = vec![0; plant.leaves.vertices.len()];
+    for (i, branch) in plant.branches.iter().enumerate() {
+        bark_branch[branch.wood_vertices.clone()].fill(i as u32);
+        original_leaf_branch[branch.leaf_vertices.clone()].fill(i as u32);
+    }
+    let mut branches: Vec<tree::Branch> = plant.branches.iter().map(|branch| tree::Branch {
+        parent: branch.parent,
+        points: branch.points.iter().map(|p| [p.x * s.spread, p.y * height_scale, p.z * s.spread]).collect(),
+        radii: branch.radii.iter().map(|r| r * s.spread).collect(),
+    }).collect();
     let convert = |v: &solstice_builder::Vertex, c| V {
         p: vec3(
             v.position.x * s.spread,
@@ -107,6 +121,7 @@ pub fn grow(s: &Settings, lod: u32) -> Option<Tree> {
         .normalize(),
         uv: vec2(v.uv.x, v.uv.y),
         c,
+        branch: 0,
     };
     let mut bark = Part {
         v: plant
@@ -117,10 +132,12 @@ pub fn grow(s: &Settings, lod: u32) -> Option<Tree> {
             .collect(),
         i: plant.wood.indices,
     };
+    for (vertex, &owner) in bark.v.iter_mut().zip(&bark_branch) { vertex.branch = owner; }
     bark.i = keep_area(&bark.i, |i| bark.v[i as usize].p);
     let needle = species.leaves.kind == LeafKind::Needles;
     let (verts, indices) = if needle { (3, 3) } else { (8, 24) };
     let mut leaves = Part::default();
+    let mut leaf_branch = Vec::new();
     let stride = [1, 2, 5][lod as usize];
     let winter = s.season == 3 && !needle;
     let colors: [[f32; 4]; 4] = std::array::from_fn(|variant| leaf_color(s, variant));
@@ -137,15 +154,27 @@ pub fn grow(s: &Settings, lod: u32) -> Option<Tree> {
         // Scale thinned leaves about the stalk, not the centre: otherwise their attachment
         // moves away from the twig as the LOD changes.
         let anchor = if needle { (piece[0].position + piece[1].position) * 0.5 } else { piece[0].position };
-        let grow = [1., 1.25, 1.63][lod as usize];
+        // Spring flush: the leaves nearest a shoot tip are still expanding. This is an
+        // illustrative developmental gradient, evaluated around each leaf's own stalk.
+        let tip_scale = if s.season == 2 && !needle {
+            let branch = &plant.branches[original_leaf_branch[i * verts] as usize];
+            let first = branch.points[0];
+            let last = *branch.points.last().unwrap();
+            let from_base = anchor.distance(first);
+            let from_tip = anchor.distance(last);
+            1. - 0.18 * from_base / (from_base + from_tip).max(1e-5)
+        } else { 1. };
+        let grow = [1., 1.25, 1.63][lod as usize] * tip_scale;
         let offset = leaves.v.len() as u32;
         for v in piece {
             let variant = ((v.uv.x * 4.) as usize).min(3);
             let color = colors[variant];
             let mut vertex = convert(v, color);
+            vertex.branch = original_leaf_branch[i * verts];
             let p = anchor + (v.position - anchor) * grow;
             vertex.p = vec3(p.x * s.spread, p.y * height_scale, p.z * s.spread);
             leaves.v.push(vertex);
+            leaf_branch.push(original_leaf_branch[i * verts]);
         }
         leaves.i.extend(
             triangles
@@ -160,13 +189,19 @@ pub fn grow(s: &Settings, lod: u32) -> Option<Tree> {
                 .map(|v| convert(v, leaf_color(s, 0))),
         );
         leaves.i.extend_from_slice(&plant.leaves.indices[..indices]);
+        leaf_branch.extend_from_slice(&original_leaf_branch[..verts]);
+        for (v, &owner) in leaves.v.iter_mut().zip(&leaf_branch) { v.branch = owner; }
     }
     leaves.i = keep_area(&leaves.i, |i| leaves.v[i as usize].p);
-    let mut tree = Tree { bark, leaves, lod };
+    let mut tree = Tree { bark, leaves, lod, branches: Vec::new(), bark_branch, leaf_branch };
     let base = tree.bark.v.iter().map(|v| v.p.y).fold(0., f32::min);
     for v in tree.bark.v.iter_mut().chain(&mut tree.leaves.v) {
         v.p -= Vec3::Y * base;
     }
+    for branch in &mut branches {
+        for point in &mut branch.points { point[1] -= base; }
+    }
+    tree.branches = branches;
     Some(tree)
 }
 
@@ -273,6 +308,29 @@ pub fn bark_images(s: &Settings) -> Option<&'static BarkImages> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn growth_stage_seasons_and_branch_ownership_are_consistent() {
+        let s = settings("solstice-oak").unwrap();
+        let mature = grow(&s, 0).unwrap();
+        let mut young_settings = s.clone();
+        young_settings.maturity = 0.5;
+        let young = grow(&young_settings, 0).unwrap();
+        assert!(young.bounds().1.y < mature.bounds().1.y * 0.7);
+        let mut spring_settings = s.clone();
+        spring_settings.season = 2;
+        let spring = grow(&spring_settings, 0).unwrap();
+        assert!(spring.leaves.v.len() < mature.leaves.v.len());
+        assert_eq!(mature.bark_branch.len(), mature.bark.v.len());
+        assert_eq!(mature.leaf_branch.len(), mature.leaves.v.len());
+        assert_eq!(mature.branches[0].parent, None);
+        for (i, branch) in mature.branches.iter().enumerate().skip(1) {
+            assert!(branch.parent.unwrap() < i);
+            assert!(branch.points.iter().flatten().all(|x| x.is_finite()));
+        }
+        assert!(mature.bark_branch.iter().chain(&mature.leaf_branch).all(|&id| (id as usize) < mature.branches.len()));
+        assert!(mature.leaf_branch.iter().any(|&id| id > 0));
+    }
 
     #[test]
     fn forest_species_files_parse_at_forest_heights() {

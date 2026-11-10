@@ -133,9 +133,26 @@ void main() {
 
 struct Textures {
     species: String,
+    paths: [Option<String>; 3],
+    weathering: f32,
     bark: Texture2D,
     height: Texture2D,
     normal: Texture2D,
+}
+
+fn solstice_view(view: u32) -> bool { view != 1 }
+fn preview_leaves(view: u32, enabled: bool) -> bool { enabled && view != 2 }
+
+#[cfg(test)]
+mod viewport_routing_tests {
+    #[test]
+    fn structure_keeps_the_live_renderer_and_hides_foliage() {
+        assert!(super::solstice_view(0));
+        assert!(!super::solstice_view(1));
+        assert!(super::solstice_view(2));
+        assert!(!super::preview_leaves(2, true));
+        assert!(super::preview_leaves(0, true));
+    }
 }
 impl Textures {
     fn new(settings: &Settings) -> Self {
@@ -144,12 +161,17 @@ impl Textures {
             texture.set_filter(FilterMode::Linear);
             texture
         }
-        let (height, normal) = tree::relief_textures(settings);
+        let mut fallback = settings.clone();
+        fallback.bark_color_path = None; fallback.bark_height_path = None; fallback.bark_normal_path = None;
+        let (height, normal) = tree::relief_textures(settings).unwrap_or_else(|_| tree::relief_textures(&fallback).expect("generated textures"));
+        let bark = tree::bark_texture(settings).unwrap_or_else(|_| tree::bark_texture(&fallback).expect("generated bark"));
         Self {
             species: settings.species.clone(),
-            bark: load(tree::bark_texture(settings)),
-            height: load(height),
-            normal: load(normal),
+            paths: [settings.bark_color_path.clone(), settings.bark_height_path.clone(), settings.bark_normal_path.clone()],
+            weathering: settings.bark_weathering,
+            bark: load(&bark),
+            height: load(&height),
+            normal: load(&normal),
         }
     }
     fn apply(&self, model: &mut Model) {
@@ -525,6 +547,10 @@ enum Modal {
     Open,
     Automation,
     Help,
+    BarkColor,
+    BarkHeight,
+    BarkNormal,
+    LeafAtlas,
 }
 struct Editor {
     s: Settings,
@@ -533,6 +559,7 @@ struct Editor {
     auto_lod: bool,
     forest: bool,
     forest_random: bool,
+    forest_floor: bool,
     // Each species' share of the stand, 0 to 1. Shares are relative: the mix is normalised.
     forest_share: [f32; crate::catalog::GROUPS.len()],
     forest_count: u32,
@@ -595,6 +622,7 @@ impl Editor {
             auto_lod: true,
             forest: false,
             forest_random: true,
+            forest_floor: true,
             forest_share: std::array::from_fn(|i| if i < 5 { 0.2 } else { 0. }),
             forest_count: 200,
             library_cwa: false,
@@ -718,6 +746,10 @@ impl Editor {
         self.path = match m {
             Modal::Save | Modal::Open => "exports/project.json".into(),
             Modal::Export => format!("exports/{}.{}", self.s.species, self.format),
+            Modal::BarkColor => self.s.bark_color_path.clone().unwrap_or_default(),
+            Modal::BarkHeight => self.s.bark_height_path.clone().unwrap_or_default(),
+            Modal::BarkNormal => self.s.bark_normal_path.clone().unwrap_or_default(),
+            Modal::LeafAtlas => self.s.leaf_atlas_path.clone().unwrap_or_default(),
             _ => String::new(),
         };
         self.path_focus = false;
@@ -818,6 +850,8 @@ pub async fn run(args: Vec<String>) {
     if let Some(view) = agent::option(&args, "--preview-view") {
         e.debug = solstice_render::DebugView::from_name(&view).expect("validated preview view");
     }
+    if args.iter().any(|arg| arg == "--structure") { e.view = 2; }
+    if args.iter().any(|arg| arg == "--wind") { e.wind = true; }
     let target = render_target(864, 730);
     // Macroquad negates Camera2D's Y zoom on the backbuffer. A positive zoom
     // keeps the layout's top-left origin aligned with mouse_position().
@@ -1060,15 +1094,18 @@ pub async fn run(args: Vec<String>) {
             ratios: e.forest_ratios(),
             grid: e.grid && !e.forest,
             bark: e.bark,
-            leaves: e.leaves,
+            leaves: preview_leaves(e.view, e.leaves),
             game_cards: e.game_preview,
             trim_cards: e.trim_cards,
             random_mix: e.forest_random,
+            forest_floor: e.forest_floor,
             leaf_specular: e.leaf_specular,
             leaf_roughness: e.leaf_roughness,
             leaf_transmission: e.leaf_transmission,
         };
-        let use_solstice = e.view == 0;
+        // Structure is the Solstice preview with foliage hidden, so its branches use the
+        // same hierarchy-based animation as the shaded tree. Only wireframe uses classic.
+        let use_solstice = solstice_view(e.view);
         if let Some(renderer) = worker.as_mut() {
             match renderer.poll() {
                 Some(Ok(frame)) => {
@@ -1187,7 +1224,7 @@ pub async fn run(args: Vec<String>) {
                     }
                 }
             } else {
-                if textures.species != e.s.species {
+                if textures.species != e.s.species || textures.weathering != e.s.bark_weathering || textures.paths != [e.s.bark_color_path.clone(), e.s.bark_height_path.clone(), e.s.bark_normal_path.clone()] {
                     textures = Textures::new(&e.s);
                 }
                 textures.apply(&mut e.model);
@@ -1303,7 +1340,7 @@ pub async fn run(args: Vec<String>) {
                 e.drag_start = Some(before)
             }
             e.dirty = e.s != e.saved;
-            if worker.is_some() && e.view == 0 && is_mouse_button_down(MouseButton::Left) {
+            if worker.is_some() && solstice_view(e.view) && is_mouse_button_down(MouseButton::Left) {
                 model_rebuild_pending = true;
             } else {
                 e.rebuild();
@@ -1666,17 +1703,18 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
             if shrub { 0.25 } else { 3. },
             if shrub { 0.65 } else { 40. },
             p,
-            250.,
+            242.,
             "m",
         );
-        ui.slider("Canopy spread", &mut e.s.spread, 0.4, 1.6, p, 293., "%");
-        ui.slider("Trunk straightness", &mut e.s.trunk_straightness, 0., 1., p, 336., "%");
+        ui.slider("Maturity", &mut e.s.maturity, 0.4, 1.2, p, 280., "%");
+        ui.slider("Canopy spread", &mut e.s.spread, 0.4, 1.6, p, 318., "%");
+        ui.slider("Trunk straightness", &mut e.s.trunk_straightness, 0., 1., p, 356., "%");
         let mut branches = e.s.branches as f32;
-        if ui.slider("Primary branches", &mut branches, 5., 20., p, 379., "") {
+        if ui.slider("Primary branches", &mut branches, 5., 20., p, 394., "") {
             e.s.branches = branches.round() as u32;
         }
-        ui.slider("Branch angle", &mut e.s.branch_angle, 0.5, 1.5, p, 422., "%");
-        ui.slider("Branch droop", &mut e.s.branch_droop, 0., 2., p, 465., "%");
+        ui.slider("Branch angle", &mut e.s.branch_angle, 0.5, 1.5, p, 432., "%");
+        ui.slider("Branch droop", &mut e.s.branch_droop, 0., 2., p, 470., "%");
         ui.slider(
             "Trunk radius",
             &mut e.s.trunk_radius,
@@ -1692,7 +1730,7 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
             0.,
             0.08,
             p,
-            551.,
+            546.,
             "%",
         );
     } else if e.tab == 1 {
@@ -1819,12 +1857,14 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
         }
         ui.slider("Leaf roughness", &mut e.leaf_roughness, 0.05, 1., p, 320., "%");
         ui.slider("Leaf translucency", &mut e.leaf_transmission, 0., 1., p, 387., "%");
-        ui.text("Lower roughness makes highlights sharper.", p, 450., 11., muted());
-        ui.text("Lighting settings affect the preview.", p, 474., 11., muted());
+        ui.slider("Bark moss / dirt", &mut e.s.bark_weathering, 0., 1., p, 450., "%");
         if ui.button("Reset render settings", Rect::new(p, 510., 252., 30.), 0) {
             e.leaf_specular = true;
             e.leaf_roughness = 0.55;
             e.leaf_transmission = 0.8;
+        }
+        for (i, (label, mode)) in [("Bark color", Modal::BarkColor), ("Bark height", Modal::BarkHeight), ("Bark normal", Modal::BarkNormal), ("Leaf atlas", Modal::LeafAtlas)].into_iter().enumerate() {
+            if ui.button(label, Rect::new(p + (i % 2) as f32 * 128., 551. + (i / 2) as f32 * 31., 124., 27.), 0) { e.open_modal(mode); }
         }
     } else {
         ui.heading("01", "Forest composition", p, 222.);
@@ -1868,6 +1908,9 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
                     e.frame();
                 }
             }
+        }
+        if ui.button(if e.forest_floor { "Forest floor: ON" } else { "Forest floor: OFF" }, Rect::new(p, 536., 262., 24.), if e.forest_floor { 2 } else { 0 }) {
+            e.forest_floor = !e.forest_floor;
         }
         if ui.button("<", Rect::new(p, 566., 40., 26.), 0) && e.forest_page > 0 {
             e.forest_page -= 1;
@@ -2191,6 +2234,10 @@ fn modal(ui: &Ui, e: &mut Editor, m: Modal) {
         Modal::Open => "Open a tree project",
         Modal::Automation => "Trees, on autopilot.",
         Modal::Help => "Make yourself at home.",
+        Modal::BarkColor => "Bark color image",
+        Modal::BarkHeight => "Bark height image",
+        Modal::BarkNormal => "Bark normal image",
+        Modal::LeafAtlas => "Leaf color atlas",
     };
     ui.text(title, 442., 262., 27., ink());
     if ui.button("x", Rect::new(979., 237., 27., 28.), 2) || is_key_pressed(KeyCode::Escape) {
@@ -2278,9 +2325,10 @@ fn modal(ui: &Ui, e: &mut Editor, m: Modal) {
         }
         return;
     }
+    let material = matches!(m, Modal::BarkColor | Modal::BarkHeight | Modal::BarkNormal | Modal::LeafAtlas);
     let export = m == Modal::Export;
     ui.text(
-        if export {
+        if material { "Paste a PNG path, or leave empty to use the generated texture." } else if export {
             "Two materials, vertex colors, and detail levels ready to import."
         } else {
             "Settings are stored as a portable, editable JSON project."
@@ -2291,7 +2339,7 @@ fn modal(ui: &Ui, e: &mut Editor, m: Modal) {
         muted(),
     );
     ui.text(
-        if export {
+        if material { "PNG FILE" } else if export {
             "OUTPUT FILE"
         } else {
             "PROJECT FILE"
@@ -2346,6 +2394,29 @@ fn modal(ui: &Ui, e: &mut Editor, m: Modal) {
         if is_key_pressed(KeyCode::Backspace) {
             e.path.pop();
         }
+    }
+    if material {
+        ui.text("Leaf atlas: four variants across, stalk at the bottom of each tile.", 442., 428., 12., muted());
+        ui.text("Match bark color, normal and height maps for best parallax.", 442., 453., 12., muted());
+        ui.text("Project files reference these images; keep them available.", 442., 478., 12., muted());
+        if ui.button("Use generated texture", Rect::new(442., 515., 554., 32.), 0) { e.path.clear(); }
+        if ui.button("Apply material", Rect::new(442., 613., 554., 40.), 1) || is_key_pressed(KeyCode::Enter) {
+            let mut candidate = e.s.clone();
+            let path = if e.path.trim().is_empty() { None } else { Some(e.path.trim().trim_matches('"').to_string()) };
+            match m {
+                Modal::BarkColor => candidate.bark_color_path = path,
+                Modal::BarkHeight => candidate.bark_height_path = path,
+                Modal::BarkNormal => candidate.bark_normal_path = path,
+                Modal::LeafAtlas => candidate.leaf_atlas_path = path,
+                _ => unreachable!(),
+            }
+            match candidate.validate() {
+                Ok(()) => { e.s = candidate; e.rebuild(); e.notice("Material updated."); e.modal = None; }
+                Err(err) => e.notice(format!("Could not load material: {err}")),
+            }
+        }
+        if get_time() < e.status_until && e.status.starts_with("Could not") { ui.text(&e.status.chars().take(80).collect::<String>(), 442., 590., 11., col(0xad553f)); }
+        return;
     }
     if export {
         ui.text("FORMAT", 442., 423., 10., green());

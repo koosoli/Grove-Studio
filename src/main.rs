@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 mod agent;
 mod catalog;
 mod gamelod;
@@ -20,7 +21,7 @@ fn main() {
     }
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--classic" {
+        if ["--classic", "--structure", "--wind"].contains(&args[i].as_str()) {
             i += 1;
             continue;
         }

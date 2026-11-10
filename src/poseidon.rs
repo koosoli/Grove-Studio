@@ -101,9 +101,9 @@ pub fn export(s: &Settings, lods: &[u32], path: &Path) -> Result<Value, String> 
             })
             .map_err(|err| err.to_string())
     };
-    let bark_pixels = load(tree::bark_texture(s))?;
-    let (height_bytes, normal_bytes) = tree::relief_textures(s);
-    let mut normal_pixels = load(normal_bytes)?;
+    let bark_pixels = load(&tree::bark_texture(s)?)?;
+    let (height_bytes, normal_bytes) = tree::relief_textures(s)?;
+    let mut normal_pixels = load(&normal_bytes)?;
     for p in normal_pixels.pixels_mut() {
         // Poseidon's native NOHQ path reads tangent X from A and Y from G.
         p.0 = [128, p[1], 255, p[0]];
@@ -117,7 +117,7 @@ pub fn export(s: &Settings, lods: &[u32], path: &Path) -> Result<Value, String> 
         p.0[3] = if y < EDGE / 16 || y >= EDGE * 15 / 16 {
             0
         } else {
-            255
+            p[3]
         };
         p
     });
@@ -182,6 +182,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
         "poseidon.json",
     ]
     .map(file);
+    let wind_sidecar = file("wind.json");
     let reference = |p: &Path| format!("{prefix}\\{}", p.file_name().unwrap().to_string_lossy());
     // As the engine's own generated trees: no RVMAT, the face texture is the colour and the
     // renderer finds `<texture>_nohq.paa` beside it (an RVMAT without a BaseColour slot only
@@ -277,9 +278,9 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
             })
             .map_err(|err| err.to_string())
     };
-    let bark_pixels = load(tree::bark_texture(s))?;
-    let (_, normal_bytes) = tree::relief_textures(s);
-    let mut bark_normal = load(normal_bytes)?;
+    let bark_pixels = load(&tree::bark_texture(s)?)?;
+    let (_, normal_bytes) = tree::relief_textures(s)?;
+    let mut bark_normal = load(&normal_bytes)?;
     for p in bark_normal.pixels_mut() {
         // OpenPoseidon's `_nohq` layout, as its own tree generator writes it (TreeCommand.cpp
         // WriteNohq): G = y, B = z, A = x, R = 0. A non-zero R is not ignored by the WGPU
@@ -305,13 +306,27 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
     tree::write(&leaves_n, paa(leaf_normal, CompressionVariant::BC3, false))?;
     tree::write(&bark_mat, material("TreeAdvTrunk", &reference(&bark_n)))?;
     tree::write(&leaf_mat, material("TreeAdv", &reference(&leaves_n)))?;
+    let detailed_wind = json!({
+        "format": "grove-branch-wind", "version": 1,
+        "model": path.file_name().unwrap().to_string_lossy(),
+        "coordinates": "model-space metres, Y up; P3D origin",
+        "pointOrder": "P3DM points: bark followed by foliage; collision LOD excluded",
+        "branchAssignment": "source shoot for wood and individual leaves; lowest shared ancestor for a spray cluster",
+        "branches": ladder.branches,
+        "levels": ladder.levels.iter().map(|level| json!({
+            "name": level.rung.name, "resolution": level.rung.resolution,
+            "barkPoints": level.bark.v.len(), "foliagePoints": level.leaves.v.len(),
+            "pointBranches": level.bark.v.iter().chain(&level.leaves.v).map(|v| v.branch).collect::<Vec<_>>()
+        })).collect::<Vec<_>>()
+    });
+    tree::write(&wind_sidecar, serde_json::to_vec(&detailed_wind).map_err(|e| e.to_string())?)?;
     let asset = json!({
         "path": path, "format": "MLOD 1.1 / P3DM", "settings": s,
         "pboPrefix": prefix, "model": reference(path), "levels": counts,
         "forestProxy": options.forest_proxy, "opaqueLeaves": options.opaque_leaves, "trimCards": options.trim_cards,
         "geometryLod": "Convex trunk collision",
-        "wind": {"map":"tree","height":"model-space Y, meters"},
-        "sidecars": [&bark, &bark_n, &leaves, &leaves_n, &bark_mat, &leaf_mat],
+        "wind": {"map":"tree","height":"model-space Y, meters","hierarchy":wind_sidecar.file_name().unwrap().to_string_lossy(),"hierarchyRequiresEngineSupport":true},
+        "sidecars": [&bark, &bark_n, &leaves, &leaves_n, &bark_mat, &leaf_mat, &wind_sidecar],
     });
     tree::write(path, model)?;
     tree::write(&manifest, serde_json::to_vec_pretty(&asset).unwrap())?;
@@ -470,12 +485,13 @@ fn trunk_collision(s: &Settings) -> Part {
     for ring in 0..2 {
         for j in 0..8 {
             let (sin, cos) = (j as f32 * std::f32::consts::TAU / 8.).sin_cos();
-            let radius = s.trunk_radius * if ring == 0 { 1.3 } else { 0.42 };
+            let radius = s.trunk_radius * (0.55 + 0.45 * s.maturity) * if ring == 0 { 1.3 } else { 0.42 };
             part.v.push(V {
-                p: vec3(cos * radius, ring as f32 * s.height * 0.62, sin * radius),
+                p: vec3(cos * radius, ring as f32 * s.height * s.maturity * 0.62, sin * radius),
                 n: Vec3::Y,
                 uv: vec2(0., 0.),
                 c: [1.; 4],
+                branch: 0,
             });
         }
     }
@@ -543,7 +559,19 @@ mod tests {
             opaque_leaves: false,
             trim_cards: true,
         };
-        export_game(&s, &path, &options).unwrap();
+        let asset = export_game(&s, &path, &options).unwrap();
+        let wind: Value = serde_json::from_slice(&std::fs::read(dir.join("beech_a_wind.json")).unwrap()).unwrap();
+        let branches = wind["branches"].as_array().unwrap();
+        assert!(branches.len() > 1);
+        for (i, branch) in branches.iter().enumerate().skip(1) {
+            assert!(branch["parent"].as_u64().unwrap() < i as u64);
+        }
+        for (level, metadata) in asset["levels"].as_array().unwrap().iter().zip(wind["levels"].as_array().unwrap()) {
+            let owners = metadata["pointBranches"].as_array().unwrap();
+            assert_eq!(owners.len() as u64, level["vertices"].as_u64().unwrap());
+            assert!(owners.iter().all(|owner| owner.as_u64().unwrap() < branches.len() as u64));
+            assert!(owners.iter().any(|owner| owner.as_u64().unwrap() > 0));
+        }
         let model = std::fs::read(&path).unwrap();
         let has = |needle: &[u8]| model.windows(needle.len()).any(|w| w == needle);
         for key in ["facepairs", "forestcrowns", "forestinterior", "lodfade", "barkpom", "shadowcoarser"] {

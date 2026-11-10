@@ -159,6 +159,10 @@ grove-studio --headless --preview --preset solstice-fir --preview-view clusters 
 
 Preview options include `--forest`, `--skybox`, `--wind-time` (seconds), `--lod auto|0|1|2|3` (game preview), and diagnostic views `clusters`, `triangles`, `gi`, `reflections`, `voxels`, `albedo` and `normals`. The Weather tab controls cloud cover, wind speed, direction, strength, branch sway and springiness, gusts and leaf flutter. The Render tab controls leaf specular, roughness and translucency. MCP `tree_preview` accepts `cloudCover`, `windStrength`, `windGust`, `branchSway`, `branchSpringiness`, `leafFlutter`, `leafSpecular`, `leafRoughness` and `leafTransmission`; CLI preview provides matching options. Springiness adjusts the lag and resonance of the preview branch response; stopping wind fades the motion rather than snapping it off. This is an approximation, not a full physical spring simulation. These are viewer settings, not exported material settings.
 
+The viewport's **Structure** button hides the foliage while keeping the live wind renderer. For a headless version use `--preview --structure`; MCP `tree_preview` accepts `"structure": true`. Wind rotates branches around generated attachment points, with simplified LODs using approximate ownership when pieces are combined.
+
+The Render tab can load PNG bark color, height and normal maps, plus a four-column leaf color atlas. Project files refer to these images by path. Game LOD P3D exports also write a `_wind.json` hierarchy sidecar; Poseidon requires separate engine support to read and animate it, and its legacy wind remains the fallback.
+
 ## MCP
 
 Configure an MCP client to start the executable with `--mcp`. The server speaks newline-delimited JSON-RPC 2.0 over stdin/stdout and writes no logs to stdout.
