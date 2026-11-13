@@ -14,7 +14,7 @@ Grass controls: --size .25..4 --density .05..1.5 --height .25..2 --width .5..3 -
 Editor: grove-studio [--preset NAME] [--config FILE] [--forest SPECIES]
 Mesh export: grove-studio --headless --preset solstice-oak --out exports/oak.p3d --lod all
 Mesh inspection: grove-studio --headless --inspect --preset solstice-birch
-Budget report: grove-studio --budget-report [--preset SPECIES] [--no-trim-cards]
+Budget report: grove-studio --budget-report [--preset SPECIES] [--no-trim-cards] [--budgets A,B,C,D] [--opaque-leaves]
 Game LOD ladder (near/mid/far/very far, P3D): grove-studio --headless --preset solstice-cwa-buk
   --lod game --out exports/beech.p3d [--prefix PBO_PREFIX] [--forest-proxy] (also with --inspect)
   [--no-trim-cards] [--budgets near,mid,far,veryfar] [--opaque-leaves [--budgets near,veryfar]]: opaque leaf pieces
@@ -151,9 +151,14 @@ fn headless(args: &[String]) -> Result<(), String> {
     if let Some(v) = option(args, "--leaf-atlas") { s.leaf_atlas_path = Some(v); }
     s.validate()?;
     if args.iter().any(|a| a == "--budget-report") {
-        if args.iter().any(|a| ["--preview", "--inspect", "--out", "--budgets", "--opaque-leaves"].contains(&a.as_str())) {
-            return Err("--budget-report cannot be combined with preview, inspect, export, custom budgets or opaque-leaves".into());
+        if args.iter().any(|a| ["--preview", "--inspect", "--out"].contains(&a.as_str())) {
+            return Err("--budget-report cannot be combined with preview, inspect or export".into());
         }
+        let report_budgets = match option(args, "--budgets") {
+            Some(v) => Some(v.split(',').map(|n| n.trim().parse::<usize>().map_err(|_| "Invalid --budgets")).collect::<Result<Vec<_>, _>>()?),
+            None => None,
+        };
+        let report_opaque = args.iter().any(|a| a == "--opaque-leaves");
         let names: Vec<String> = if option(args, "--preset").is_some() || option(args, "--config").is_some() {
             vec![s.species.clone()]
         } else {
@@ -162,7 +167,13 @@ fn headless(args: &[String]) -> Result<(), String> {
         let mut reports = Vec::new();
         for name in names {
             let settings = if name == s.species { s.clone() } else { Settings::preset(&name)? };
-            let mut ladder = crate::gamelod::ladder(&settings);
+            let mut ladder = if report_opaque {
+                crate::gamelod::ladder_with(&settings, &crate::gamelod::opaque_rungs(report_budgets.as_deref())?)
+            } else if let Some(b) = &report_budgets {
+                crate::gamelod::ladder_with(&settings, &crate::gamelod::rungs_with_budgets(b)?)
+            } else {
+                crate::gamelod::ladder(&settings)
+            };
             if !args.iter().any(|a| a == "--no-trim-cards") { crate::gamelod::trim_cards(&mut ladder); }
             let proxy = crate::gamelod::proxy_ladder(&settings);
             reports.push(json!({"species":name, "settings":settings, "levels":crate::gamelod::stats(&ladder), "shadowAndOcclusionProxy":crate::gamelod::stats(&proxy)}));
