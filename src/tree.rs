@@ -41,6 +41,16 @@ pub fn bark_texture(s: &Settings) -> Result<Vec<u8>, String> {
     Ok(result.into_inner())
 }
 
+/// The same generated or imported leaf albedo used by the live viewer.
+pub fn leaf_texture(s: &Settings) -> Result<Vec<u8>, String> {
+    if s.leaf_atlas_path.is_some() { return selected_png(&s.leaf_atlas_path, &[]); }
+    let pixels = crate::preview::leaf_rgba(s);
+    let image = image::RgbaImage::from_raw(256, 256, pixels).ok_or("Invalid leaf atlas")?;
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image).write_to(&mut bytes, image::ImageOutputFormat::Png).map_err(|e| e.to_string())?;
+    Ok(bytes.into_inner())
+}
+
 pub fn leaf_color(s: &Settings, variant: usize) -> [f32; 4] {
     let t = variant as f32 / 3.;
     let palette = crate::reference::palette(s);
@@ -394,7 +404,7 @@ fn export_obj(t: &Tree, path: &Path, s: &Settings) -> Result<(), String> {
     for (name, p) in [("Bark", &t.bark), ("Foliage", &t.leaves)] {
         writeln!(text, "o {name}\nusemtl {name}").unwrap();
         for v in &p.v {
-            let color = if name == "Foliage" && s.leaf_atlas_path.is_some() { [1.; 4] } else { v.c };
+            let color = if name == "Foliage" { [1.; 4] } else { v.c };
             writeln!(
                 text,
                 "v {:.6} {:.6} {:.6} {:.4} {:.4} {:.4}",
@@ -430,11 +440,10 @@ fn export_obj(t: &Tree, path: &Path, s: &Settings) -> Result<(), String> {
         height_path.file_name().unwrap().to_string_lossy(),
         normal_path.file_name().unwrap().to_string_lossy(),
     );
-    if let Some(path_to_atlas) = &s.leaf_atlas_path {
-        let leaf_path = path.with_extension("leaves.png");
-        write(&leaf_path, fs::read(path_to_atlas).map_err(|e| format!("{path_to_atlas}: {e}"))?)?;
-        materials.push_str(&format!("map_Kd {}\nmap_d {}\n", leaf_path.file_name().unwrap().to_string_lossy(), leaf_path.file_name().unwrap().to_string_lossy()));
-    }
+    let leaf_path = path.with_extension("leaves.png");
+    write(&leaf_path, leaf_texture(s)?)?;
+    materials.push_str(&format!("map_Kd {}\n", leaf_path.file_name().unwrap().to_string_lossy()));
+    if s.leaf_atlas_path.is_some() { materials.push_str(&format!("map_d {}\n", leaf_path.file_name().unwrap().to_string_lossy())); }
     write(&mtl, materials)?;
     write(path, text)
 }
@@ -462,7 +471,7 @@ fn export_gltf(t: &Tree, path: &Path, s: &Settings) -> Result<(), String> {
                     "POSITION" => vec![v.p.x, v.p.y, v.p.z],
                     "NORMAL" => vec![v.n.x, v.n.y, v.n.z],
                     "TANGENT" => tangents[vertex].to_array().to_vec(),
-                    "COLOR_0" => if material == 1 && s.leaf_atlas_path.is_some() { vec![1.; 4] } else { v.c.to_vec() },
+                    "COLOR_0" => if material == 1 { vec![1.; 4] } else { v.c.to_vec() },
                     "_WIND" => wind_weights(v, s.height * s.maturity, material == 1).to_vec(),
                     _ => vec![v.uv.x, v.uv.y],
                 };
@@ -535,17 +544,16 @@ fn export_gltf(t: &Tree, path: &Path, s: &Settings) -> Result<(), String> {
         {"name":"Bark","pbrMetallicRoughness":{"baseColorFactor":[1,1,1,1],"baseColorTexture":{"index":0},"metallicFactor":0,"roughnessFactor":0.92}},
         {"name":"Foliage","doubleSided":true,"pbrMetallicRoughness":{"baseColorFactor":[1,1,1,1],"metallicFactor":0,"roughnessFactor":0.85}}
     ]);
-    if let Some(path_to_atlas) = &s.leaf_atlas_path {
-        let data = fs::read(path_to_atlas).map_err(|e| format!("{path_to_atlas}: {e}"))?;
+    {
+        let data = leaf_texture(s)?;
         while bin.len() % 4 != 0 { bin.push(0); }
-        let offset = bin.len();
-        bin.extend_from_slice(&data);
+        let offset = bin.len(); bin.extend_from_slice(&data);
         let view = views.len();
         views.push(json!({"buffer":0,"byteOffset":offset,"byteLength":data.len()}));
         images.push(json!({"bufferView":view,"mimeType":"image/png"}));
         texture_defs.push(json!({"source":images.len()-1,"sampler":0}));
         materials[1]["pbrMetallicRoughness"]["baseColorTexture"] = json!({"index":texture_defs.len()-1});
-        materials[1]["alphaMode"] = json!("MASK");
+        if s.leaf_atlas_path.is_some() { materials[1]["alphaMode"] = json!("MASK"); }
     }
     materials[0]["normalTexture"] = json!({"index":height_index+1});
     materials[0]["extras"] = json!({"parallax":{"heightTexture":{"index":height_index,"texCoord":0},"scale":s.parallax_depth,"layers":16,"heightConvention":"white is raised; depth = 1 - height","requiresEngineShader":true}});
@@ -589,6 +597,20 @@ mod tests {
     }
 
     #[test]
+    fn generated_leaf_textures_export_in_obj_and_gltf() {
+        let dir = std::env::temp_dir().join(format!("grove-leaf-textures-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut s = Settings::preset("solstice-birch").unwrap(); s.maturity = 0.4;
+        let obj = dir.join("tree.obj"); export(&s, 2, "obj", &obj).unwrap();
+        assert!(obj.with_extension("leaves.png").is_file());
+        assert!(fs::read_to_string(obj.with_extension("mtl")).unwrap().contains("map_Kd tree.leaves.png"));
+        let gltf = dir.join("tree.gltf"); export(&s, 2, "gltf", &gltf).unwrap();
+        let doc: Value = serde_json::from_slice(&fs::read(&gltf).unwrap()).unwrap();
+        assert_eq!(doc["materials"][1]["pbrMetallicRoughness"]["baseColorTexture"]["index"], 3);
+        assert!(doc["materials"][1].get("alphaMode").is_none());
+    }
+
+    #[test]
     fn custom_materials_and_branch_hierarchy_export() {
         let dir = std::env::temp_dir().join(format!("grove-material-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -598,6 +620,7 @@ mod tests {
         s.leaf_atlas_path = Some(atlas.to_string_lossy().into_owned());
         s.bark_color_path = s.leaf_atlas_path.clone();
         s.validate().unwrap();
+        assert_eq!(leaf_texture(&s).unwrap(), fs::read(&atlas).unwrap());
         let model = dir.join("tree.gltf");
         export(&s, 2, "gltf", &model).unwrap();
         let doc: Value = serde_json::from_slice(&fs::read(model).unwrap()).unwrap();

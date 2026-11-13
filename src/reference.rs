@@ -257,22 +257,15 @@ fn leaf_color(s: &Settings, variant: usize) -> [f32; 4] {
     ]
 }
 
-pub fn leaf_atlas(s: &Settings) -> Option<&'static [u8]> {
-    static BROADLEAF: OnceLock<Vec<u8>> = OnceLock::new();
-    static BIRCH: OnceLock<Vec<u8>> = OnceLock::new();
-    static NEEDLES: OnceLock<Vec<u8>> = OnceLock::new();
-    static WILLOW: OnceLock<Vec<u8>> = OnceLock::new();
-    static OAK: OnceLock<Vec<u8>> = OnceLock::new();
+pub fn leaf_maps(s: &Settings) -> Option<&'static solstice_asset::TextureLayer> {
+    static CACHE: [OnceLock<solstice_asset::TextureLayer>; 5] = [const { OnceLock::new() }; 5];
     let kind = species(s)?.leaves.kind;
-    // One atlas per leaf kind, shared by every species that uses it.
-    let cache = match kind {
-        LeafKind::Broadleaf => &BROADLEAF,
-        LeafKind::Birch => &BIRCH,
-        LeafKind::Needles => &NEEDLES,
-        LeafKind::Willow => &WILLOW,
-        LeafKind::Oak => &OAK,
-    };
-    Some(cache.get_or_init(|| kind.atlas(0).bake(256).color_mips.remove(0)))
+    let i = LeafKind::ALL.iter().position(|k| *k == kind)?;
+    Some(CACHE[i].get_or_init(|| kind.atlas(0).bake(256)))
+}
+
+pub fn leaf_atlas(s: &Settings) -> Option<&'static [u8]> {
+    Some(&leaf_maps(s)?.color_mips[0])
 }
 
 pub struct BarkImages {

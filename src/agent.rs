@@ -369,7 +369,7 @@ pub fn export_lods(
         let extensions: &[_] = if format == "gltf" {
             &["bin"]
         } else {
-            &["mtl", "bark.png", "bark-height.png", "bark-normal.png"]
+            &["mtl", "bark.png", "bark-height.png", "bark-normal.png", "leaves.png"]
         };
         check_outputs(
             root,

@@ -176,7 +176,11 @@ fn veined(
         let phase = v * vein_count - d * 2.2;
         let side_veins = (-((phase - phase.round()) * 9.0).powi(2)).exp() * (1.0 - d);
         let midrib = (-(across * 18.0).powi(2)).exp();
-        let veins = side_veins.max(midrib);
+        // Fine veins branch off the larger pairs; keep their relief subtle at distance.
+        let fine_phase = phase * 3.0 + d * 1.7;
+        let fine_veins = (-((fine_phase - fine_phase.round()) * 16.0).powi(2)).exp()
+            * (1.0 - d) * (1.0 - midrib) * 0.22;
+        let veins = side_veins.max(midrib).max(fine_veins);
 
         let mut color = colors[variant];
         color *= 1.0 + 0.18 * mottle.at(u, v) + 0.1 * blotches.at(u, v);
@@ -187,7 +191,7 @@ fn veined(
             color,
             // Veins sit in grooves on a leaf's upper face.
             height: -veins,
-            roughness,
+            roughness: (roughness + 0.06 * mottle.at(u, v) - 0.045 * midrib).clamp(0.2, 0.8),
             cavity: 1.0 - veins * 0.15,
         }
     })

@@ -108,8 +108,8 @@ Projects saved with the earlier `oak`, `birch` or `pine` species open as `solsti
 ## Export and game import
 
 - **Units and axes**: meters, Y up. Each tree has separate Bark and Foliage materials, with vertex colors, normals, UVs and glTF tangent frames.
-- **glTF 2.0**: a `.gltf` and `.bin` pair per LOD, with textures embedded in the binary buffer. Foliage is opaque and double-sided. Keep the `.bin` beside the `.gltf`.
-- **OBJ**: `.obj`, `.mtl` and bark color, normal and height PNGs. Vertex RGB is included as an extension. Keep all sidecars together. Configure foliage to render both sides.
+- **glTF 2.0**: a `.gltf` and `.bin` pair per LOD, with bark and generated leaf albedo embedded in the binary buffer. Generated foliage is opaque and double-sided. Keep the `.bin` beside the `.gltf`.
+- **OBJ**: `.obj`, `.mtl`, bark color/normal/height PNGs and a leaf albedo PNG. Vertex RGB is included as an extension. Keep all sidecars together. Configure foliage to render both sides.
 - **LODs**: LOD 0 is the full tree. LOD 1 keeps alternate leaves, and LOD 2 keeps one in five, growing the remaining pieces. All LODs share the same ground origin.
 - **Game LOD ladder** (`--lod game`, Poseidon P3D): four visual levels target at most 150,000, 30,000, 6,500 and 1,500 exported P3D faces (including reversed foliage faces). Near uses opaque individual leaf geometry; mid and distant levels use alpha cards or clustered sprays. Thinned pieces grow to compensate for lost geometric leaf area. Sparse trees can be below these targets. The exported shadow-buffer LOD is capped separately and a coarse `_occlusion.p3d` is provided for explicit use. The checked-out engine shadow pass selects visual LODs for visible objects and does not automatically consume this shadow level or occlusion sidecar; runtime support must be verified or added on the engine side.
 - **Card trimming:** mid and distant game cards are trimmed by default. Clipping can add triangles, so whole cards are thinned to fit the final budget and enlarged to preserve their combined geometric area. Alpha coverage, overlapping leaves, compressed mips and filtering can change the visible coverage; profile and inspect in the target engine. Use `--no-trim-cards` or MCP `trimCards: false` to compare.
@@ -214,3 +214,5 @@ Grove Studio is licensed under the **GNU General Public License v3.0 or later**.
 - The Poseidon oak re-expresses the forest oak preset of the Poseidon engine, which uses the ez-tree growth model by Dan Greenheck (MIT). See [CREDITS.md](CREDITS.md).
 - Third-party Rust dependency licenses are listed in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt).
 - The editor loads Segoe UI from your own Windows installation if present, and falls back to the built-in font otherwise. No font files are redistributed.
+
+Generated leaf textures retain species veins and mottling through seasonal recoloring. The Solstice viewer and game P3D leaf detail bands use procedural vein normals; spray cards retain neutral normals. Imported leaf albedos retain their original export resolution.

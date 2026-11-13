@@ -303,7 +303,16 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
     }
     let edge = crate::gamelod::ATLAS;
     let atlas = RgbaImage::from_raw(edge, edge, ladder.atlas.clone()).unwrap();
-    let leaf_normal = leaf_normal_map(&atlas);
+    let leaf_normal = if s.leaf_atlas_path.is_some() { leaf_normal_map(&atlas) } else {
+        let (normals, _) = preview::leaf_surface_maps(s, true, edge as usize);
+        RgbaImage::from_fn(edge, edge, |x,y| {
+            let i = ((y*edge+x)*2) as usize;
+            let nx = normals[i] as f32 / 127.5 - 1.;
+            let ny = normals[i+1] as f32 / 127.5 - 1.;
+            let nz = (1.-nx*nx-ny*ny).max(0.).sqrt();
+            image::Rgba([0, normals[i+1], (nz*127.5+127.5).round() as u8, normals[i]])
+        })
+    };
     tree::write(&bark, paa(bark_pixels, CompressionVariant::BC1, false))?;
     tree::write(&bark_n, paa(bark_normal, CompressionVariant::BC3, false))?;
     {

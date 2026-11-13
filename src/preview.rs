@@ -539,35 +539,55 @@ pub(crate) fn leaf_rgba(settings: &Settings) -> Vec<u8> {
             Err(err) => crate::log::log(format!("Could not load leaf atlas {path}: {err}; using generated atlas")),
         }
     }
-    if settings.season == 0 {
-        if let Some(atlas) = crate::reference::leaf_atlas(settings) {
-            return atlas.to_vec();
-        }
-    }
-    let mut color = Vec::new();
-    for y in 0..TEX_SIZE {
-        for x in 0..TEX_SIZE {
-            let across = ((x as f32 + 0.5) / (TEX_SIZE / 4) as f32).fract() * 2. - 1.;
-            let along = y as f32 / TEX_SIZE as f32;
-            let rib = (-across.abs() * 19.).exp();
-            let phase = along * 8. - across.abs() * 1.8;
-            let veins = (-(phase - phase.round()).abs() * 12.).exp() * (1. - across.abs());
-            let shade = 1. + 0.23 * rib + 0.13 * veins - 0.12 * across.abs().powi(3);
-            let c = tree::leaf_color(settings, (x / (TEX_SIZE / 4)) as usize);
-            color.extend(
-                c[..3]
-                    .iter()
-                    .map(|v| (tree::srgb(v * shade) * 255.).round() as u8),
-            );
-            color.push(255);
+    let mut color = crate::reference::leaf_atlas(settings).expect("known species").to_vec();
+    if settings.season == 0 { return color; }
+    // Recolor the actual species atlas while retaining its veins and mottling.
+    let linear = |b: u8| ((b as f32 / 255. + 0.055) / 1.055).powf(2.4);
+    let centers: [[f32;3];4] = std::array::from_fn(|variant| {
+        let i = (128 * 256 + variant * 64 + 32) * 4;
+        [linear(color[i]), linear(color[i+1]), linear(color[i+2])]
+    });
+    for (i, p) in color.chunks_exact_mut(4).enumerate() {
+        let variant = (i % 256) / 64;
+        let target = tree::leaf_color(settings, variant);
+        for ch in 0..3 {
+            let detail = (linear(p[ch]) / centers[variant][ch].max(0.001)).clamp(0.4, 1.8);
+            p[ch] = (tree::srgb(target[ch] * detail) * 255.).round().clamp(0.,255.) as u8;
         }
     }
     color
 }
 
+/// Leaf relief for the original or game atlas. Spray cards keep neutral normals so tiny
+/// baked silhouettes do not turn into glossy bumps; the individual-leaf bands use veins.
+pub(crate) fn leaf_surface_maps(settings: &Settings, game: bool, edge: usize) -> (Vec<u8>, Vec<u8>) {
+    let source = crate::reference::leaf_maps(settings).expect("known species");
+    let mut normals = vec![128; edge * edge * 2];
+    let mut data = vec![128; edge * edge * 2];
+    if settings.leaf_atlas_path.is_some() { return (normals, data); }
+    for y in 0..edge {
+        let v = (y as f32 + 0.5) / edge as f32;
+        let along = if !game { Some(v) } else {
+            [crate::gamelod::OPAQUE, crate::gamelod::CUTOUT].iter()
+                .find(|r| v >= r.0 && v <= r.1).map(|r| (v-r.0)/(r.1-r.0))
+        };
+        let Some(along) = along else { continue; };
+        for x in 0..edge {
+            let sx = (x * 256 / edge).min(255);
+            let sy = ((along * 256.) as usize).min(255);
+            let src = (sy*256+sx)*2; let dst = (y*edge+x)*2;
+            normals[dst..dst+2].copy_from_slice(&source.normal_mips[0][src..src+2]);
+            // Preserve the editor roughness slider's scale with subtle local variation.
+            let r = source.material_mips[0][src] as f32;
+            data[dst] = (128. + (r-128.) * 0.25).clamp(96.,160.) as u8;
+        }
+    }
+    (normals, data)
+}
+
 fn leaf_layer(settings: &Settings) -> TextureLayer {
-    let n = (TEX_SIZE * TEX_SIZE * 2) as usize;
-    layer(leaf_rgba(settings), vec![128; n], vec![128; n])
+    let (normal, data) = leaf_surface_maps(settings, false, TEX_SIZE as usize);
+    layer(leaf_rgba(settings), normal, data)
 }
 
 /// Places `count` trees on a jittered square grid. Each tree goes to the species furthest below
@@ -855,8 +875,8 @@ fn species_asset(settings: &Settings, lod: u32, game_cards: bool, trim_cards: bo
         let layer = if foliage && game_cards {
             let atlas = image::RgbaImage::from_raw(crate::gamelod::ATLAS, crate::gamelod::ATLAS, game.as_ref().unwrap().atlas.clone()).unwrap();
             let color = image::imageops::resize(&atlas, TEX_SIZE, TEX_SIZE, FilterType::Triangle).into_raw();
-            let n = (TEX_SIZE * TEX_SIZE * 2) as usize;
-            layer(color, vec![128; n], vec![128; n])
+            let (normal, data) = leaf_surface_maps(settings, true, TEX_SIZE as usize);
+            layer(color, normal, data)
         } else if foliage {
             leaf_layer(settings)
         } else {
@@ -872,7 +892,7 @@ fn species_asset(settings: &Settings, lod: u32, game_cards: bool, trim_cards: bo
                     ((settings.parallax_depth * 1000.).round() as u32) << 8
                 },
             texture_layer: 0,
-            normal_strength: if foliage { 0. } else { 1. },
+            normal_strength: if foliage { if settings.leaf_atlas_path.is_some() { 0. } else { 0.5 } } else { 1. },
             ..Default::default()
         };
         Ok((mesh, layer, material))
@@ -1057,6 +1077,19 @@ fn build_scene(key: &SceneKey) -> Result<LoadedScene, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leaf_seasons_keep_species_detail_and_game_sprays_keep_neutral_normals() {
+        let mut s = Settings::preset("solstice-birch").unwrap();
+        let summer = leaf_rgba(&s); s.season = 1;
+        let autumn = leaf_rgba(&s);
+        assert_ne!(summer, autumn);
+        assert!(autumn.chunks_exact(4).map(|p| p[1]).max().unwrap() > autumn.chunks_exact(4).map(|p| p[1]).min().unwrap() + 15);
+        let (normal, data) = leaf_surface_maps(&s, true, 256);
+        assert_eq!(normal.len(), 256*256*2); assert_eq!(data.len(), normal.len());
+        assert!(normal[..100*256*2].iter().any(|&v| v != 128));
+        assert!(normal[140*256*2..].iter().all(|&v| v == 128));
+    }
 
     #[test]
     fn foliage_phase_is_shared_within_each_piece_and_keeps_atlas_coordinates() {
