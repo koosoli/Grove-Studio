@@ -1,6 +1,6 @@
 [package]
 name = "grove-studio"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "A procedural tree workshop with a WebGPU preview and glTF/OBJ export, plus a headless CLI and MCP server"
 license = "GPL-3.0-or-later"

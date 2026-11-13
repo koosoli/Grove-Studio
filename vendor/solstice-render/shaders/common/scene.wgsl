@@ -97,7 +97,8 @@ const INSTANCE_HIDDEN: u32 = 0x20000000u;
 const INSTANCE_STAYS_IN_GI: u32 = 0x10000000u;
 const INSTANCE_WIND: u32 = 0x08000000u;
 const INSTANCE_WIND_LEAF: u32 = 0x04000000u;
-const INSTANCE_MATERIAL_MASK: u32 = 0x03ffffffu;
+const INSTANCE_GRASS: u32 = 0x02000000u;
+const INSTANCE_MATERIAL_MASK: u32 = 0x01ffffffu;
 
 fn instance_material(i: Instance) -> u32 {
     return i.material & INSTANCE_MATERIAL_MASK;
@@ -226,8 +227,15 @@ fn vegetation_wind(i: Instance, p: vec3f, uv: vec2f, clock: f32, origin_xz: vec2
 
 fn transform_wind_normal(i: Instance, n: vec3f, p: vec3f, clock: f32, params: vec4f) -> vec3f {
     let normal = transform_normal(i, n);
-    let angle = vegetation_angle(i, p, clock, vec2f(i.world_0.w, i.world_2.w), params);
+    var angle = vegetation_angle(i, p, clock, vec2f(i.world_0.w, i.world_2.w), params);
     let direction = floor(max(clock - 1.0, 0.0) / 10000.0) * 0.3926990817;
+    if (i.material & INSTANCE_GRASS) != 0u && clock > 0.0 && params.x > 0.0 {
+        let t = (clock - 1.0) % 10000.0;
+        let at = vec2f(i.world_0.w, i.world_2.w) + p.xz;
+        let gust = vegetation_gust(at, t, direction, params.y);
+        let phase = dot(at, vec2f(1.3,0.9));
+        angle = clamp(max(p.y,0.0)*0.4*params.x*gust*(0.7+0.3*sin(t*2.1+phase)),-0.7,0.7);
+    }
     let dir = vec2f(sin(direction), cos(direction));
     let along = dot(normal.xz, dir);
     let bent_x = along * cos(angle) + normal.y * sin(angle);
@@ -237,6 +245,9 @@ fn transform_wind_normal(i: Instance, n: vec3f, p: vec3f, clock: f32, params: ve
 fn vegetation_padding(i: Instance, center: vec3f, radius: f32, clock: f32, params: vec4f) -> f32 {
     if clock <= 0.0 || params.x <= 0.0 || (i.material & INSTANCE_WIND) == 0u {
         return 0.0;
+    }
+    if (i.material & INSTANCE_GRASS) != 0u {
+        return 0.8 * max(center.y + radius, 0.0) * i.max_scale;
     }
     let height = pow(clamp(max(center.y + radius, 0.0) / 12.0, 0.0, 3.0), 0.6);
     let max_angle = min(0.025 * params.x * (1.0 + params.y) * height, 0.3);

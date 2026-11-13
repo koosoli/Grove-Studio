@@ -1,3 +1,17 @@
+// Grove grass preview: opaque blades bend in a continuous field. The engine's runtime
+// grass renderer still supplies its own placement, interaction and ring LODs.
+fn grass_preview_offset(p: vec3f, origin: vec2f, clock: f32, params: vec4f) -> vec3f {
+    if clock <= 0.0 || params.x <= 0.0 || p.y <= 0.0 { return vec3f(0.0); }
+    let encoded = clock - 1.0;
+    let direction = floor(encoded / 10000.0) * 0.3926990817;
+    let t = encoded % 10000.0;
+    let gust = vegetation_gust(origin + p.xz, t, direction, params.y);
+    let phase = dot(origin + p.xz, vec2f(1.3, 0.9));
+    let angle = clamp(p.y * 0.4 * params.x * gust * (0.7 + 0.3 * sin(t*2.1 + phase)), -0.7, 0.7);
+    let dir = vec2f(sin(direction), cos(direction));
+    return vec3f(dir.x*p.y*sin(angle), p.y*(cos(angle)-1.0), dir.y*p.y*sin(angle));
+}
+
 // Grove stores the actual stem tree in otherwise unused material records. The unused high
 // half of each packed vertex's d word names its source stem (zero means no hierarchy).
 fn hierarchy_local(i: Instance, p: vec3f, vertex: PackedVertex, clock: f32, params: vec4f, dynamics: vec4f, vector: bool) -> vec3f {
@@ -41,6 +55,7 @@ fn hierarchy_local(i: Instance, p: vec3f, vertex: PackedVertex, clock: f32, para
 
 fn transform_vegetation(i: Instance, p: vec3f, uv: vec2f, vertex: PackedVertex, clock: f32, params: vec4f, dynamics: vec4f) -> vec3f {
     let material = wind_records[instance_material(i)];
+    if (material.flags & 0x02000000u) != 0u { return transform_point(i, p) + grass_preview_offset(p, vec2f(i.world_0.w,i.world_2.w), clock, params); }
     let hierarchical = (material.flags & 0x01000000u) != 0u && (vertex.d >> 16u) != 0u;
     let local = hierarchy_local(i, p, vertex, clock, params, dynamics, false);
     let legacy = vec4f(params.xyz, select(params.w, 0.0, hierarchical));
@@ -49,6 +64,7 @@ fn transform_vegetation(i: Instance, p: vec3f, uv: vec2f, vertex: PackedVertex, 
 
 fn transform_vegetation_prev(i: Instance, p: vec3f, uv: vec2f, vertex: PackedVertex, clock: f32, params: vec4f, dynamics: vec4f) -> vec3f {
     let material = wind_records[instance_material(i)];
+    if (material.flags & 0x02000000u) != 0u { return transform_point_prev(i, p) + grass_preview_offset(p, vec2f(i.prev_world_0.w,i.prev_world_2.w), clock, params); }
     let hierarchical = (material.flags & 0x01000000u) != 0u && (vertex.d >> 16u) != 0u;
     let local = hierarchy_local(i, p, vertex, clock, params, dynamics, false);
     let legacy = vec4f(params.xyz, select(params.w, 0.0, hierarchical));

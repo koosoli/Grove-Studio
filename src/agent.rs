@@ -7,6 +7,10 @@ use std::{
 
 pub const HELP: &str = "Grove Studio
 
+Grass: grove-studio --grass meadow [--headless --inspect]
+Grass mesh: --headless --grass meadow --out exports/grass.gltf --lod all
+Engine textures: --headless --grass meadow --format engine --out exports/grass-pack
+Grass controls: --size .25..4 --density .05..1.5 --height .25..2 --width .5..3 --lean 0..1.5 --dry 0..1 --no-weeds
 Editor: grove-studio [--preset NAME] [--config FILE] [--forest SPECIES]
 Mesh export: grove-studio --headless --preset solstice-oak --out exports/oak.p3d --lod all
 Mesh inspection: grove-studio --headless --inspect --preset solstice-birch
@@ -51,6 +55,7 @@ pub fn dispatch(args: &[String]) -> Option<Result<(), String>> {
     if args.iter().any(|a| a == "--mcp") {
         return Some(mcp_root(args).and_then(mcp));
     }
+    if args.iter().any(|a|a=="--grass") && args.iter().any(|a|a=="--headless") {return Some(crate::grass::headless(args));}
     if !args.iter().any(|a| a == "--headless" || a == "--budget-report") {
         return None;
     }
@@ -435,8 +440,13 @@ pub fn parse_lods(s: &str) -> Result<Vec<u32>, String> {
 fn schema() -> Value {
     json!({"type":"object","additionalProperties":false,"properties":{"species":{"type":"string","enum":crate::preview::SPECIES.as_slice()},"seed":{"type":"integer","minimum":0,"maximum":4294967295u64},"height":{"type":"number","minimum":0.25,"maximum":40},"maturity":{"type":"number","minimum":0.15,"maximum":1.2,"default":1},"spread":{"type":"number","minimum":0.4,"maximum":1.6},"branches":{"type":"integer","minimum":5,"maximum":20},"density":{"type":"number","minimum":0.25,"maximum":1.8},"leaf_size":{"type":"number","minimum":0.025,"maximum":0.4},"trunk_radius":{"type":"number","minimum":0.05,"maximum":1.0},"trunk_straightness":{"type":"number","minimum":0,"maximum":1},"branch_angle":{"type":"number","minimum":0.5,"maximum":1.5},"branch_droop":{"type":"number","minimum":0,"maximum":2},"season":{"type":"integer","minimum":0,"maximum":3},"parallax_depth":{"type":"number","minimum":0,"maximum":0.08},"bark_weathering":{"type":"number","minimum":0,"maximum":1},"bark_color_path":{"type":["string","null"]},"bark_height_path":{"type":["string","null"]},"bark_normal_path":{"type":["string","null"]},"leaf_atlas_path":{"type":["string","null"]}}})
 }
+fn grass_schema()->Value { json!({"type":"object","additionalProperties":false,"properties":{"preset":{"type":"string","enum":crate::grass::PRESETS},"style":{"type":"string","enum":["solstice","poseidon"]},"seed":{"type":"integer","minimum":0,"maximum":4294967295u64},"size":{"type":"number","minimum":0.25,"maximum":4},"density":{"type":"number","minimum":0.05,"maximum":1.5},"height":{"type":"number","minimum":0.25,"maximum":2},"width":{"type":"number","minimum":0.5,"maximum":3},"lean":{"type":"number","minimum":0,"maximum":1.5},"dry":{"type":"number","minimum":0,"maximum":1},"patchiness":{"type":"number","minimum":0,"maximum":1},"weeds":{"type":"boolean"}}}) }
 pub fn tools_list() -> Value {
     json!({"tools":[
+        {"name":"grass_presets","description":"List editable procedural grass presets.","inputSchema":{"type":"object","additionalProperties":false}},
+        {"name":"grass_inspect","description":"Measure the three grass mesh LODs without files.","inputSchema":{"type":"object","properties":{"settings":grass_schema()},"additionalProperties":false}},
+        {"name":"grass_generate","description":"Export opaque grass mesh or eight-layer OpenPoseidon texture bundle.","inputSchema":{"type":"object","properties":{"settings":grass_schema(),"output":{"type":"string"},"format":{"type":"string","enum":["gltf","obj","engine"]},"lod":{"type":"integer","minimum":0,"maximum":2}},"required":["output"],"additionalProperties":false}},
+        {"name":"grass_preview","description":"Render a grass patch in the Solstice viewer.","inputSchema":{"type":"object","properties":{"settings":grass_schema(),"output":{"type":"string"},"lod":{"type":"integer","minimum":0,"maximum":2},"windTime":{"type":"number","minimum":0,"maximum":86400}},"required":["output"],"additionalProperties":false}},
         {"name":"tree_presets","description":"List tree species and settings; optionally search names and IDs.","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"additionalProperties":false}},
         {"name":"tree_randomize","description":"Create a reproducible random variation of the current species and selected settings.","inputSchema":{"type":"object","properties":{"settings":schema(),"scope":{"type":"string","enum":["all","shape","foliage"],"default":"all"},"field":{"type":"string","description":"Randomize only this field instead of a scope","enum":["height","maturity","spread","trunk_straightness","branches","branch_angle","branch_droop","trunk_radius","parallax_depth","density","leaf_size","season"]},"seed":{"type":"integer","minimum":0,"maximum":4294967295u64}},"required":["seed"],"additionalProperties":false}},
         {"name":"tree_budget_report","description":"Measure game LOD and shadow-proxy geometry without writing files.","inputSchema":{"type":"object","properties":{"settings":schema(),"trimCards":{"type":"boolean","default":true}},"additionalProperties":false}},
@@ -463,6 +473,10 @@ fn settings_from(v: &Value) -> Result<Settings, String> {
 pub fn call_tool(name: &str, args: &Value, root: &Path) -> Result<Value, String> {
     let obj = args.as_object().ok_or("arguments must be an object")?;
     let allowed: &[&str] = match name {
+        "grass_presets"=> &[],
+        "grass_inspect"=> &["settings"],
+        "grass_generate"=> &["settings","output","format","lod"],
+        "grass_preview"=> &["settings","output","lod","windTime"],
         "tree_presets" => &["query"],
         "tree_randomize" => &["settings", "scope", "field", "seed"],
         "tree_inspect" => &["settings"],
@@ -505,6 +519,7 @@ pub fn call_tool(name: &str, args: &Value, root: &Path) -> Result<Value, String>
             return Err(format!("Unknown argument: {key}"));
         }
     }
+    if name.starts_with("grass_") {return grass_tool(name,args,root);}
     if name == "tree_presets" {
         let query = args.get("query").map(|v| v.as_str().ok_or("query must be a string")).transpose()?.unwrap_or("");
         let ids: Vec<&str> = if query.trim().is_empty() { crate::preview::SPECIES.iter().copied().collect() } else { crate::gui::library_matches(query, false).into_iter().map(|v| v.0).collect() };
@@ -587,7 +602,29 @@ pub fn call_tool(name: &str, args: &Value, root: &Path) -> Result<Value, String>
     Ok(json!({"ok":true,"files":files}))
 }
 
-fn capture_preview(s: Settings, args: &Value, path: &Path) -> Result<Value, String> {
+fn grass_tool(name:&str,args:&Value,root:&Path)->Result<Value,String> {
+    if name=="grass_presets" {return Ok(json!({"presets":crate::grass::PRESETS.iter().map(|n|crate::grass::Settings::preset(n).unwrap()).collect::<Vec<_>>()}));}
+    let s:crate::grass::Settings=serde_json::from_value(args.get("settings").cloned().unwrap_or(json!({}))).map_err(|e|e.to_string())?;s.validate()?;
+    if name=="grass_inspect" {return s.report();}
+    let file=args.get("output").and_then(Value::as_str).ok_or("output must be a relative name")?;
+    let rel=Path::new(file);
+    if rel.as_os_str().is_empty()||rel.components().any(|c|!matches!(c,std::path::Component::Normal(_))){return Err("Output must be beneath output root".into());}
+    let lod=args.get("lod").map(|v|v.as_u64().filter(|n|*n<=2).ok_or("Grass LOD must be 0..2")).transpose()?.unwrap_or(0) as u32;
+    std::fs::create_dir_all(root).map_err(|e|e.to_string())?;let root=root.canonicalize().map_err(|e|e.to_string())?;let out=root.join(rel);
+    let format=args.get("format").map(|v|v.as_str().ok_or("format must be a string")).transpose()?.unwrap_or("gltf");
+    let paths:Vec<PathBuf>=if name=="grass_preview"{vec![out.clone()]}else if format=="engine"{
+        (0..8).map(|i|out.join(format!("assets/grass/meadow-grass-blade-{i}.png"))).chain([out.join("project.json"),out.join("source.grass"),out.join("grass-bundle.json")]).collect()
+    }else{vec![out.clone(),out.with_extension("bin"),out.with_extension("mtl"),out.with_extension("grass.png")]};
+    for path in &paths {let mut ancestor=path.as_path();while std::fs::symlink_metadata(ancestor).is_err(){ancestor=ancestor.parent().ok_or("Invalid output path")?;}if !ancestor.canonicalize().map_err(|e|e.to_string())?.starts_with(&root){return Err("Output escapes output root".into());}}
+    if name=="grass_preview" {
+        let mut request=json!({"grass":s,"lod":lod.to_string()});
+        if let Some(time)=args.get("windTime"){request["windTime"]=time.clone();}
+        return capture_preview(Settings::default(),&request,&out);
+    }
+    if format=="engine"{crate::grass::export_engine(&s,&out)}else{crate::grass::export(&s,&out,format,lod)}
+}
+
+pub(crate) fn capture_preview(s: Settings, args: &Value, path: &Path) -> Result<Value, String> {
     use crate::preview::{self, Request, SceneKey};
     if path.extension().and_then(|ext| ext.to_str()) != Some("png") {
         return Err("Preview output must have the .png extension".into());
@@ -691,10 +728,19 @@ fn capture_preview(s: Settings, args: &Value, path: &Path) -> Result<Value, Stri
     let branch_sway = number("branchSway", 2., 1.)?;
     let branch_springiness = number("branchSpringiness", 1., 0.5)?;
     let leaf_flutter = number("leafFlutter", 2., 1.)?;
+    let grass = args.get("grass").map(|v| serde_json::from_value::<crate::grass::Settings>(v.clone()).map_err(|e|e.to_string())).transpose()?;
+    if let Some(g)=&grass {g.validate()?;}
+    let mut camera=preview::camera_for(&s,forest,count,distance);
+    if let Some(g)=&grass {
+        let d=distance.unwrap_or(g.size.max(g.height_hint())*2.);let pitch=0.42_f32;let yaw=0.65_f32;
+        camera.position=glam::Vec3::new(0.,g.height_hint()*0.35,0.)+glam::Vec3::new(yaw.sin()*pitch.cos(),pitch.sin(),yaw.cos()*pitch.cos())*d;
+        camera.pitch=-pitch;
+    }
     let frame = preview::capture(
         Request {
-            camera: preview::camera_for(&s, forest, count, distance),
+            camera,
             scene: SceneKey {
+                grass: args.get("grass").map(|value| serde_json::from_value::<crate::grass::Settings>(value.clone()).map_err(|e|e.to_string())).transpose()?,
                 settings: s,
                 lod,
                 forest,
@@ -807,6 +853,17 @@ fn mcp(root: PathBuf) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn grass_mcp_validates_and_exports_beneath_root() {
+        let root=std::env::temp_dir().join(format!("grove-grass-mcp-{}",std::process::id()));
+        assert!(call_tool("grass_generate", &json!({"output":"../escape.gltf"}), &root).is_err());
+        assert!(call_tool("grass_inspect", &json!({"settings":{"size":100}}), &root).is_err());
+        let result=call_tool("grass_generate", &json!({"settings":{"size":0.5,"density":0.1,"patchiness":0.0,"weeds":false},"format":"gltf","output":"patch.gltf","lod":2}), &root).unwrap();
+        assert!(result["triangles"].as_u64().unwrap()>0);
+        assert!(root.join("patch.gltf").is_file());
+        assert!(call_tool("grass_generate", &json!({"output":"patch.gltf","lod":9}), &root).is_err());
+    }
+
     #[test]
     fn mcp_budget_report_measures_game_faces() {
         let report = call_tool("tree_budget_report", &json!({"settings":{"species":"solstice-forest-beech"}, "trimCards":true}), Path::new("exports")).unwrap();

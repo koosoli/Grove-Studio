@@ -216,3 +216,18 @@ Grove Studio is licensed under the **GNU General Public License v3.0 or later**.
 - The editor loads Segoe UI from your own Windows installation if present, and falls back to the built-in font otherwise. No font files are redistributed.
 
 Generated leaf textures retain species veins and mottling through seasonal recoloring. The Solstice viewer and game P3D leaf detail bands use procedural vein normals; spray cards retain neutral normals. Imported leaf albedos retain their original export resolution.
+
+## Grass authoring
+
+Open the **Grass** tab and choose **Preview grass**, or launch `grove-studio --grass meadow`. Presets are meadow, lawn, dry, tall and verge. Full tufts use Solstice-style branching blades; six-blade clumps use a compact OpenPoseidon-inspired blade count. Adjust patch size, density, blade height/width/bend, dry fraction, weeds and bare gaps; New seed varies the patch. Grass supports its own undo/redo, JSON projects and glTF/OBJ mesh exports. Use Weather and Light while grass preview is active. The first three mesh LODs reduce plant density and widen retained blades; they are authoring mesh LODs, not the engine's GPU placement rings. Grass preview needs the Solstice renderer. The forest viewer's existing ground/understory is unchanged.
+
+```
+grove-studio --headless --grass meadow --inspect
+grove-studio --headless --grass meadow --style poseidon --seed 42 --out exports/grass.gltf --lod all
+grove-studio --headless --grass meadow --preview --out exports/grass.png --wind-time 3
+grove-studio --headless --grass meadow --format engine --out exports/grass-pack
+```
+
+The **Engine bundle** button writes an optional procedural blade set under `exports/grass-PRESET-SEED/assets/grass`. Its eight 64x256 opaque PNGs use OpenPoseidon's loader filenames, layer order, and tip-at-top orientation. On compatible engine builds, point `WGR_GRASS_BLADE_DIR` to that `assets/grass` directory; the newer look2 loader supports this override. Grove does not install into the game directory. The bundle includes a JSON manifest, editable project and Solstice `.grass` source text. The engine retains its own clump geometry, species selection, terrain placement, density/ring LODs, trampling and rotor wash; these settings are not automatically imported from Grove. This set is procedural, not the engine's photographed look2 assets.
+
+MCP tools: `grass_presets`, `grass_inspect`, `grass_generate` (`gltf`, `obj`, or `engine`) and `grass_preview`. Outputs remain beneath the configured MCP output root. Grass P3D export is not provided; tree P3D and FOREST-PROXY exports remain available.

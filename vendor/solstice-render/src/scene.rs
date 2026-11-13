@@ -50,6 +50,8 @@ pub(crate) const INSTANCE_HIDDEN: u32 = 1 << 29;
 pub(crate) const INSTANCE_STAYS_IN_GI: u32 = 1 << 28;
 const INSTANCE_WIND: u32 = 1 << 27;
 const INSTANCE_WIND_LEAF: u32 = 1 << 26;
+const INSTANCE_GRASS: u32 = 1 << 25;
+pub const MATERIAL_GRASS: u32 = 1 << 25;
 /// This material belongs to a tree using the Grove/Poseidon wind convention.
 pub const MATERIAL_WIND: u32 = 1 << 4;
 /// Alpha-tested card material, sampled during visibility and shadow rasterization.
@@ -256,7 +258,7 @@ fn gpu_instances(scene: &PagedScene) -> (Vec<GpuInstance>, Vec<Option<u32>>) {
         index.push(Some(out.len() as u32));
         // The bits above hold the INSTANCE_ flags.
         debug_assert!(
-            instance.material < INSTANCE_WIND_LEAF,
+            instance.material < INSTANCE_GRASS,
             "too many materials"
         );
         let flags = scene.materials.get(instance.material as usize).map_or(0, |m| m.flags);
@@ -270,6 +272,7 @@ fn gpu_instances(scene: &PagedScene) -> (Vec<GpuInstance>, Vec<Option<u32>>) {
                 material |= INSTANCE_WIND_LEAF;
             }
         }
+        if flags & MATERIAL_GRASS != 0 { material |= INSTANCE_GRASS; }
         let world = instance.transform;
         let linear = Mat3::from_mat4(world);
         let normal = Mat4::from_mat3(linear.inverse().transpose());

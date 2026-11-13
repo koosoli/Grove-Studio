@@ -20,6 +20,7 @@ const TEX_SIZE: u32 = 256;
 #[derive(Clone, Debug, PartialEq)]
 pub struct SceneKey {
     pub settings: Settings,
+    pub grass: Option<crate::grass::Settings>,
     pub lod: Option<u32>,
     pub forest: u128,
     pub count: u32,
@@ -958,6 +959,19 @@ fn build_scene(key: &SceneKey) -> Result<LoadedScene, String> {
         transform: Mat4::IDENTITY,
     });
 
+    if let Some(grass) = &key.grass {
+        if !key.leaves { return Ok(paginate(&scene)); }
+        let mesh = grass.mesh(key.lod.unwrap_or(0).min(2))?;
+        let index = scene.meshes.len() as u32;
+        scene.meshes.push(build_virtual_mesh(&mesh, &opts));
+        let texture_layer = scene.textures.len() as i32;
+        scene.textures.push(grass.atlas()?);
+        scene.materials.push(Material { base_color:[1.;4], texture_layer, roughness:0.7,
+            flags:Material::TWO_SIDED | Material::FOLIAGE | solstice_render::scene::MATERIAL_WIND | solstice_render::scene::MATERIAL_GRASS | 128 | (65 << 16),
+            normal_strength:0.3, ..Default::default() });
+        scene.instances.push(Instance { mesh:index, material:index, transform:Mat4::IDENTITY });
+        return Ok(paginate(&scene));
+    }
     let mut trees = Vec::new();
     let mut understory = Vec::new();
     if key.forest == 0 {
@@ -1168,7 +1182,7 @@ mod tests {
         let mut ratios = [0; SPECIES.len()];
         let index = SPECIES.iter().position(|s| *s == "solstice-bush").unwrap();
         ratios[index] = 1;
-        let key = SceneKey { settings, lod: Some(2), forest: 1u128 << index, count: 40, ratios,
+        let key = SceneKey { settings, grass:None, lod: Some(2), forest: 1u128 << index, count: 40, ratios,
             grid: false, bark: true, leaves: true, game_cards: false, trim_cards: false,
             random_mix: true, forest_floor: false, leaf_specular: true, leaf_roughness: 0.55, leaf_transmission: 0.8 };
         let scene = build_scene(&key).unwrap().scene;

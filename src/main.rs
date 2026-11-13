@@ -2,6 +2,7 @@
 mod agent;
 mod catalog;
 mod gamelod;
+mod grass;
 mod gui;
 mod log;
 mod poseidon;
@@ -26,6 +27,7 @@ fn main() {
             continue;
         }
         if ![
+            "--grass",
             "--screenshot",
             "--self-test",
             "--preset",
@@ -62,7 +64,7 @@ fn main() {
         }
     }
     if args.iter().any(|arg| arg == "--classic")
-        && (agent::option(&args, "--forest").is_some()
+        && (agent::option(&args, "--grass").is_some() || agent::option(&args, "--forest").is_some()
             || agent::option(&args, "--preview-view").is_some())
     {
         eprintln!("Grove Studio: forest and diagnostic views require the Solstice renderer.");
@@ -79,7 +81,7 @@ fn main() {
     }
     let conf = macroquad::conf::Conf {
         miniquad_conf: macroquad::miniquad::conf::Conf {
-            window_title: "Grove Studio | Tree workshop".into(),
+            window_title: "Grove Studio | Vegetation workshop".into(),
             window_width: 1440,
             window_height: 900,
             high_dpi: true,

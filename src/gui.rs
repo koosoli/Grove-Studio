@@ -560,6 +560,11 @@ enum Modal {
     LeafAtlas,
 }
 struct Editor {
+    grass: crate::grass::Settings,
+    grass_mode: bool,
+    grass_saved: crate::grass::Settings,
+    grass_history: Vec<crate::grass::Settings>,
+    grass_redo: Vec<crate::grass::Settings>,
     s: Settings,
     model: Model,
     lod: u32,
@@ -625,6 +630,10 @@ impl Editor {
         let s = Settings::preset("solstice-oak").expect("built-in Solstice oak");
         let distance = s.height * 2.32;
         Self {
+            grass: crate::grass::Settings::default(),
+            grass_mode: false,
+            grass_saved: crate::grass::Settings::default(),
+            grass_history: vec![], grass_redo: vec![],
             model: Model::new(&s, 0),
             saved: s.clone(),
             s,
@@ -694,6 +703,7 @@ impl Editor {
         self.status_until = get_time() + 5.;
     }
     fn apply_preset(&mut self, name: &str) {
+        self.grass_mode=false;
         self.s = Settings::preset(name).unwrap();
         self.lod = 0;
         self.rebuild();
@@ -721,11 +731,12 @@ impl Editor {
         preview::stand(&self.forest_share).1
     }
     fn scene_height(&self) -> f32 {
+        if self.grass_mode { return self.grass.size.max(self.grass.height_hint()).max(0.5); }
         preview::scene_height(&self.s, if self.forest { self.forest_mask() } else { 0 })
     }
     fn frame(&mut self) {
         self.yaw = 0.65;
-        self.pitch = if self.forest { 0.44 } else { 0.15 };
+        self.pitch = if self.grass_mode { 0.4 } else if self.forest { 0.44 } else { 0.15 };
         self.distance = if self.forest {
             preview::frame_distance(&self.s, self.forest_mask(), self.forest_count)
         } else {
@@ -734,6 +745,7 @@ impl Editor {
         self.pan = Vec3::ZERO;
     }
     fn set_lod(&mut self, n: u32) {
+        if self.grass_mode {self.auto_lod=false;self.lod=n.min(2);return;}
         self.auto_lod = false;
         if self.lod != n {
             self.lod = n;
@@ -741,6 +753,7 @@ impl Editor {
         }
     }
     fn undo(&mut self) {
+        if self.grass_mode { if let Some(g)=self.grass_history.pop(){self.grass_redo.push(self.grass.clone());self.grass=g;self.dirty=self.grass!=self.grass_saved;} return; }
         self.record_edit = false;
         self.drag_start = None;
         if let Some(s) = self.history.pop() {
@@ -751,6 +764,7 @@ impl Editor {
         }
     }
     fn redo(&mut self) {
+        if self.grass_mode { if let Some(g)=self.grass_redo.pop(){self.grass_history.push(self.grass.clone());self.grass=g;self.dirty=self.grass!=self.grass_saved;} return; }
         self.record_edit = false;
         self.drag_start = None;
         if let Some(s) = self.redo.pop() {
@@ -771,12 +785,25 @@ impl Editor {
             Modal::LeafAtlas => self.s.leaf_atlas_path.clone().unwrap_or_default(),
             _ => String::new(),
         };
+        if self.grass_mode {
+            if matches!(m, Modal::Save | Modal::Open) { self.path = "exports/grass-project.json".into(); }
+            if matches!(m, Modal::Export) { self.format = "gltf".into(); self.path = "exports/grass.gltf".into(); }
+        }
         self.path_focus = false;
     }
     fn export(&mut self) -> Result<Vec<PathBuf>, String> {
         let base = Path::new(&self.path);
         if base.as_os_str().is_empty() {
             return Err("Enter an output filename.".into());
+        }
+        if self.grass_mode {
+            let lods = if self.all_lods { vec![0,1,2] } else { vec![self.lod.min(2)] };
+            let mut paths = Vec::new();
+            for lod in lods {
+                let path = if self.all_lods { base.with_file_name(format!("{}_lod{}.{}",base.file_stem().unwrap_or_default().to_string_lossy(),lod,self.format)) } else {base.to_path_buf()};
+                crate::grass::export(&self.grass, &path, &self.format, lod)?; paths.push(path);
+            }
+            return Ok(paths);
         }
         if self.format == "p3d" && self.game_lods {
             if base.extension().and_then(|s| s.to_str()) != Some("p3d") {
@@ -804,6 +831,15 @@ impl Editor {
     fn project_action(&mut self, save: bool) -> Result<(), String> {
         if self.path.is_empty() {
             return Err("Enter a project filename.".into());
+        }
+        if self.grass_mode && save { self.grass.save(Path::new(&self.path))?; self.grass_saved=self.grass.clone(); self.dirty=false; return Ok(()); }
+        if !save {
+            let value: serde_json::Value = serde_json::from_slice(&fs::read(&self.path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+            if value.get("preset").is_some() && value.get("species").is_none() {
+                self.grass = crate::grass::Settings::load(Path::new(&self.path))?;
+                self.grass_mode=true; self.grass_saved=self.grass.clone(); self.grass_history.clear();self.grass_redo.clear();self.tab=6; self.frame(); self.dirty=false; return Ok(());
+            }
+            self.grass_mode=false;
         }
         if save {
             tree::save_project(&self.s, Path::new(&self.path))?;
@@ -838,6 +874,9 @@ pub async fn run(args: Vec<String>) {
         .and_then(|b| load_ttf_font_from_bytes(&b).ok());
     let mut ui = Ui::new(font);
     let mut e = Editor::new();
+    if let Some(name)=agent::option(&args,"--grass") {
+        match crate::grass::Settings::preset(&name){Ok(g)=>{e.grass=g;e.grass_mode=true;e.tab=6;e.frame();},Err(err)=>e.notice(err)}
+    }
     if let Some(name) = agent::option(&args, "--preset") {
         match Settings::preset(&name) {
             Ok(s) => {
@@ -1096,7 +1135,7 @@ pub async fn run(args: Vec<String>) {
             e.yaw += get_frame_time() * 0.20;
         }
         wind_playback.step(e.wind, e.wind_speed, e.branch_springiness, get_frame_time());
-        let center = vec3(0., e.scene_height() * 0.49, 0.) + e.pan;
+        let center = vec3(0., if e.grass_mode { 0.35 * e.grass.height_hint() } else { e.scene_height() * 0.49 }, 0.) + e.pan;
         let pos = center
             + vec3(
                 e.yaw.sin() * e.pitch.cos(),
@@ -1104,6 +1143,7 @@ pub async fn run(args: Vec<String>) {
                 e.yaw.cos() * e.pitch.cos(),
             ) * e.distance;
         let scene = preview::SceneKey {
+            grass: e.grass_mode.then(|| e.grass.clone()),
             settings: e.s.clone(),
             lod: if e.auto_lod && e.game_preview {
                 Some(if e.distance > e.scene_height() * 10. { 3 } else if e.distance > e.scene_height() * 5. { 2 } else if e.distance > e.scene_height() * 2.8 { 1 } else { 0 })
@@ -1124,7 +1164,7 @@ pub async fn run(args: Vec<String>) {
         };
         // Structure is the Solstice preview with foliage hidden, so its branches use the
         // same hierarchy-based animation as the shaded tree. Only wireframe uses classic.
-        let use_solstice = solstice_view(e.view);
+        let use_solstice = e.grass_mode || solstice_view(e.view);
         if let Some(renderer) = worker.as_mut() {
             match renderer.poll() {
                 Some(Ok(frame)) => {
@@ -1516,7 +1556,7 @@ fn header(ui: &Ui, e: &mut Editor) {
     ui.text("grove", 59., 40., 28., col(0xf1f7e9));
     ui.text("S T U D I O", 143., 39., 11., col(0xa5b99f));
     draw_line(257., 17., 257., 55., 1., col(0x3e5143));
-    ui.text("Tree workshop", 282., 31., 15., col(0xf0f4e9));
+    ui.text("Vegetation workshop", 282., 31., 15., col(0xf0f4e9));
     ui.text(
         &format!(
             "{}  /  {}",
@@ -1614,7 +1654,7 @@ fn library(ui: &Ui, e: &mut Editor) {
     e.library_page = e.library_page.min(pages - 1);
     for (i, (id, name, desc)) in matches.iter().skip(e.library_page * LIBRARY_PAGE).take(LIBRARY_PAGE).enumerate() {
         let y = 192. + i as f32 * 50.;
-        let active = e.s.species == *id;
+        let active = !e.grass_mode && e.s.species == *id;
         let r = Rect::new(14., y, 229., 46.);
         let over = ui.over(r);
         rounded(
@@ -1672,6 +1712,8 @@ fn library(ui: &Ui, e: &mut Editor) {
     .iter()
     .enumerate()
     {
+        if e.grass_mode && i==0 { continue; }
+        let label = if e.grass_mode && i==1 { "Grass geometry" } else { *label };
         let y = 542. + i as f32 * 37.;
         let r = Rect::new(21., y - 18., 215., 32.);
         ui.text(
@@ -1705,7 +1747,7 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
     let p = x + 28.;
     draw_rectangle(x, 72., 318., 796., col(0xfafbF7));
     draw_line(x, 72., x, 868., 1., line());
-    ui.text("Shape your tree", p, 111., 20., ink());
+    ui.text(if e.grass_mode {"Shape your grass"} else {"Shape your tree"}, p, 111., 20., ink());
     ui.text(
         "Small changes. Natural possibilities.",
         p,
@@ -1713,18 +1755,18 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
         12.,
         muted(),
     );
-    rounded(Rect::new(p, 157., 262., 35.), 6., col(0xeef1e9));
+    rounded(Rect::new(p, 157., 262., if gpu {45.}else{35.}), 6., col(0xeef1e9));
     if !gpu && e.tab >= 2 {
         e.tab = 0;
     }
     let labels: &[_] = if gpu {
-        &["Shape", "Leaf", "Light", "Forest", "Render", "Weather"]
+        &["Shape", "Leaf", "Light", "Forest", "Render", "Weather", "Grass"]
     } else {
         &["Structure", "Foliage"]
     };
-    let tab_width = 260. / labels.len() as f32;
+    let tab_width = 260. / labels.len().min(4) as f32;
     for (i, label) in labels.iter().enumerate() {
-        let r = Rect::new(p + 3. + i as f32 * tab_width, 160., tab_width - 4., 29.);
+        let r = Rect::new(p + 3. + (i%4) as f32 * tab_width, 158. + (i/4) as f32 * 21., tab_width - 4., if gpu {19.}else{29.});
         if e.tab == i as u32 {
             rounded(r, 4., col(0xffffff));
             ui.center(label, r, 11., ink());
@@ -1734,6 +1776,38 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
         if ui.over(r) && is_mouse_button_pressed(MouseButton::Left) {
             e.tab = i as u32
         }
+    }
+    if e.tab == 6 {
+        let before=e.grass.clone();
+        ui.heading("07", "Grass generator", p, 223.);
+        if ui.button(if e.grass_mode { "Preview trees" } else { "Preview grass" }, Rect::new(p,238.,262.,28.),0) {
+            e.grass_mode=!e.grass_mode; e.forest=false; e.view=0; e.leaves=true; e.frame();
+        }
+        for (i,name) in crate::grass::PRESETS.iter().enumerate() {
+            if ui.button(name,Rect::new(p+i as f32*52.,279.,50.,26.),if e.grass.preset==*name {2}else{0}) {
+                e.grass=crate::grass::Settings::preset(name).unwrap(); e.grass_mode=true; e.view=0; e.leaves=true; e.frame();
+            }
+        }
+        for (i,(id,label)) in [("solstice","Full tufts"),("poseidon","Six-blade clumps")].iter().enumerate(){ if ui.button(label,Rect::new(p+i as f32*132.,312.,128.,24.),if e.grass.style==*id{2}else{0}){e.grass.style=(*id).into();} }
+        ui.slider("Patch size",&mut e.grass.size,0.25,4.,p,350.,"m");
+        ui.slider("Density",&mut e.grass.density,0.05,1.5,p,388.,"%");
+        ui.slider("Blade height",&mut e.grass.height,0.25,2.,p,426.,"x");
+        ui.slider("Blade width",&mut e.grass.width,0.5,3.,p,464.,"x");
+        ui.slider("Blade bend",&mut e.grass.lean,0.,1.5,p,502.,"x");
+        ui.slider("Dry blades",&mut e.grass.dry,0.,1.,p,540.,"%");
+        if ui.button(if e.grass.weeds {"[x] Weeds and flowers"}else{"[ ] Weeds and flowers"},Rect::new(p,575.,262.,26.),0) { e.grass.weeds=!e.grass.weeds; }
+        if ui.button("New seed",Rect::new(p,610.,125.,27.),0) { e.grass.seed=e.grass.seed.wrapping_add(1); }
+        if ui.button("Engine bundle",Rect::new(p+132.,610.,130.,27.),0) {
+            let path=PathBuf::from(format!("exports/grass-{}-{}",e.grass.preset,e.grass.seed));
+            match crate::grass::export_engine(&e.grass,&path) {Ok(_)=>e.notice(format!("Exported {}",path.display())),Err(err)=>e.notice(err)}
+        }
+        ui.slider("Bare gaps",&mut e.grass.patchiness,0.,1.,p,655.,"%");
+        ui.text(&format!("Seed {} / 3 mesh LODs",e.grass.seed),p,708.,12.,muted());
+        ui.text("Save/Open project and Export model",p,730.,11.,muted());
+        ui.text("also work for the active grass patch.",p,748.,11.,muted());
+        if let Err(err)=e.grass.validate() {ui.text(&err,p,780.,10.,muted());}
+        if e.grass!=before { e.grass_history.push(before);if e.grass_history.len()>60{e.grass_history.remove(0);}e.grass_redo.clear();e.dirty=e.grass!=e.grass_saved; }
+        return;
     }
     if e.tab == 0 {
         ui.heading("01", "Tree shape", p, 223.);
@@ -2061,7 +2135,7 @@ fn viewport_ui(ui: &Ui, e: &mut Editor, stats: Option<(u32, u32)>, renderer: &st
             "solstice-old_oak" => "Solstice old oak",
             _ => "Solstice oak",
         });    ui.text(
-        if e.forest { "Forest preview" } else { name },
+        if e.grass_mode { "Grass patch" } else if e.forest { "Forest preview" } else { name },
         284.,
         145.,
         29.,
@@ -2070,12 +2144,12 @@ fn viewport_ui(ui: &Ui, e: &mut Editor, stats: Option<(u32, u32)>, renderer: &st
     ui.text(
         &format!(
             "{}  /  SEED {:06}",
-            if crate::reference::evergreen(&e.s) {
+            if e.grass_mode { "GRASS" } else if crate::reference::evergreen(&e.s) {
                 "EVERGREEN"
             } else {
                 "DECIDUOUS"
             },
-            e.s.seed
+            if e.grass_mode { e.grass.seed } else { e.s.seed }
         ),
         285.,
         169.,
@@ -2087,16 +2161,16 @@ fn viewport_ui(ui: &Ui, e: &mut Editor, stats: Option<(u32, u32)>, renderer: &st
         .unwrap_or_else(|| format!("Preview -- FPS  /  UI {} FPS", get_fps()));
     rounded(Rect::new(914., 172., 184., 25.), 5., col(0xf7f9f2));
     ui.center(&fps, Rect::new(914., 172., 184., 25.), 10., ink());
-    if gpu && ui.button(if e.game_preview { "Game cards" } else { "Original leaves" }, Rect::new(783., 136., 145., 29.), if e.game_preview { 2 } else { 0 }) {
+    if gpu && !e.grass_mode && ui.button(if e.game_preview { "Game cards" } else { "Original leaves" }, Rect::new(783., 136., 145., 29.), if e.game_preview { 2 } else { 0 }) {
         e.game_preview = !e.game_preview;
         if !e.game_preview && e.lod > 2 { e.lod = 2; }
         e.view = 0;
     }
-    if gpu && e.game_preview && ui.button(if e.trim_cards { "Trim ON" } else { "Trim OFF" }, Rect::new(936., 136., 162., 29.), if e.trim_cards { 2 } else { 0 }) {
+    if gpu && !e.grass_mode && e.game_preview && ui.button(if e.trim_cards { "Trim ON" } else { "Trim OFF" }, Rect::new(936., 136., 162., 29.), if e.trim_cards { 2 } else { 0 }) {
         e.trim_cards = !e.trim_cards;
         e.view = 0;
     }
-    if gpu && e.game_preview && ((!e.auto_lod && e.lod == 0) || (e.auto_lod && e.distance <= e.scene_height() * 2.8)) {
+    if gpu && !e.grass_mode && e.game_preview && ((!e.auto_lod && e.lod == 0) || (e.auto_lod && e.distance <= e.scene_height() * 2.8)) {
         rounded(Rect::new(914., 201., 184., 24.), 5., col(0xf7f9f2));
         ui.center("Trim applies from Mid onward", Rect::new(914., 201., 184., 24.), 10., ink());
     }
@@ -2108,10 +2182,11 @@ fn viewport_ui(ui: &Ui, e: &mut Editor, stats: Option<(u32, u32)>, renderer: &st
         )
     {
         e.forest = !e.forest;
+        if e.forest { e.grass_mode=false; }
         e.view = 0;
         e.frame();
     }
-    if !e.forest {
+    if !e.forest && !e.grass_mode {
         let labels = ["Shaded", "Wireframe", "Structure"];
         rounded(Rect::new(783., 93., 315., 34.), 7., col(0xf7f9f2));
         for (i, s) in labels.iter().enumerate() {
@@ -2224,14 +2299,16 @@ fn lod_strip(ui: &Ui, e: &mut Editor) {
     ) {
         e.auto_lod = true;
     }
-    let labels: &[(&str, &str)] = if e.game_preview {
-        &[("Near", "Folded leaves"), ("Mid", "Flat leaves"), ("Far", "Spray cards"), ("Distant", "Spray cards")]
+    let labels: &[(&str, &str)] = if e.grass_mode {
+        &[("Near", "Full grass patch"),("Mid", "Reduced clumps"),("Far", "Sparse opaque blades")]
+    } else if e.game_preview {
+        &[("Near", "Opaque leaves"), ("Mid", "Flat leaves"), ("Far", "Spray cards"), ("Distant", "Spray cards")]
     } else { &[("LOD 0", "Close up"), ("LOD 1", "Mid distance"), ("LOD 2", "Far distance")] };
     for (i, (name, desc)) in labels
     .iter()
     .enumerate()
     {
-        let r = if e.game_preview { Rect::new(450. + i as f32 * 165., 813., 157., 44.) } else { Rect::new(467. + i as f32 * 209., 813., 199., 44.) };
+        let r = if e.game_preview && !e.grass_mode { Rect::new(450. + i as f32 * 165., 813., 157., 44.) } else { Rect::new(467. + i as f32 * 209., 813., 199., 44.) };
         let active = !e.auto_lod && e.lod == i as u32;
         rounded(r, 6., if active { col(0xe0ead6) } else { col(0xebeee5) });
         ui.text(
@@ -2242,7 +2319,7 @@ fn lod_strip(ui: &Ui, e: &mut Editor) {
             if active { green() } else { ink() },
         );
         ui.text(desc, r.x + 12., r.y + 33., 10., muted());
-        let count = if e.game_preview { String::new() } else { commas(e.model.lod_counts[i]) };
+        let count = if e.game_preview || e.grass_mode { String::new() } else { commas(e.model.lod_counts[i]) };
         ui.text(
             &count,
             r.x + r.w - 12. - ui.width(&count, 15.),
@@ -2385,7 +2462,7 @@ fn modal(ui: &Ui, e: &mut Editor, m: Modal) {
     let export = m == Modal::Export;
     ui.text(
         if material { "Paste a PNG path, or leave empty to use the generated texture." } else if export {
-            "Two materials, vertex colors, and detail levels ready to import."
+            if e.grass_mode {"Opaque grass geometry with a generated blade atlas."}else{"Two materials, vertex colors, and detail levels ready to import."}
         } else {
             "Settings are stored as a portable, editable JSON project."
         },
