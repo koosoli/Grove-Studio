@@ -148,9 +148,22 @@ fn vegetation_angle(i: Instance, p: vec3f, clock: f32, origin_xz: vec2f, params:
     // spatial phase variation. Growing the angle with height keeps the foot planted.
     let spatial = dot(p.xz, vec2f(0.025, 0.02));
     let sway = sin(t * 0.55 + phase + spatial) * 0.7 + sin(t * 0.93 + phase * 1.7 + spatial) * 0.3;
-    let gust = 1.0 + params.y * (0.5 + 0.5 * sin(t * 0.19 + phase));
+    let direction = floor(encoded / 10000.0) * 0.3926990817;
+    let gust = vegetation_gust(origin_xz, t, direction, params.y);
     let height = pow(clamp(max(p.y, 0.0) / 12.0, 0.0, 3.0), 0.6);
     return clamp(0.025 * params.x * gust * height * sway, -0.3, 0.3);
+}
+
+// Coherent gusts travel downwind across the stand. Sampling at the instance origin keeps
+// the trunk and every attached branch in the same local weather, including previous frames.
+fn vegetation_gust(origin: vec2f, time: f32, direction: f32, strength: f32) -> f32 {
+    let dir = vec2f(sin(direction), cos(direction));
+    let side = vec2f(-dir.y, dir.x);
+    let downwind = dot(origin, dir) - time * 8.0;
+    let across = dot(origin, side);
+    let broad = sin(downwind * 0.15 + across * 0.025);
+    let roll = sin(downwind * 0.57 - across * 0.09 + time * 0.13);
+    return 1.0 + strength * clamp(0.5 + 0.32 * broad + 0.18 * roll, 0.0, 1.0);
 }
 
 // Steady-state response of a damped oscillator to a sinusoidal wind component. This
@@ -185,7 +198,7 @@ fn vegetation_wind(i: Instance, p: vec3f, uv: vec2f, clock: f32, origin_xz: vec2
     let reach = smoothstep(0.25, 2.5, length(p.xz));
     let exposure = clamp(max(p.y, 0.0) / 8.0, 0.0, 1.0);
     let branch_phase = dot(p.xz, vec2f(0.72, 0.53)) + p.y * 0.21 + phase;
-    let branch_gust = 1.0 + params.y * (0.5 + 0.5 * sin(t * 0.19 + phase));
+    let branch_gust = vegetation_gust(origin_xz, t, direction, params.y);
     let spring = clamp(dynamics.x, 0.0, 1.0);
     let natural = mix(3.5, 1.7, spring) * mix(1.0, 1.2, reach);
     let damping = mix(0.8, 0.42, spring);

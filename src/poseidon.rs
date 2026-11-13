@@ -28,7 +28,7 @@ pub fn game_sidecars(path: &Path) -> Vec<PathBuf> {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
     let dir = path.parent().unwrap_or(Path::new("."));
     ["bark_co.paa", "bark_co_nohq.paa", "leaves_ca.paa", "leaves_ca_nohq.paa",
-     "leaves_co.paa", "leaves_co_nohq.paa", "bark.rvmat", "leaves.rvmat", "poseidon.json"]
+     "leaves_co.paa", "leaves_co_nohq.paa", "bark.rvmat", "leaves.rvmat", "wind.json", "occlusion.p3d", "poseidon.json"]
         .iter().map(|suffix| dir.join(format!("{stem}_{suffix}"))).collect()
 }
 
@@ -211,7 +211,9 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
         material: String::new(),
     };
     let mut model = b"MLOD\x01\x01\x00\x00".to_vec();
-    integer(&mut model, ladder.levels.len() as u32 + 1);
+    let proxy = crate::gamelod::proxy_ladder(s);
+    let shadow = &proxy.levels[0];
+    integer(&mut model, ladder.levels.len() as u32 + 2);
     let height = ladder
         .levels
         .first()
@@ -243,7 +245,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
                 }
             }
         }
-        if options.opaque_leaves && k == 0 {
+        if k == 0 {
             props.push(("clusterfoliage", "1".into()));
         }
         write_lod_with(
@@ -251,7 +253,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
             &level.bark,
             &level.leaves,
             &bark_surface,
-            if options.opaque_leaves && k == 0 { &opaque_surface } else { &leaf_surface },
+            if k == 0 { &opaque_surface } else { &leaf_surface },
             level.rung.resolution,
             true,
             &props,
@@ -263,6 +265,16 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
             "vertices": level.vertices(),
         }));
     }
+    // Resolution 11000 is the ShadowBuffer sentinel recognized by the model loader.
+    // Some engine builds still cast visible objects from visual LODs rather than this level.
+    write_lod_with(&mut model, &shadow.bark, &shadow.leaves, &bark_surface, &leaf_surface,
+        11000.0, true, &[]);
+    let occlusion_path = file("occlusion.p3d");
+    let mut occlusion = b"MLOD\x01\x01\x00\x00".to_vec();
+    integer(&mut occlusion, 1);
+    write_lod_with(&mut occlusion, &shadow.bark, &shadow.leaves, &bark_surface, &leaf_surface,
+        8.0, true, &[]);
+    tree::write(&occlusion_path, occlusion)?;
     let empty = Surface {
         texture: String::new(),
         material: String::new(),
@@ -294,7 +306,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
     let leaf_normal = leaf_normal_map(&atlas);
     tree::write(&bark, paa(bark_pixels, CompressionVariant::BC1, false))?;
     tree::write(&bark_n, paa(bark_normal, CompressionVariant::BC3, false))?;
-    if options.opaque_leaves {
+    {
         let mut opaque = atlas.clone();
         for p in opaque.pixels_mut() {
             p.0[3] = 255;
@@ -323,10 +335,12 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
     let asset = json!({
         "path": path, "format": "MLOD 1.1 / P3DM", "settings": s,
         "pboPrefix": prefix, "model": reference(path), "levels": counts,
-        "forestProxy": options.forest_proxy, "opaqueLeaves": options.opaque_leaves, "trimCards": options.trim_cards,
+        "forestProxy": options.forest_proxy, "opaqueLeaves": true, "trimCards": options.trim_cards,
         "geometryLod": "Convex trunk collision",
+        "shadowProxy": {"resolution":11000.0,"triangles":shadow.triangles(),"p3dFaces":shadow.bark.i.len()/3 + shadow.leaves.i.len()*2/3,"runtimeSelection":"requires engine support"},
+        "occlusionProxy": occlusion_path.file_name().unwrap().to_string_lossy(),
         "wind": {"map":"tree","height":"model-space Y, meters","hierarchy":wind_sidecar.file_name().unwrap().to_string_lossy(),"hierarchyRequiresEngineSupport":true},
-        "sidecars": [&bark, &bark_n, &leaves, &leaves_n, &bark_mat, &leaf_mat, &wind_sidecar],
+        "sidecars": [&bark, &bark_n, &leaves, &leaves_n, &opaque_leaves, &opaque_leaves_n, &bark_mat, &leaf_mat, &wind_sidecar, &occlusion_path],
     });
     tree::write(path, model)?;
     tree::write(&manifest, serde_json::to_vec_pretty(&asset).unwrap())?;
@@ -485,7 +499,7 @@ fn trunk_collision(s: &Settings) -> Part {
     for ring in 0..2 {
         for j in 0..8 {
             let (sin, cos) = (j as f32 * std::f32::consts::TAU / 8.).sin_cos();
-            let radius = s.trunk_radius * (0.55 + 0.45 * s.maturity) * if ring == 0 { 1.3 } else { 0.42 };
+            let radius = s.trunk_radius * tree::age_radius_scale(s.maturity) * if ring == 0 { 1.3 } else { 0.42 };
             part.v.push(V {
                 p: vec3(cos * radius, ring as f32 * s.height * s.maturity * 0.62, sin * radius),
                 n: Vec3::Y,
@@ -578,6 +592,12 @@ mod tests {
             assert!(has(key.as_bytes()), "{key}");
         }
         assert!(has(b"op_grove_trees\\beech_a_leaves_ca.paa"));
+        assert!(has(b"op_grove_trees\\beech_a_leaves_co.paa"));
+        assert!(has(b"clusterfoliage"));
+        assert_eq!(u32::from_le_bytes(model[8..12].try_into().unwrap()), 6);
+        assert!(model.windows(4).any(|bytes| bytes == 11000_f32.to_le_bytes()));
+        assert!(asset["shadowProxy"]["p3dFaces"].as_u64().unwrap() <= 2000);
+        assert!(dir.join("beech_a_occlusion.p3d").is_file());
         assert!(!has(b".rvmat"), "faces name no RVMAT");
         for tex in ["bark_co", "leaves_ca"] {
             assert!(dir.join(format!("beech_a_{tex}_nohq.paa")).is_file());

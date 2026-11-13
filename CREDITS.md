@@ -15,3 +15,5 @@ Grove Studio uses SamG-Coder’s MIT-licensed Solstice asset, cluster builder, p
 Rust dependencies are managed by Cargo.lock. macroquad is licensed under MIT OR Apache-2.0; miniquad under MIT OR Apache-2.0; glam under MIT OR Apache-2.0; serde and serde_json under MIT OR Apache-2.0. See each dependency’s distributed license for its full terms. Macroquad’s included ProggyClean font is its fallback font. Segoe UI is loaded from the user’s own Windows installation, and is not redistributed with this project.
 
 Full dependency license and copyright notices are included in THIRD-PARTY-NOTICES.txt.
+
+The old oak and weeping willow presets and related growth ideas also draw on [Solstice Garden](https://github.com/SamG-Coder/solstice-garden) by SamG-Coder (MIT).

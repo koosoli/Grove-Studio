@@ -71,6 +71,10 @@ pub fn forest_mask(names: &str) -> Result<u128, String> {
 pub fn height_hint(settings: &Settings) -> f32 {
     if settings.species == "solstice-bush" {
         settings.height * settings.maturity * 6.
+    } else if settings.species == "solstice-willow" || settings.species == "solstice-old_oak" {
+        // These specimen presets describe the trunk height; their rising limbs and wide
+        // crowns extend well beyond it, so frame and space them as larger trees.
+        settings.height * settings.maturity * 1.9
     } else {
         settings.height * settings.maturity
     }
@@ -207,6 +211,8 @@ pub struct Frame {
     pub pixels: Vec<u8>,
     pub clusters: u32,
     pub triangles: u32,
+    /// Most recently resolved GPU timings, when timestamp queries are available.
+    pub gpu_ms: Option<[f32; solstice_render::profiler::SECTIONS.len()]>,
 }
 
 pub struct Worker {
@@ -433,6 +439,7 @@ fn run_worker(
                 pixels,
                 clusters: stats.clusters,
                 triangles: stats.triangles,
+                gpu_ms: renderer.section_times(),
             }))
             .is_err()
         {
@@ -860,7 +867,7 @@ fn species_asset(settings: &Settings, lod: u32, game_cards: bool, trim_cards: bo
             roughness: if foliage { leaf_roughness } else { 0.92 },
             flags: solstice_render::scene::MATERIAL_WIND
                 | if foliage {
-                    Material::TWO_SIDED | Material::FOLIAGE | 128 | ((leaf_transmission * 100.).round() as u32) << 16 | if game_cards || settings.leaf_atlas_path.is_some() { solstice_render::scene::MATERIAL_ALPHA_TEST } else { 0 } | if !leaf_specular { solstice_render::scene::MATERIAL_NO_SPECULAR } else { 0 }
+                    Material::TWO_SIDED | Material::FOLIAGE | 128 | ((leaf_transmission * 100.).round() as u32) << 16 | if (game_cards && lod != 0) || (!game_cards && settings.leaf_atlas_path.is_some()) { solstice_render::scene::MATERIAL_ALPHA_TEST } else { 0 } | if !leaf_specular { solstice_render::scene::MATERIAL_NO_SPECULAR } else { 0 }
                 } else {
                     ((settings.parallax_depth * 1000.).round() as u32) << 8
                 },
@@ -948,25 +955,39 @@ fn build_scene(key: &SceneKey) -> Result<LoadedScene, String> {
             }
         }
     }
+    let placed = if key.forest == 0 { Vec::new() } else {
+        let weights: Vec<u32> = SPECIES.iter().enumerate()
+            .filter(|(index, _)| key.forest & (1 << index) != 0)
+            .map(|(index, _)| key.ratios[index]).collect();
+        let spacing = forest_spacing(&key.settings, key.forest);
+        if key.random_mix { natural_forest(key.count, &weights, spacing, key.settings.seed) }
+        else { place_forest(key.count, &weights, spacing) }
+    };
+    let young_kinds: std::collections::HashSet<usize> = placed.iter()
+        .filter(|(_, transform)| transform.x_axis.truncate().length() < 0.7)
+        .map(|(kind, _)| *kind).collect();
     let mut assets = Vec::new();
+    let mut young_assets = vec![None; trees.len()];
     let mut hierarchies = Vec::new();
-    BUILD_TOTAL.store(trees.len() as u32, Ordering::Relaxed);
+    BUILD_TOTAL.store((trees.len() + young_kinds.len()) as u32, Ordering::Relaxed);
     BUILD_DONE.store(0, Ordering::Relaxed);
-    for settings in &trees {
-        let asset = species_asset(settings, key.lod.unwrap_or(0), key.game_cards, key.trim_cards, key.leaf_specular, key.leaf_roughness, key.leaf_transmission)?;
-        let first = scene.meshes.len() as u32;
-        for (mesh, layer, material) in [&asset.bark, &asset.leaves] {
-            scene.meshes.push(mesh.clone());
-            let texture_layer = scene.textures.len() as i32;
-            scene.textures.push(layer.clone());
-            scene.materials.push(Material {
-                texture_layer,
-                ..*material
-            });
+    for (kind, settings) in trees.iter().enumerate() {
+        for is_young in [false, true] {
+            if is_young && !young_kinds.contains(&kind) { continue; }
+            let mut stage = settings.clone();
+            if is_young { stage.maturity = (settings.maturity * 0.55).clamp(if settings.species == "solstice-bush" { 0.4 } else { 0.15 }, 1.2); }
+            let asset = species_asset(&stage, key.lod.unwrap_or(0), key.game_cards, key.trim_cards, key.leaf_specular, key.leaf_roughness, key.leaf_transmission)?;
+            let first = scene.meshes.len() as u32;
+            for (mesh, layer, material) in [&asset.bark, &asset.leaves] {
+                scene.meshes.push(mesh.clone());
+                let texture_layer = scene.textures.len() as i32;
+                scene.textures.push(layer.clone());
+                scene.materials.push(Material { texture_layer, ..*material });
+            }
+            if is_young { young_assets[kind] = Some(first); } else { assets.push(first); }
+            hierarchies.push((first, asset.branches));
+            BUILD_DONE.fetch_add(1, Ordering::Relaxed);
         }
-        assets.push(first);
-        hierarchies.push((first, asset.branches));
-        BUILD_DONE.fetch_add(1, Ordering::Relaxed);
     }
     // Hierarchy records share the already-bound material buffer; only actual draw materials
     // point at these records, so no extra per-stage storage binding is required.
@@ -1000,15 +1021,15 @@ fn build_scene(key: &SceneKey) -> Result<LoadedScene, String> {
         place(assets[0], Mat4::IDENTITY);
     } else {
         let spacing = forest_spacing(&key.settings, key.forest);
-        let weights: Vec<u32> = SPECIES
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| key.forest & (1 << index) != 0)
-            .map(|(index, _)| key.ratios[index])
-            .collect();
-        let placed = if key.random_mix { natural_forest(key.count, &weights, spacing, key.settings.seed) } else { place_forest(key.count, &weights, spacing) };
-        for (kind, transform) in placed {
-            place(assets[kind], transform);
+        for (kind, mut transform) in placed {
+            let scale = transform.x_axis.truncate().length();
+            let first = if scale < 0.7 {
+                // The prototype is genuinely grown young; retain only mild instance variation.
+                let (_, rotation, translation) = transform.to_scale_rotation_translation();
+                transform = Mat4::from_scale_rotation_translation(Vec3::splat((scale / 0.55).clamp(0.9, 1.1)), rotation, translation);
+                young_assets[kind].unwrap_or(assets[kind])
+            } else { assets[kind] };
+            place(first, transform);
             if key.forest_floor {
                 let position = transform.w_axis.truncate();
                 for k in 0..2 {
@@ -1105,6 +1126,23 @@ mod tests {
             }
         }
         assert!(a.iter().any(|(_, transform)| transform.x_axis.truncate().length() < 0.7));
+    }
+
+    #[test]
+    fn forest_uses_grown_saplings_instead_of_shrunk_adult_meshes() {
+        let mut settings = Settings::preset("solstice-bush").unwrap();
+        settings.seed = 123;
+        let mut ratios = [0; SPECIES.len()];
+        let index = SPECIES.iter().position(|s| *s == "solstice-bush").unwrap();
+        ratios[index] = 1;
+        let key = SceneKey { settings, lod: Some(2), forest: 1u128 << index, count: 40, ratios,
+            grid: false, bark: true, leaves: true, game_cards: false, trim_cards: false,
+            random_mix: true, forest_floor: false, leaf_specular: true, leaf_roughness: 0.55, leaf_transmission: 0.8 };
+        let scene = build_scene(&key).unwrap().scene;
+        assert_eq!(scene.meshes.len(), 5, "ground plus adult and young bark/foliage");
+        let young: Vec<_> = scene.instances.iter().filter(|i| i.mesh == 3).collect();
+        assert!(!young.is_empty(), "the young prototype is instantiated");
+        assert!(young.iter().all(|i| (0.89..=1.11).contains(&i.transform.x_axis.truncate().length())), "young leaves must not be scaled down with an adult mesh");
     }
 
     #[test]

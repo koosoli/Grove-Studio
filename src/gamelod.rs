@@ -12,8 +12,7 @@
 //! | very far | 1 000 - 2 000      | trunk and main limbs         | a few large spray cards         |
 //!
 //! Conifers keep their needle fans at near and use spray cards from mid on, since a fan is a
-//! single triangle already. Budgets count single-sided triangles (as `--inspect` does); an
-//! exporter that writes two-sided foliage writes the foliage twice.
+//! single triangle already. Budgets count exported P3D faces, including the reversed foliage faces.
 //!
 //! Every level shares the ground origin, the vertex normals of the source geometry and the
 //! bark UVs, so wind (by model height), lighting and bark relief behave as on the full tree.
@@ -33,6 +32,7 @@ pub const CUTOUT: (f32, f32) = (0.27, 0.48);
 pub const SPRAY: (f32, f32) = (0.52, 0.98);
 pub const SPRAY_U: [(f32, f32); 2] = [(0.01, 0.49), (0.51, 0.99)];
 
+#[allow(dead_code)] // Retained for custom ladders and comparisons.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LeafStyle {
     /// A folded alpha card: four triangles.
@@ -52,7 +52,7 @@ pub enum LeafStyle {
 #[derive(Clone, Copy, Debug)]
 pub struct Rung {
     pub name: &'static str,
-    /// Single-sided triangle budget of the whole level.
+    /// Maximum P3D faces, including reversed foliage faces.
     pub budget: usize,
     /// Most of the budget the wood may take.
     pub wood: usize,
@@ -73,8 +73,8 @@ pub const LADDER: [Rung; 4] = [
         wood: 40_000,
         wood_error: 0.002,
         min_branch: 0.0,
-        broadleaf: LeafStyle::Folded,
-        needles: LeafStyle::PiecesOverSprays,
+        broadleaf: LeafStyle::Opaque,
+        needles: LeafStyle::Opaque,
         resolution: 0.5,
     },
     Rung {
@@ -120,6 +120,8 @@ impl Level {
     pub fn triangles(&self) -> usize {
         (self.bark.i.len() + self.leaves.i.len()) / 3
     }
+    /// P3D writes a reversed face for each foliage triangle.
+    pub fn p3d_faces(&self) -> usize { self.bark.i.len() / 3 + self.leaves.i.len() * 2 / 3 }
     pub fn vertices(&self) -> usize {
         self.bark.v.len() + self.leaves.v.len()
     }
@@ -210,11 +212,21 @@ pub fn trim_cards(ladder: &mut Ladder) {
         }
         outline
     }).collect();
-    for level in ladder.levels.iter_mut().skip(1) {
+    for index in 1..ladder.levels.len() {
+        let (earlier, later) = ladder.levels.split_at_mut(index);
+        let previous = &earlier[index - 1];
+        let previous_total = previous.p3d_faces();
+        let level = &mut later[0];
         let old = std::mem::take(&mut level.leaves);
         let mut result = Part::default();
+        let mut groups: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let mut last_source_end = None;
         let mut offset = 0;
         while offset + 2 < old.i.len() {
+            let source = offset;
+            let continuation = source >= 3 && old.i[source] == old.i[source - 3] && old.i[source + 1] == old.i[source - 1];
+            let vertex_start = result.v.len();
+            let index_start = result.i.len();
             let tri = &old.i[offset..offset + 3];
             let vertices = [old.v[tri[0] as usize], old.v[tri[1] as usize], old.v[tri[2] as usize]];
             let uv = (vertices[0].uv + vertices[1].uv + vertices[2].uv) / 3.;
@@ -269,6 +281,56 @@ pub fn trim_cards(ladder: &mut Ladder) {
                     }
                 }
                 result.v.extend(polygon);
+                let group = (vertex_start, result.v.len(), index_start, result.i.len());
+                if continuation && last_source_end == Some(source) && !groups.is_empty() {
+                    let previous = groups.last_mut().unwrap();
+                    previous.1 = group.1;
+                    previous.3 = group.3;
+                } else { groups.push(group); }
+                last_source_end = Some(offset);
+            }
+        }
+        // Clip first, then choose whole cards to meet the actual output budget. Grow the
+        // surviving cards uniformly so their summed geometric area equals the unthinned
+        // clipped cards; use one transform for both triangles of a non-planar card.
+        let available = previous_total.min(level.rung.budget).saturating_sub(level.bark.i.len() / 3) / 2;
+        if result.i.len() / 3 > available && available > 0 && !groups.is_empty() {
+            let area = |part: &Part, start: usize, end: usize| -> f64 {
+                part.i[start..end].chunks_exact(3).map(|t| {
+                    let a = part.v[t[0] as usize].p;
+                    let b = part.v[t[1] as usize].p;
+                    let c = part.v[t[2] as usize].p;
+                    (b - a).cross(c - a).length() as f64 * 0.5
+                }).sum()
+            };
+            let total_area = area(&result, 0, result.i.len());
+            let mut step = 2usize;
+            while groups.iter().step_by(step).map(|g| (g.3-g.2)/3).sum::<usize>() > available && step < groups.len() { step += 1; }
+            let selected_area: f64 = groups.iter().step_by(step).map(|g| area(&result, g.2, g.3)).sum();
+            let scale = if selected_area > 1e-12 { (total_area / selected_area).sqrt() as f32 } else { 1.0 };
+            let mut thinned = Part::default();
+            let mut retained = Vec::new();
+            for &(vs, ve, is, ie) in groups.iter().step_by(step) {
+                if (ie - is) / 3 > available.saturating_sub(thinned.i.len()/3) { continue; }
+                let anchor = result.v[vs..ve].iter().map(|v| v.p).sum::<Vec3>() / (ve-vs) as f32;
+                let first = thinned.v.len() as u32;
+                let index_start = thinned.i.len();
+                thinned.v.extend(result.v[vs..ve].iter().map(|v| { let mut v = *v; v.p = anchor + (v.p-anchor) * scale; v }));
+                thinned.i.extend(result.i[is..ie].iter().map(|&i| first + i - vs as u32));
+                retained.push((first as usize, thinned.v.len(), index_start, thinned.i.len()));
+            }
+            result = thinned;
+            groups = retained;
+        }
+        // Match the near-level single-sided geometric leaf area after switching to cards.
+        // This is not alpha-weighted apparent area: overlap and mip filtering still matter.
+        let target_area = surface_area(&earlier[0].leaves);
+        let actual_area = surface_area(&result);
+        if actual_area > 1e-12 && target_area > 0.0 {
+            let scale = (target_area / actual_area).sqrt() as f32;
+            for &(vs, ve, _, _) in &groups {
+                let center = result.v[vs..ve].iter().map(|v| v.p).sum::<Vec3>() / (ve-vs) as f32;
+                for v in &mut result.v[vs..ve] { v.p = center + (v.p-center) * scale; }
             }
         }
         level.leaves = result;
@@ -277,6 +339,15 @@ pub fn trim_cards(ladder: &mut Ladder) {
 
 pub fn ladder(s: &Settings) -> Ladder {
     ladder_with(s, &LADDER)
+}
+
+/// Compact geometry for shadow or sky-occlusion baking. The writer supplies its use-specific
+/// resolution; foliage is kept to leave a recognizable canopy silhouette.
+pub fn proxy_ladder(s: &Settings) -> Ladder {
+    let rung = Rung { name: "shadow proxy", budget: 900, wood: 200, wood_error: 0.05,
+        min_branch: 0.1, broadleaf: LeafStyle::Clusters, needles: LeafStyle::Clusters,
+        resolution: 11000.0 };
+    ladder_with(s, &[rung])
 }
 
 /// The rungs with other triangle budgets (`--budgets near,mid,far,veryfar`): each rung's wood
@@ -329,7 +400,7 @@ pub fn ladder_with(s: &Settings, rungs: &[Rung]) -> Ladder {
     let needles = kind == LeafKind::Needles;
     let colors = crate::preview::leaf_rgba(s);
     let height = full.bounds().1.y.max(1.0);
-    let pieces = if needles { 3 } else { 8 };
+    let pieces = if needles { 3 } else { 2 + kind.rows().len() * 3 };
     let leaves = read_leaves(&full.leaves, kind);
     let crown = if full.leaves.v.is_empty() {
         Vec3::Y * height * 0.7
@@ -347,12 +418,16 @@ pub fn ladder_with(s: &Settings, rungs: &[Rung]) -> Ladder {
     if !bake.is_empty() {
         bake_sprays(&mut atlas, &colors, &full.leaves, pieces, &leaves, &bake);
     }
-    let mut levels = Vec::new();
+    let mut levels: Vec<Level> = Vec::new();
     for &rung in rungs {
-        let bark = simplify_wood(&full.bark, &rung, height);
-        let left = rung.budget.saturating_sub(bark.i.len() / 3);
+        let mut bark = simplify_wood(&full.bark, &rung, height);
+        // A small sapling may be far below the fixed rung budgets. Limit later levels using
+        // the actual preceding level, otherwise one spray cluster per leaf can cost more
+        // triangles than the individual leaves it replaces.
+        let target = levels.last().map_or(rung.budget, |previous| rung.budget.min(previous.p3d_faces()));
+        let left = target.saturating_sub(bark.i.len() / 3) / 2;
         let style = if needles { rung.needles } else { rung.broadleaf };
-        let foliage = match style {
+        let mut foliage = match style {
             LeafStyle::Folded => cards(&leaves, left, true),
             LeafStyle::Flat => cards(&leaves, left, false),
             LeafStyle::Clusters => spray_cards(&leaves, &cluster(&leaves, left / 6, card_scale), crown, &full.branches),
@@ -370,9 +445,40 @@ pub fn ladder_with(s: &Settings, rungs: &[Rung]) -> Ladder {
                 part
             }
         };
+        if matches!(style, LeafStyle::Flat | LeafStyle::Clusters) {
+            let target_area = surface_area(&full.leaves);
+            let area = surface_area(&foliage);
+            if target_area > 0.0 && area > 1e-12 {
+                let scale = (target_area / area).sqrt() as f32;
+                for card in foliage.v.chunks_exact_mut(4) {
+                    let center = if style == LeafStyle::Flat { (card[0].p + card[1].p) * 0.5 }
+                        else { card.iter().map(|v| v.p).sum::<Vec3>() * 0.25 };
+                    for v in card { v.p = center + (v.p-center) * scale; }
+                }
+            }
+        }
+        if let Some(previous) = levels.last() {
+            if foliage.i.is_empty() || bark.i.len() / 3 + foliage.i.len() * 2 / 3 > previous.p3d_faces() {
+                // Retaining a previous representation is preferable to deleting foliage or
+                // making a distant level more expensive on an unusually sparse plant.
+                bark = previous.bark.clone();
+                foliage = previous.leaves.clone();
+            }
+        }
         levels.push(Level { rung, bark, leaves: foliage });
     }
     Ladder { levels, atlas, branches: full.branches }
+}
+
+/// Sum of single-sided triangle areas in square metres; alpha masks and overlap are not
+/// included, so this is geometry area rather than apparent canopy coverage.
+fn surface_area(part: &Part) -> f64 {
+    part.i.chunks_exact(3).map(|t| {
+        let a = part.v[t[0] as usize].p;
+        let b = part.v[t[1] as usize].p;
+        let c = part.v[t[2] as usize].p;
+        (b-a).cross(c-a).length() as f64 * 0.5
+    }).sum()
 }
 
 /// Inspection statistics for a ladder.
@@ -386,9 +492,15 @@ pub fn stats(l: &Ladder) -> serde_json::Value {
             "triangles": level.triangles(),
             "wood_triangles": level.bark.i.len() / 3,
             "leaf_triangles": level.leaves.i.len() / 3,
+            "foliage_geometry_area_m2": surface_area(&level.leaves),
             "two_sided_faces": level.bark.i.len() / 3 + level.leaves.i.len() * 2 / 3,
             "vertices": level.vertices(),
             "estimated_vertex_bytes": level.vertices() * 72,
+            "vertex_bytes": level.vertices() * std::mem::size_of::<V>(),
+            "index_bytes": (level.bark.i.len() + level.leaves.i.len()) * std::mem::size_of::<u32>(),
+            "geometry_bytes": level.vertices() * std::mem::size_of::<V>() + (level.bark.i.len() + level.leaves.i.len()) * std::mem::size_of::<u32>(),
+            "budget": level.rung.budget,
+            "within_budget": level.p3d_faces() <= level.rung.budget,
         }))
         .collect::<Vec<_>>())
 }
@@ -418,25 +530,25 @@ fn read_leaves(part: &Part, kind: LeafKind) -> Vec<Leaf> {
         }
         return out;
     }
-    let (h0, h1) = (kind.half_width(0.32), kind.half_width(0.68));
-    for piece in part.v.chunks_exact(8) {
-        let (base, tip) = (piece[0].p, piece[7].p);
-        let (row0, row1) = (piece[3].p - piece[1].p, piece[6].p - piece[4].p);
-        let side = (row0 + row1).normalize_or_zero();
+    let rows = kind.rows();
+    let vertices = 2 + rows.len() * 3;
+    for piece in part.v.chunks_exact(vertices) {
+        let (base, tip) = (piece[0].p, piece[vertices - 1].p);
+        let mut side_sum = Vec3::ZERO;
+        let mut width_sum = 0.;
+        for (i, &at) in rows.iter().enumerate() {
+            let across = piece[3 + i * 3].p - piece[1 + i * 3].p;
+            side_sum += across;
+            width_sum += across.length() / (2. * kind.half_width(at)).max(1e-6);
+        }
+        let side = side_sum.normalize_or_zero();
         let axis = (tip - base).normalize_or_zero();
-        let width = (row0.length() + row1.length()) / (2. * (h0 + h1)).max(1e-6);
         out.push(Leaf {
-            base,
-            tip,
-            side,
-            face: side.cross(axis).normalize_or_zero(),
-            width,
+            base, tip, side, face: side.cross(axis).normalize_or_zero(),
+            width: width_sum / rows.len() as f32,
             variant: ((piece[0].uv.x * 4.) as usize).min(3) as f32,
-            n_base: piece[0].n,
-            n_mid: piece[2].n,
-            n_tip: piece[7].n,
-            color: piece[0].c,
-            branch: piece[0].branch,
+            n_base: piece[0].n, n_mid: piece[2].n, n_tip: piece[vertices - 1].n,
+            color: piece[0].c, branch: piece[0].branch,
         });
     }
     out
@@ -445,7 +557,8 @@ fn read_leaves(part: &Part, kind: LeafKind) -> Vec<Leaf> {
 /// Every n-th of `total` items so that the kept ones fit `budget` units of `each`, and how much
 /// to grow each kept one to keep most of the covered area.
 fn stride(total: usize, each: usize, budget: usize) -> (usize, f32) {
-    let n = (total * each).div_ceil(budget.max(each)).max(1);
+    let mut n = (total * each).div_ceil(budget.max(each)).max(1);
+    while total.div_ceil(n) * each > budget && n < total { n += 1; }
     // area-preserving: the kept pieces cover what all of them covered, so a thinned crown keeps
     // its silhouette and density at the distance it is drawn (coverage, not triangle count, is
     // what reads at 45 m)
@@ -503,7 +616,16 @@ fn opaque_pieces(part: &Part, verts: usize, budget: usize) -> Part {
         }
     }
     let each = (part.i.len() / 3).div_ceil(count).max(1);
-    let (n, grow) = stride(count, each, budget);
+    let (n, _) = stride(count, each, budget);
+    let area = |tri: &[u32; 3]| {
+        let a = part.v[tri[0] as usize].p;
+        let b = part.v[tri[1] as usize].p;
+        let c = part.v[tri[2] as usize].p;
+        (b-a).cross(c-a).length() as f64 * 0.5
+    };
+    let total: f64 = tris.iter().flatten().map(area).sum();
+    let selected: f64 = tris.iter().step_by(n).flatten().map(area).sum();
+    let grow = if selected > 1e-12 { (total / selected).sqrt() as f32 } else { 1. };
     let mut out = Part::default();
     for (k, piece) in part.v.chunks_exact(verts).enumerate() {
         if k % n != 0 || tris[k].is_empty() {
@@ -529,7 +651,12 @@ fn opaque_pieces(part: &Part, verts: usize, budget: usize) -> Part {
 /// fold along the midrib (`folded`), or two flat ones.
 fn cards(leaves: &[Leaf], budget: usize, folded: bool) -> Part {
     let each = if folded { 4 } else { 2 };
-    let (n, grow) = stride(leaves.len(), each, budget);
+    let (n, _) = stride(leaves.len(), each, budget);
+    // Cards use the same shape, so width * length is proportional to their area.
+    // Weight by the actual retained leaves rather than assuming all have equal size.
+    let total: f32 = leaves.iter().map(|leaf| leaf.width * leaf.length()).sum();
+    let selected: f32 = leaves.iter().step_by(n).map(|leaf| leaf.width * leaf.length()).sum();
+    let grow = if selected > 1e-9 { (total / selected).sqrt() } else { 1. };
     let mut out = Part::default();
     for leaf in leaves.iter().step_by(n) {
         let half = leaf.side * (leaf.width * 0.5 * grow);
@@ -918,6 +1045,8 @@ fn bake_sprays(
     let edge = ATLAS as usize;
     let tris: &[[usize; 3]] = if verts == 3 {
         &[[0, 2, 1]]
+    } else if verts == 5 {
+        &[[0, 2, 1], [0, 3, 2], [1, 2, 4], [2, 3, 4]]
     } else {
         &[[0, 2, 1], [0, 3, 2], [1, 2, 5], [1, 5, 4], [2, 3, 6], [2, 6, 5], [4, 5, 7], [5, 6, 7]]
     };
@@ -1041,7 +1170,9 @@ mod tests {
         let leaves = Part { v: vec![vertex(0.01, CUTOUT.0), vertex(0.24, CUTOUT.0), vertex(0.24, CUTOUT.1), vertex(0.01, CUTOUT.1),
                                       vertex(0.01, OPAQUE.0), vertex(0.1, OPAQUE.0), vertex(0.1, OPAQUE.1)],
                             i: vec![0,1,2, 0,2,3, 4,5,6] };
-        let mut ladder = Ladder { atlas, branches: vec![], levels: vec![Level { rung: LADDER[0], bark: Part::default(), leaves: Part::default() }, Level { rung: LADDER[1], bark: Part::default(), leaves }] };
+        let mut near = leaves.clone();
+        near.i.extend_from_within(..);
+        let mut ladder = Ladder { atlas, branches: vec![], levels: vec![Level { rung: LADDER[0], bark: Part::default(), leaves: near }, Level { rung: LADDER[1], bark: Part::default(), leaves }] };
         trim_cards(&mut ladder);
         let out = &ladder.levels[1].leaves;
         assert!(out.i.len() >= 9);
@@ -1049,7 +1180,80 @@ mod tests {
         assert!(out.v.iter().any(|v| v.uv.y == OPAQUE.0));
         for v in out.v.iter().filter(|v| v.uv.y >= CUTOUT.0) {
             assert!(v.uv.x >= 40. / ATLAS as f32 && v.uv.x <= 80. / ATLAS as f32);
-            assert!(v.p.distance(Vec3::new(v.uv.x, v.uv.y, 0.)) < 1e-6);
+            assert!(v.p.is_finite());
+        }
+    }
+
+    #[test]
+    fn opaque_thinning_preserves_area_for_differently_sized_leaves() {
+        let v = |x: f32, y: f32| V { p: Vec3::new(x,y,0.), n: Vec3::Z, uv: vec2(0.,0.), c: [1.;4], branch: 0 };
+        let source = Part { v: vec![v(0.,0.),v(1.,0.),v(0.,1.),v(2.,0.),v(4.,0.),v(2.,2.)], i: vec![0,1,2,3,4,5] };
+        let reduced = opaque_pieces(&source, 3, 1);
+        let area = |p: &Part| -> f32 { p.i.chunks_exact(3).map(|t| { let a=p.v[t[0] as usize].p; let b=p.v[t[1] as usize].p; let c=p.v[t[2] as usize].p; (b-a).cross(c-a).length()*0.5 }).sum() };
+        assert_eq!(reduced.i.len(), 3);
+        assert!((area(&source) - area(&reduced)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn trimmed_cards_respect_budget_and_preserve_geometric_area() {
+        let vertex = |x: f32, y: f32, u: f32, v: f32| V { p: Vec3::new(x, y, 0.), n: Vec3::Z, uv: vec2(u,v), c: [1.;4], branch: 0 };
+        let mut atlas = vec![0; (ATLAS * ATLAS * 4) as usize];
+        for y in 150..235 { for x in 15..110 { if ((x as f32-62.).powi(2)/2200. + (y as f32-192.).powi(2)/1700.) < 1. { atlas[((y*ATLAS+x)*4+3) as usize] = 255; } } }
+        let mut leaves = Part::default();
+        for k in 0..100 {
+            let i = leaves.v.len() as u32; let x = k as f32 * 2.;
+            leaves.v.extend([vertex(x,0.,0.01,CUTOUT.0), vertex(x+1.,0.,0.24,CUTOUT.0), vertex(x+1.,1.,0.24,CUTOUT.1), vertex(x,1.,0.01,CUTOUT.1)]);
+            leaves.i.extend([i,i+1,i+2,i,i+2,i+3]);
+        }
+        let mut near = leaves.clone(); near.i.extend_from_within(..);
+        let make = |budget| { let mut r = LADDER[1]; r.budget = budget; Ladder { atlas: atlas.clone(), branches: vec![], levels: vec![Level { rung: LADDER[0], bark: Part::default(), leaves: near.clone() }, Level { rung:r, bark:Part::default(), leaves:leaves.clone() }] } };
+        let mut reference = make(10000); trim_cards(&mut reference);
+        let mut limited = make(80); trim_cards(&mut limited);
+        let area = |p: &Part| -> f32 { p.i.chunks_exact(3).map(|t| { let a=p.v[t[0] as usize].p; let b=p.v[t[1] as usize].p; let c=p.v[t[2] as usize].p; (b-a).cross(c-a).length()*0.5 }).sum() };
+        assert!(limited.levels[1].p3d_faces() <= 80);
+        let (a,b) = (area(&reference.levels[1].leaves), area(&limited.levels[1].leaves));
+        assert!((a-b).abs() / a < 0.001, "clipped leaf area changed: {a} vs {b}");
+    }
+
+    #[test]
+    fn forest_species_trimmed_ladders_and_shadow_proxy_obey_budgets() {
+        for name in ["beech", "spruce", "pine", "oak", "birch", "lime", "willow"] {
+            let id = format!("solstice-forest-{name}");
+            let s = Settings::preset(&id).unwrap();
+            let mut ladder = ladder(&s);
+            let near_area = surface_area(&ladder.levels[0].leaves);
+            for level in &ladder.levels {
+                let area = surface_area(&level.leaves);
+                assert!((area-near_area).abs() / near_area.max(1e-9) < 0.001, "{id} {} untrimmed area {area} vs {near_area}", level.rung.name);
+            }
+            trim_cards(&mut ladder);
+            for level in &ladder.levels {
+                let area = surface_area(&level.leaves);
+                assert!((area-near_area).abs() / near_area.max(1e-9) < 0.001, "{id} {} trimmed area {area} vs {near_area}", level.rung.name);
+                assert!(level.p3d_faces() <= level.rung.budget, "{id} {}: {} > {} P3D faces", level.rung.name, level.p3d_faces(), level.rung.budget);
+                assert!(!level.bark.i.is_empty() && !level.leaves.i.is_empty(), "{id} {}", level.rung.name);
+            }
+            let proxy = proxy_ladder(&s); let p = &proxy.levels[0];
+            assert!(p.bark.i.len()/3 + p.leaves.i.len()*2/3 <= 2000, "{id} shadow faces");
+        }
+    }
+
+    #[test]
+    fn young_tree_lods_never_cost_more_at_a_distance() {
+        for species in ["solstice-oak", "solstice-birch", "solstice-fir", "solstice-cwa-buk", "solstice-willow"] {
+            for maturity in [0.15, 0.4] {
+                let mut settings = Settings::preset(species).unwrap();
+                settings.maturity = maturity;
+                for trim in [false, true] {
+                    let mut ladder = ladder(&settings);
+                    if trim { trim_cards(&mut ladder); }
+                    for pair in ladder.levels.windows(2) {
+                        assert!(pair[1].triangles() <= pair[0].triangles(), "{species} {maturity} trim={trim}: {} > {}", pair[1].triangles(), pair[0].triangles());
+                    }
+                    assert!(ladder.levels.iter().all(|level| !level.bark.i.is_empty() && !level.leaves.i.is_empty()), "{species} {maturity}");
+                    assert!(ladder.levels.iter().flat_map(|level| level.bark.v.iter().chain(&level.leaves.v)).all(|v| (v.branch as usize) < ladder.branches.len()), "{species} {maturity}: wind ownership must remain valid");
+                }
+            }
         }
     }
 

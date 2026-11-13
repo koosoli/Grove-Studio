@@ -2,7 +2,7 @@
 //! forest models. Each species is written in Solstice's species form. Do not edit by hand.
 
 /// Every species beyond Solstice's own four: id, label, forest group, species text.
-pub const CUSTOM: [(&str, &str, &str, &str); 94] = [
+pub const CUSTOM: [(&str, &str, &str, &str); 101] = [
     ("solstice-poseidon-oak", "Poseidon oak", "Poseidon oak", include_str!("../species/poseidon-oak.species")),
     ("solstice-cwa-alp-borovice", "Pine", "Pine", r#"# Pine: CWA model tree_afstr_borovice. The family sets the shape; the name's variant words adjust it.
 height 14.00
@@ -884,9 +884,16 @@ level per_metre=3.5 span=0.2..0.97 angle=45..45 length=0.42 taper=0.3 radius=0.6
 level per_metre=8 span=0.2..1 angle=30..30 length=0.3 taper=0.3 radius=0.6 upturn=0 droop=0.6 gnarl=0.4 whorl=0
 leaves broadleaf_leaves per_metre=42 length=0.06..0.12 width=0.45 variants=0.4,0.3,0.2,0.1 normals=0.5
 "#),
+    ("solstice-forest-beech", "Forest Beech", "Forest Beech", include_str!("../species/forest/forest-beech.species")),
+    ("solstice-forest-spruce", "Forest Spruce", "Forest Spruce", include_str!("../species/forest/forest-spruce.species")),
+    ("solstice-forest-pine", "Forest Pine", "Forest Pine", include_str!("../species/forest/forest-pine.species")),
+    ("solstice-forest-oak", "Forest Oak", "Forest Oak", include_str!("../species/forest/forest-oak.species")),
+    ("solstice-forest-birch", "Forest Birch", "Forest Birch", include_str!("../species/forest/forest-birch.species")),
+    ("solstice-forest-lime", "Forest Lime", "Forest Lime", include_str!("../species/forest/forest-lime.species")),
+    ("solstice-forest-willow", "Forest Willow", "Forest Willow", include_str!("../species/forest/forest-willow.species")),
 ];
 /// Every species id, Solstice's first.
-pub const IDS: [&str; 98] = [
+pub const IDS: [&str; 107] = [
     "solstice-oak", "solstice-birch", "solstice-fir", "solstice-bush",
     "solstice-poseidon-oak", "solstice-cwa-alp-borovice", "solstice-cwa-alp-borovice-horska", "solstice-cwa-alp-borovice-horska-v1",
     "solstice-cwa-alp-borovice-v1", "solstice-cwa-alp-jedle", "solstice-cwa-alp-jedle-v1", "solstice-cwa-alp-smrk",
@@ -911,15 +918,25 @@ pub const IDS: [&str; 98] = [
     "solstice-cwa-smrk-medium-v1", "solstice-cwa-smrk-ridky", "solstice-cwa-smrk-ridky-v1", "solstice-cwa-smrk-v1",
     "solstice-cwa-smrk-vysoky", "solstice-cwa-smrk-vysoky-v1", "solstice-cwa-topol", "solstice-cwa-topol2",
     "solstice-cwa-topol2-v1", "solstice-cwa-topol-v1", "solstice-cwa-trnka", "solstice-cwa-trnka-v1",
-    "solstice-cwa-vrba", "solstice-cwa-vrba-v1",
+    "solstice-cwa-vrba", "solstice-cwa-vrba-v1", "solstice-willow", "solstice-old_oak",
+    "solstice-forest-beech", "solstice-forest-spruce", "solstice-forest-pine", "solstice-forest-oak", "solstice-forest-birch", "solstice-forest-lime", "solstice-forest-willow",
 ];
 /// Forest groups: a label and the species that share the group's percentage.
-pub const GROUPS: [(&str, &[&str]); 28] = [
+pub const GROUPS: [(&str, &[&str]); 37] = [
     ("Solstice oak", &["solstice-oak"]),
     ("Solstice birch", &["solstice-birch"]),
     ("Solstice fir", &["solstice-fir"]),
     ("Solstice bush", &["solstice-bush"]),
     ("Poseidon oak", &["solstice-poseidon-oak"]),
+    ("Solstice weeping willow", &["solstice-willow"]),
+    ("Solstice old oak", &["solstice-old_oak"]),
+    ("Forest Beech", &["solstice-forest-beech"]),
+    ("Forest Spruce", &["solstice-forest-spruce"]),
+    ("Forest Pine", &["solstice-forest-pine"]),
+    ("Forest Oak", &["solstice-forest-oak"]),
+    ("Forest Birch", &["solstice-forest-birch"]),
+    ("Forest Lime", &["solstice-forest-lime"]),
+    ("Forest Willow", &["solstice-forest-willow"]),
     ("Pine", &["solstice-cwa-alp-borovice", "solstice-cwa-alp-borovice-horska", "solstice-cwa-alp-borovice-horska-v1", "solstice-cwa-alp-borovice-v1", "solstice-cwa-borovice", "solstice-cwa-borovice-horska", "solstice-cwa-borovice-horska-v1", "solstice-cwa-borovice-v1"]),
     ("Fir", &["solstice-cwa-alp-jedle", "solstice-cwa-alp-jedle-v1", "solstice-cwa-jedle", "solstice-cwa-jedle-v1"]),
     ("Spruce", &["solstice-cwa-alp-smrk", "solstice-cwa-alp-smrk-ridky", "solstice-cwa-alp-smrk-ridky-v1", "solstice-cwa-alp-smrk-v1", "solstice-cwa-smrk", "solstice-cwa-smrk-dvoj", "solstice-cwa-smrk-dvoj-v1", "solstice-cwa-smrk-medium", "solstice-cwa-smrk-medium-v1", "solstice-cwa-smrk-ridky", "solstice-cwa-smrk-ridky-v1", "solstice-cwa-smrk-v1", "solstice-cwa-smrk-vysoky", "solstice-cwa-smrk-vysoky-v1"]),

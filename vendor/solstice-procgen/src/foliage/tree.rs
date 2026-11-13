@@ -78,13 +78,14 @@ fn grow(
     tip_radius: f32,
     level: &Level,
 ) -> Stem {
-    let step = ring_spacing(radius, length);
+    let step = if level.reach > 0.0 { 0.3_f32.min(length / 2.0) } else { ring_spacing(radius, length) };
     let segments = ((length / step).ceil() as usize).max(2);
     let step = length / segments as f32;
     let mut points = vec![start];
     let mut radii = vec![radius];
     let mut direction = direction.normalize();
     let mut point = start;
+    let mut grown = 0.0;
     for i in 1..=segments {
         let t = i as f32 / segments as f32;
         let wander = Vec3::new(rng.signed(), rng.signed() * 0.5, rng.signed()) * level.gnarl;
@@ -92,19 +93,27 @@ fn grow(
             + (wander + Vec3::Y * level.upturn - Vec3::Y * level.droop * t * 2.0) * step)
             .normalize();
         point += direction * step;
+        if level.reach > 0.0 && point.y < 0.12 && i > 2 { break; }
+        grown += step;
         points.push(point);
         radii.push(radius + (tip_radius - radius) * t.powf(0.8));
     }
     Stem {
         points,
         radii,
-        length,
+        length: grown,
     }
 }
 
 impl Species {
     /// Grows one plant. Different seeds give different plants of the same species.
     pub fn grow(&self, seed: u32) -> Plant {
+        self.grow_with_juvenile_foliage(seed, 0.0)
+    }
+
+    /// Optionally retain leaves on developing nonterminal shoots, including the young leader.
+    /// A strength of zero reproduces the upstream mature plant exactly.
+    pub fn grow_with_juvenile_foliage(&self, seed: u32, strength: f32) -> Plant {
         let mut rng = Rng::new(seed, 7);
         let trunk_level = Level {
             upturn: 0.02,
@@ -131,13 +140,23 @@ impl Species {
                 let parent_length = stems[parent_index].length;
                 let span = level.span.1 - level.span.0;
                 let count = (parent_length * span * level.per_metre).round().max(1.0) as usize;
-                for (t, spin) in shoot_positions(level, count, &mut rng) {
+                let mut positions = shoot_positions(level, count, &mut rng);
+                // Solstice's specimen trees continue their branch tips with near-straight
+                // shoots. Retain the existing shape of Grove's other library species.
+                let has_terminal = matches!(self.leaves.kind, LeafKind::Willow | LeafKind::Oak)
+                    && depth > 0 && level.span.1 >= 0.95 && level.whorl == 0;
+                if has_terminal { positions.push((0.985, rng.range(0.0, TAU))); }
+                let terminal_index = positions.len().saturating_sub(1);
+                for (index, (t, spin)) in positions.into_iter().enumerate() {
                     let (point, along, parent_radius) = stems[parent_index].at(t);
                     let side = perpendicular(along, spin);
                     let along_span = ((t - level.span.0) / span.max(1.0e-6)).clamp(0.0, 1.0);
-                    let angle = level.angle.0
-                        + (level.angle.1 - level.angle.0) * along_span
-                        + rng.signed() * 10.0;
+                    let angle = if has_terminal && index == terminal_index {
+                        rng.range(4.0, 16.0)
+                    } else {
+                        level.angle.0 + (level.angle.1 - level.angle.0) * along_span
+                            + rng.signed() * 10.0
+                    };
                     let angle = angle.to_radians();
                     let direction = along * angle.cos() + side * angle.sin();
                     let mut length = parent_length * level.length * rng.range(0.75, 1.2);
@@ -145,6 +164,10 @@ impl Species {
                         length *= self.crown.envelope(along_span);
                     } else {
                         length *= 1.0 - level.taper * along_span;
+                    }
+                    if level.reach > 0.0 {
+                        let drop = point.y - level.reach * rng.range(0.55, 1.6);
+                        length = length.min(drop.max(0.25));
                     }
                     if length < 0.03 {
                         continue;
@@ -188,6 +211,24 @@ impl Species {
                 &mut rng,
             );
             branches[index].leaf_vertices = start..leaves.vertices.len();
+        }
+        if strength > 0.0 {
+            let strength = strength.clamp(0.0, 1.0);
+            let mut terminal = vec![false; stems.len()];
+            for &index in &generation { terminal[index] = true; }
+            for index in 0..stems.len() {
+                if terminal[index] || (index == 0 && self.leaves.kind == LeafKind::Needles) { continue; }
+                // Stably phase in developing shoots rather than placing leaves abruptly on
+                // every older branch when maturity moves just below 100%.
+                let mut h = (index as u32).wrapping_mul(0x9e3779b1) ^ seed ^ 0x85ebca6b;
+                h ^= h >> 16; h = h.wrapping_mul(0x7feb352d); h ^= h >> 15;
+                if (h as f32 / u32::MAX as f32) >= strength { continue; }
+                let mut young_leaves = self.leaves;
+                young_leaves.per_metre *= 0.22;
+                let start = leaves.vertices.len();
+                add_leaves(&mut leaves, &stems[index], &young_leaves, crown_center, &mut rng);
+                branches[index].leaf_vertices = start..leaves.vertices.len();
+            }
         }
         Plant { wood, leaves, branches }
     }
@@ -248,7 +289,10 @@ fn crown_center(stems: &[Stem], leafy: &[usize]) -> Vec3 {
 
 /// A stem's surface: rings of vertices along its curve, closing to a point at its tip.
 fn add_tube(mesh: &mut Mesh, stem: &Stem, root_flare: f32, rng: &mut Rng) {
-    let sides = ((stem.radii[0] * TAU / 0.035) as usize).clamp(3, 16);
+    // Thick stems need more sides to show a round silhouette and gentle irregularity.
+    let sides = (((stem.radii[0] * TAU / 0.035) as usize).clamp(3, 16)
+        + ((stem.radii[0] - 0.09).max(0.0) * 60.0) as usize).min(40);
+    let thick = smoothstep(0.06, 0.2, stem.radii[0]);
     // Bark wraps a whole number of times, so its seam matches.
     let around = (stem.radii[0] * TAU / BARK_REPEAT).round().max(1.0) * BARK_REPEAT;
     let lobes = rng.range(0.0, TAU);
@@ -277,12 +321,44 @@ fn add_tube(mesh: &mut Mesh, stem: &Stem, root_flare: f32, rng: &mut Rng) {
             let theta = j as f32 / sides as f32 * TAU;
             let buttress = 1.0 + flare * (0.6 + 0.4 * (theta * 5.0 + lobes).cos());
             let outward = normal * theta.cos() + binormal * theta.sin();
-            let radius = if tip { 0.0 } else { stem.radii[i] * buttress };
+            // Sample on a circle so the texture seam also closes geometrically. Derive
+            // the offsets from the existing stem seed, preserving subsequent growth RNG.
+            let lump = if thick > 0.0 {
+                let (c, s) = (theta.cos(), theta.sin());
+                let broad = Vec3::new(c * 1.3, distance * 0.9 + lobes * 13.7, s * 1.3);
+                let fine = Vec3::new(c * 3.1, distance * 2.6 + lobes * 29.1, s * 3.1);
+                1.0 + thick * (0.075 * crate::noise::fbm(broad, 3, 97)
+                    + 0.03 * crate::noise::fbm(fine, 2, 98))
+            } else { 1.0 };
+            let radius = if tip { 0.0 } else { stem.radii[i] * buttress * lump };
             mesh.vertices.push(Vertex {
                 position: stem.points[i] + outward * radius,
                 normal: outward,
                 uv: Vec2::new(j as f32 / sides as f32 * around, distance),
             });
+        }
+    }
+    // Follow the actual irregular surface when lighting a thick stem. Compute a smooth
+    // finite-difference normal at both UV seam copies, using the same wrapped neighbours.
+    if thick > 0.0 {
+        let row = sides + 1;
+        let offset = base as usize;
+        let mut normals = Vec::with_capacity(rings * row);
+        for i in 0..rings {
+            for j in 0..=sides {
+                let k = j % sides;
+                let prev = (k + sides - 1) % sides;
+                let next = (k + 1) % sides;
+                let pos = |r: usize, c: usize| mesh.vertices[offset + r * row + c].position;
+                let across = pos(i, next) - pos(i, prev);
+                let along = pos((i + 1).min(rings - 1), k) - pos(i.saturating_sub(1), k);
+                let outward = mesh.vertices[offset + i * row + j].normal;
+                let candidate = across.cross(along).normalize_or(outward);
+                normals.push(if candidate.dot(outward) < 0.0 { -candidate } else { candidate });
+            }
+        }
+        for (vertex, normal) in mesh.vertices[offset..offset + rings * row].iter_mut().zip(normals) {
+            vertex.normal = normal;
         }
     }
     let row = sides as u32 + 1;
@@ -295,9 +371,6 @@ fn add_tube(mesh: &mut Mesh, stem: &Stem, root_flare: f32, rng: &mut Rng) {
     }
 }
 
-/// Fractions of a leaf's length with a full cross-section, between its stalk and its tip.
-const LEAF_ROWS: [f32; 2] = [0.32, 0.68];
-
 /// Leaves along a stem, alternating around it, with a few at its tip.
 fn add_leaves(mesh: &mut Mesh, stem: &Stem, leaves: &Leaves, crown: Vec3, rng: &mut Rng) {
     let count = (stem.length * leaves.per_metre).round().max(1.0) as usize;
@@ -309,7 +382,7 @@ fn add_leaves(mesh: &mut Mesh, stem: &Stem, leaves: &Leaves, crown: Vec3, rng: &
         let (point, along, radius) = stem.at(t);
         spin += GOLDEN_ANGLE;
         let side = perpendicular(along, spin);
-        let out = (along * 0.6 + side).normalize();
+        let out = (along * leaves.lean + side).normalize();
         let length = rng.range(leaves.length.0, leaves.length.1);
         let mut pick = rng.unit() * total;
         let mut variant = 0;
@@ -436,7 +509,8 @@ fn add_leaf(
         normal: lit(face, base),
         uv: Vec2::new(u(0.0), 0.0),
     });
-    for &s in &LEAF_ROWS {
+    let rows = kind.rows();
+    for &s in rows {
         let center = base + axis * (s * length) + curl(s);
         let half = half_width(s);
         let fold = face * (half * kind.fold());
@@ -461,15 +535,24 @@ fn add_leaf(
         uv: Vec2::new(u(0.0), 1.0),
     });
 
-    // Counter-clockwise seen from the face.
-    let (stalk, l0, c0, r0) = (first, first + 1, first + 2, first + 3);
-    let (l1, c1, r1) = (first + 4, first + 5, first + 6);
-    let point = first + 7;
-    mesh.indices.extend_from_slice(&[
-        stalk, c0, l0, stalk, r0, c0, //
-        l0, c0, c1, l0, c1, l1, c0, r0, r1, c0, r1, c1, //
-        l1, c1, point, c1, r1, point,
-    ]);
+    // Counter-clockwise seen from the face: the stalk's two triangles, two pairs between each
+    // row and the next, and the tip's two.
+    let stalk = first;
+    let row = |k: u32| (first + 1 + k * 3, first + 2 + k * 3, first + 3 + k * 3);
+    let count = rows.len() as u32;
+    let point = first + 1 + count * 3;
+    let (l0, c0, r0) = row(0);
+    mesh.indices
+        .extend_from_slice(&[stalk, c0, l0, stalk, r0, c0]);
+    for k in 0..count - 1 {
+        let (l0, c0, r0) = row(k);
+        let (l1, c1, r1) = row(k + 1);
+        mesh.indices
+            .extend_from_slice(&[l0, c0, c1, l0, c1, l1, c0, r0, r1, c0, r1, c1]);
+    }
+    let (l1, c1, r1) = row(count - 1);
+    mesh.indices
+        .extend_from_slice(&[l1, c1, point, c1, r1, point]);
 }
 
 #[cfg(test)]

@@ -153,6 +153,13 @@ mod viewport_routing_tests {
         assert!(!super::preview_leaves(2, true));
         assert!(super::preview_leaves(0, true));
     }
+    #[test]
+    fn library_search_finds_both_catalogs_by_name_and_id() {
+        assert!(super::library_matches("OAK", true).iter().any(|v| v.0 == "solstice-oak"));
+        assert!(super::library_matches("smrk", false).iter().any(|v| v.0.contains("smrk")));
+        assert!(super::library_matches("not-a-real-species", false).is_empty());
+        assert_eq!(super::library_matches("", false).len(), 14);
+    }
 }
 impl Textures {
     fn new(settings: &Settings) -> Self {
@@ -565,6 +572,9 @@ struct Editor {
     forest_count: u32,
     library_cwa: bool,
     library_page: usize,
+    library_search: String,
+    library_search_focus: bool,
+    random_state: u32,
     forest_page: usize,
     sky: bool,
     skybox: usize,
@@ -627,6 +637,9 @@ impl Editor {
             forest_count: 200,
             library_cwa: false,
             library_page: 0,
+            library_search: String::new(),
+            library_search_focus: false,
+            random_state: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() | 1,
             forest_page: 0,
             sky: true,
             skybox: 1,
@@ -650,7 +663,7 @@ impl Editor {
             history: vec![],
             redo: vec![],
             drag_start: None,
-            tab: 3,
+            tab: 0,
             view: 0,
             grid: true,
             bark: true,
@@ -688,6 +701,12 @@ impl Editor {
     }
     fn reroll(&mut self) {
         self.s.seed = self.s.seed.wrapping_add(1);
+    }
+    fn randomize(&mut self, scope: &str, field: Option<&str>) {
+        self.random_state = self.random_state.wrapping_mul(1664525).wrapping_add(1013904223);
+        let result = if let Some(field) = field { self.s.randomize_field(field, self.random_state) } else { self.s.randomize(scope, self.random_state) };
+        if let Err(err) = result { self.notice(err); return; }
+        self.notice("Generated a random variation.");
     }
     fn orbit(&mut self, delta: Vec2) {
         self.yaw -= delta.x * 0.008;
@@ -1000,7 +1019,7 @@ pub async fn run(args: Vec<String>) {
                 test_steps.push(json!({"step":"project","passed":ok&&loaded&&e.s==saved,"detail":"Saved settings, changed height, reopened and matched all saved values."}));
             }
         }
-        if e.modal.is_none() {
+        if e.modal.is_none() && !e.library_search_focus {
             let vp = Rect::new(
                 258.,
                 if e.forest { 198. } else { 162. },
@@ -1541,6 +1560,25 @@ fn header(ui: &Ui, e: &mut Editor) {
         e.open_modal(Modal::Help)
     }
 }
+pub(crate) fn library_matches(query: &str, cwa: bool) -> Vec<(&'static str, &'static str, &'static str)> {
+    let base = [
+        ("solstice-oak", "Solstice oak", "Crooked, open-grown limbs"),
+        ("solstice-birch", "Solstice birch", "Tall trunk and hanging twigs"),
+        ("solstice-fir", "Solstice fir", "Whorled conifer branches"),
+        ("solstice-bush", "Solstice bush", "Dense multi-stem shrub"),
+        ("solstice-willow", "Solstice weeping willow", "Long hanging shoots"),
+        ("solstice-old_oak", "Solstice old oak", "Broad, mature specimen"),
+    ];
+    let query = query.trim().to_lowercase();
+    let mut trees = Vec::new();
+    if !cwa || !query.is_empty() { trees.extend(base); }
+    for (i, &(id, name, group, _)) in crate::catalog::CUSTOM.iter().enumerate() {
+        let grove_preset = i == 0 || id.starts_with("solstice-forest-");
+        if !query.is_empty() || (cwa && !grove_preset) || (!cwa && grove_preset) { trees.push((id, name, group)); }
+    }
+    trees.into_iter().filter(|(id, name, group)| query.is_empty() || id.to_lowercase().contains(&query) || name.to_lowercase().contains(&query) || group.to_lowercase().contains(&query)).collect()
+}
+
 fn library(ui: &Ui, e: &mut Editor) {
     draw_rectangle(0., 72., 258., 796., col(0xf6f7f2));
     draw_line(257., 72., 257., 868., 1., line());
@@ -1555,26 +1593,29 @@ fn library(ui: &Ui, e: &mut Editor) {
             e.library_page = 0;
         }
     }
-    let trees: Vec<(&str, &str, &str)> = if e.library_cwa {
-        // Every CWA-style species, five to a page; Poseidon oak is on the Solstice tab.
-        crate::catalog::CUSTOM[1..]
-            .iter()
-            .skip(e.library_page * LIBRARY_PAGE)
-            .take(LIBRARY_PAGE)
-            .map(|c| (c.0, c.1, c.2))
-            .collect()
-    } else {
-        vec![
-            ("solstice-oak", "Solstice oak", "Crooked, open-grown limbs"),
-            ("solstice-birch", "Solstice birch", "Tall trunk and hanging twigs"),
-            ("solstice-fir", "Solstice fir", "Whorled conifer branches"),
-            ("solstice-bush", "Solstice bush", "Dense multi-stem shrub"),
-            ("solstice-poseidon-oak", "Poseidon oak", "Engine forest oak, in Solstice"),
-        ]
-    };    for (i, (id, name, desc)) in trees.iter().enumerate() {
-        let y = 168. + i as f32 * 56.;
+    let field = Rect::new(14., 160., 229., 28.);
+    rounded(field, 5., col(0xeaf0e2));
+    if e.library_search_focus { draw_rectangle_lines(field.x, field.y, field.w, field.h, 1.5, green()); }
+    let search_label = if e.library_search.is_empty() { "Search all trees..." } else { &e.library_search };
+    ui.text(&search_label.chars().take(28).collect::<String>(), 22., 179., 13., if e.library_search.is_empty() { muted() } else { ink() });
+    if ui.enabled && is_mouse_button_pressed(MouseButton::Left) { e.library_search_focus = field.contains(ui.mouse); }
+    if ui.enabled && e.library_search_focus && e.modal.is_none() {
+        let ctrl = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
+        if ctrl && is_key_pressed(KeyCode::A) { e.library_search.clear(); e.library_page = 0; }
+        if ctrl && is_key_pressed(KeyCode::V) {
+            if let Some(s) = macroquad::miniquad::window::clipboard_get() { e.library_search.extend(s.chars().filter(|c| !c.is_control()).take(64)); e.library_page = 0; }
+        }
+        while let Some(c) = get_char_pressed() { if !c.is_control() && e.library_search.len() < 128 { e.library_search.push(c); e.library_page = 0; } }
+        if is_key_pressed(KeyCode::Backspace) { e.library_search.pop(); e.library_page = 0; }
+        if is_key_pressed(KeyCode::Escape) || is_key_pressed(KeyCode::Enter) { e.library_search_focus = false; }
+    }
+    let matches = library_matches(&e.library_search, e.library_cwa);
+    let pages = matches.len().div_ceil(LIBRARY_PAGE).max(1);
+    e.library_page = e.library_page.min(pages - 1);
+    for (i, (id, name, desc)) in matches.iter().skip(e.library_page * LIBRARY_PAGE).take(LIBRARY_PAGE).enumerate() {
+        let y = 192. + i as f32 * 50.;
         let active = e.s.species == *id;
-        let r = Rect::new(14., y, 229., 52.);
+        let r = Rect::new(14., y, 229., 46.);
         let over = ui.over(r);
         rounded(
             r,
@@ -1588,7 +1629,7 @@ fn library(ui: &Ui, e: &mut Editor) {
             },
         );
         if active {
-            draw_rectangle(14., y + 10., 3., 42., green())
+            draw_rectangle(14., y + 6., 3., 34., green())
         }
         tree_icon(
             48.,
@@ -1601,8 +1642,8 @@ fn library(ui: &Ui, e: &mut Editor) {
             },
             if active { col(0x62834c) } else { col(0x8e9e7e) },
         );
-        ui.text(name, 81., y + 29., 15., ink());
-        ui.text(desc, 81., y + 49., 10., muted());
+        ui.text(name, 81., y + 22., 14., ink());
+        ui.text(desc, 81., y + 39., 10., muted());
         if active {
             draw_circle(225., y + 17., 3., green())
         }
@@ -1611,8 +1652,8 @@ fn library(ui: &Ui, e: &mut Editor) {
             e.notice(format!("Loaded the {name} preset."));
         }
     }
-    if e.library_cwa {
-        let pages = (crate::catalog::CUSTOM.len() - 1).div_ceil(LIBRARY_PAGE);
+    if matches.is_empty() { ui.text("No trees found.", 22., 215., 13., muted()); }
+    if pages > 1 {
         if ui.button("<", Rect::new(14., 452., 40., 26.), 0) && e.library_page > 0 {
             e.library_page -= 1;
         }
@@ -1696,6 +1737,7 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
     }
     if e.tab == 0 {
         ui.heading("01", "Tree shape", p, 223.);
+        if ui.button("Random shape", Rect::new(p + 150., 203., 112., 24.), 0) { e.randomize("shape", None); }
         let shrub = e.s.species == "solstice-bush";
         ui.slider(
             "Trunk length",
@@ -1706,7 +1748,7 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
             242.,
             "m",
         );
-        ui.slider("Maturity", &mut e.s.maturity, 0.4, 1.2, p, 280., "%");
+        ui.slider("Tree age (relative)", &mut e.s.maturity, if shrub { 0.4 } else { 0.15 }, 1.2, p, 280., "%");
         ui.slider("Canopy spread", &mut e.s.spread, 0.4, 1.6, p, 318., "%");
         ui.slider("Trunk straightness", &mut e.s.trunk_straightness, 0., 1., p, 356., "%");
         let mut branches = e.s.branches as f32;
@@ -1719,7 +1761,7 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
             "Trunk radius",
             &mut e.s.trunk_radius,
             0.05,
-            0.45,
+            1.0,
             p,
             508.,
             "m",
@@ -1733,11 +1775,21 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
             546.,
             "%",
         );
+        for (y, field) in [(242., "height"), (280., "maturity"), (318., "spread"), (356., "trunk_straightness"), (394., "branches"), (432., "branch_angle"), (470., "branch_droop"), (508., "trunk_radius"), (546., "parallax_depth")] {
+            if ui.button("R", Rect::new(p + 264., y - 16., 22., 23.), 0) { e.randomize("shape", Some(field)); }
+        }
+        ui.text("R: randomize this setting", p, 590., 11., muted());
     } else if e.tab == 1 {
         ui.heading("01", "Canopy detail", p, 229.);
+        if ui.button("Random leaves", Rect::new(p + 150., 209., 112., 24.), 0) { e.randomize("foliage", None); }
         ui.slider("Foliage density", &mut e.s.density, 0.25, 1.8, p, 265., "%");
         ui.slider("Leaf size", &mut e.s.leaf_size, 0.025, 0.4, p, 329., "m");
+        if ui.button("R", Rect::new(p + 264., 249., 22., 23.), 0) { e.randomize("foliage", Some("density")); }
+        if ui.button("R", Rect::new(p + 264., 313., 22., 23.), 0) { e.randomize("foliage", Some("leaf_size")); }
         ui.heading("02", "Season palette", p, 412.);
+        if ui.button("Random season", Rect::new(p + 150., 392., 112., 24.), 0) {
+            e.randomize("foliage", Some("season"));
+        }
         for (i, (label, c)) in [
             ("Summer", col(0x527a37)),
             ("Autumn", col(0xba7639)),
@@ -1772,6 +1824,7 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
             11.,
             muted(),
         );
+        ui.text("R: randomize this setting", p, 573., 11., muted());
     } else if e.tab == 2 {
         ui.heading("01", "Sun and sky", p, 229.);
         ui.slider(
@@ -1973,7 +2026,8 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
         green(),
     );
     ui.text("Vertex colors · meters · Y up", p + 14., 780., 11., muted());
-    if ui.button("Reset species settings", Rect::new(p, 817., 262., 29.), 0) {
+    if ui.button("Random tree", Rect::new(p, 817., 126., 29.), 2) { e.randomize("all", None); e.frame(); }
+    if ui.button("Reset", Rect::new(p + 133., 817., 129., 29.), 0) {
         let name = e.s.species.clone();
         e.s = Settings::preset(&name).unwrap();
         e.frame();
@@ -2003,6 +2057,8 @@ fn viewport_ui(ui: &Ui, e: &mut Editor, stats: Option<(u32, u32)>, renderer: &st
             "solstice-birch" => "Solstice birch",
             "solstice-fir" => "Solstice fir",
             "solstice-bush" => "Solstice bush",
+            "solstice-willow" => "Solstice weeping willow",
+            "solstice-old_oak" => "Solstice old oak",
             _ => "Solstice oak",
         });    ui.text(
         if e.forest { "Forest preview" } else { name },
@@ -2278,7 +2334,7 @@ fn modal(ui: &Ui, e: &mut Editor, m: Modal) {
             muted(),
         );
         ui.text(
-            "Tools: tree_presets, tree_inspect, tree_generate, tree_preview",
+            "Tools: tree_presets, tree_randomize, tree_generate, tree_preview",
             442.,
             540.,
             13.,

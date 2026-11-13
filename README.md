@@ -31,7 +31,7 @@ Grove Studio is free and open source. If it saves you time, you can support its 
 
 ## Features
 
-- **Five tree species**: oak, birch, fir, bush, and the Poseidon-style forest oak, each with its own proportions and bark.
+- **Tree library**: Solstice trees and shrubs, including the garden weeping willow and old oak, plus Poseidon-style and CWA-inspired presets.
 - **Live WebGPU preview** using Solstice's cluster hierarchy, occlusion culling, cascaded shadows and voxel/screen-space global illumination.
 - **Structure and foliage controls** including trunk straightness, branch angle and droop, with immediate updates, plus LOD inspection (Auto LOD or explicit LOD 0-2) that reports drawn triangles and clusters.
 - **Seasons**: summer, autumn, spring and winter palettes. Winter drops almost all leaves and keeps the wood.
@@ -50,6 +50,8 @@ Grove Studio is free and open source. If it saves you time, you can support its 
 | `solstice-birch` | Tall trunk and hanging twigs |
 | `solstice-fir` | Whorled conifer branches, evergreen |
 | `solstice-bush` | Dense multi-stem shrub |
+| `solstice-willow` | Weeping willow with long hanging shoots |
+| `solstice-old_oak` | Broad old oak specimen |
 | `solstice-poseidon-oak` | Forest oak proportions re-expressed in Solstice's format (see [CREDITS.md](CREDITS.md)) |
 
 <div align="center">
@@ -109,9 +111,9 @@ Projects saved with the earlier `oak`, `birch` or `pine` species open as `solsti
 - **glTF 2.0**: a `.gltf` and `.bin` pair per LOD, with textures embedded in the binary buffer. Foliage is opaque and double-sided. Keep the `.bin` beside the `.gltf`.
 - **OBJ**: `.obj`, `.mtl` and bark color, normal and height PNGs. Vertex RGB is included as an extension. Keep all sidecars together. Configure foliage to render both sides.
 - **LODs**: LOD 0 is the full tree. LOD 1 keeps alternate leaves, and LOD 2 keeps one in five, growing the remaining pieces. All LODs share the same ground origin.
-- **Game LOD ladder** (`--lod game`, Poseidon P3D): four levels a forest can afford. Near (at most 150,000 triangles) has the wood simplified with meshoptimizer and folded alpha-cut leaf cards; mid (about 30,000) drops the twigs and uses flat two-triangle leaf cards; far (about 6,500) and very far (about 1,500) keep the trunk and limbs and draw the crown as crossed spray cards baked from the tree's own leaves. Conifers use spray cards from mid on, and spray cards under needle fans up close. Thinned leaves grow so the crown keeps its coverage. The origin is the trunk's foot; the leaf atlas carries the leaf outlines in alpha and every texture ships its `_nohq` normal map. `--inspect --lod game` reports each level.
-- **Experimental card trimming:** game LOD export trims medium and distant alpha cards by default; choose Poseidon P3D and Game LOD in the export dialog to toggle it. Use `--no-trim-cards` on the CLI, or `tree_generate` with `lod: "game"` and `trimCards: false` in MCP. The Solstice viewer defaults to the game cards; use the Game cards / Original leaves and Trim ON / OFF buttons to compare. The four game preview choices correspond to near, mid, far and very far export levels; trimming applies from mid onward. MCP `tree_preview` accepts `gameCards` and `trimCards` booleans. Use the Lighting view button to select Triangles for inspecting the topology; the normal lit view is intended to look similar. The numbers above are pre-trimming budgets: trimming adds triangles and can exceed them considerably. Profile in the target engine; compressed mips, filtering and vertex wind may also change the appearance.
-- **FOREST-PROXY tree models** (`--lod game --forest-proxy`): the per-tree properties OpenPoseidon's forest instancing reads, so each tree can be its own GPU instance inside a forest block: `facepairs` (every leaf face has its reverse twin), `forestcrowns` (per-crown radial leaf normals) and `forestinterior` on every level, and `lodfade`, `barkpom` and `shadowcoarser` on the nearest. Origin is the trunk foot with `autocenter=0`; the block itself (the empty proxy level and the `voxsource` union of each tree's coarsest level) is written by `PoseidonTools tree forest-block --proxy-trees --tree <this.p3d>=<weight>`.
+- **Game LOD ladder** (`--lod game`, Poseidon P3D): four visual levels target at most 150,000, 30,000, 6,500 and 1,500 exported P3D faces (including reversed foliage faces). Near uses opaque individual leaf geometry; mid and distant levels use alpha cards or clustered sprays. Thinned pieces grow to compensate for lost geometric leaf area. Sparse trees can be below these targets. The exported shadow-buffer LOD is capped separately and a coarse `_occlusion.p3d` is provided for explicit use. The checked-out engine shadow pass selects visual LODs for visible objects and does not automatically consume this shadow level or occlusion sidecar; runtime support must be verified or added on the engine side.
+- **Card trimming:** mid and distant game cards are trimmed by default. Clipping can add triangles, so whole cards are thinned to fit the final budget and enlarged to preserve their combined geometric area. Alpha coverage, overlapping leaves, compressed mips and filtering can change the visible coverage; profile and inspect in the target engine. Use `--no-trim-cards` or MCP `trimCards: false` to compare.
+- **FOREST-PROXY tree models** (`--lod game --forest-proxy`): the per-tree properties expected by compatible forest-instancing builds: `facepairs` (every leaf face has its reverse twin), `forestcrowns` (per-crown radial leaf normals) and `forestinterior` on every level, and `lodfade`, `barkpom` and `shadowcoarser` on the nearest. Origin is the trunk foot with `autocenter=0`; the block itself (the empty proxy level and the `voxsource` union of each tree's coarsest level) is written by `PoseidonTools tree forest-block --proxy-trees --tree <this.p3d>=<weight>`.
 - **Wind**: glTF includes a `_WIND` custom attribute with normalized height squared and a foliage flutter weight. Poseidon P3D uses the existing height-based tree sway; its alpha foliage shares one flutter phase per tree. The Solstice preview instead adds a continuous local branch-sway approximation and tip-weighted individual leaf flutter, so this fine motion is preview-only and is not reproduced by Poseidon. Baked spray cards receive only shared sway. These are artistic approximations, not a physical wind simulation; exports contain no baked animation.
 - **Parallax**: the Bark material includes a standard `normalTexture`, plus `extras.parallax` with the height texture index, UV scale, 16 layers and height convention (white is raised). Core glTF has no parallax property, so ordinary importers show the normal-mapped bark only.
 - **Triangle counts** are measured from the real mesh. Faces with no area are removed during generation.
@@ -161,6 +163,10 @@ Preview options include `--forest`, `--skybox`, `--wind-time` (seconds), `--lod 
 
 The viewport's **Structure** button hides the foliage while keeping the live wind renderer. For a headless version use `--preview --structure`; MCP `tree_preview` accepts `"structure": true`. Wind rotates branches around generated attachment points, with simplified LODs using approximate ownership when pieces are combined.
 
+Use `grove-studio --budget-report` to print JSON counts for the seven forest presets, or add `--preset NAME` for one species. Geometry byte counts describe in-memory vertices and indices, not GPU allocations or textures. `two_sided_faces` counts P3D front and reverse foliage faces; `foliage_geometry_area_m2` is unmasked triangle area, not visible alpha coverage. The same per-tree report is available through MCP `tree_budget_report`.
+
+Search the tree library by name or model ID. In **Shape**, Tree age is a relative maturity scale, not years: 100% is the mature preset, with saplings down to 15% (40% for the bush preset). Young trees grow shorter, slimmer branches while retaining leaf size; mixed forests use separately grown young trees. **Random tree** varies the current species' seed, shape and foliage; **Random shape**, **Random leaves** and the small **R** buttons vary only the indicated controls. Season and imported materials stay as selected unless changed separately. Undo restores previous settings. For repeatable results, the CLI accepts `--randomize all|shape|foliage --random-seed N` or `--random-field NAME --random-seed N`. MCP provides `tree_randomize` with `scope` or `field`; `tree_presets` also accepts an optional `query`.
+
 The Render tab can load PNG bark color, height and normal maps, plus a four-column leaf color atlas. Project files refer to these images by path. Game LOD P3D exports also write a `_wind.json` hierarchy sidecar; Poseidon requires separate engine support to read and animate it, and its legacy wind remains the fallback.
 
 ## MCP
@@ -204,7 +210,7 @@ python verify.py
 
 Grove Studio is licensed under the **GNU General Public License v3.0 or later**. See [LICENSE](LICENSE).
 
-- Trees, the renderer and the procedural bark and leaf textures come from [Solstice](https://github.com/SamG-Coder/solstice) by SamG-Coder (MIT). A modified copy of its renderer is in `vendor/solstice-render`, with its [MIT license](vendor/solstice-render/LICENSE).
+- Trees, the renderer and the procedural bark and leaf textures come from [Solstice](https://github.com/SamG-Coder/solstice) by SamG-Coder (MIT); the weeping willow and old oak also feature in [Solstice Garden](https://github.com/SamG-Coder/solstice-garden) (MIT). A modified copy of its renderer is in `vendor/solstice-render`, with its [MIT license](vendor/solstice-render/LICENSE).
 - The Poseidon oak re-expresses the forest oak preset of the Poseidon engine, which uses the ez-tree growth model by Dan Greenheck (MIT). See [CREDITS.md](CREDITS.md).
 - Third-party Rust dependency licenses are listed in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt).
 - The editor loads Segoe UI from your own Windows installation if present, and falls back to the built-in font otherwise. No font files are redistributed.

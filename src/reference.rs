@@ -3,7 +3,7 @@
 use crate::tree::{self, Part, Settings, Tree, V};
 use image::{ImageBuffer, ImageOutputFormat};
 use macroquad::prelude::{vec2, vec3, Vec3};
-use solstice_procgen::foliage::{leaf::LeafKind, tree::Species};
+use solstice_procgen::foliage::{leaf::LeafKind, tree::{Crown, Species}};
 use std::{io::Cursor, sync::OnceLock};
 
 pub use crate::catalog::IDS;
@@ -79,23 +79,48 @@ pub fn grow(s: &Settings, lod: u32) -> Option<Tree> {
     let mut species = species(s)?;
     let original_leaf_size = (species.leaves.length.0 + species.leaves.length.1) * 0.5;
     let leaf_scale = s.leaf_size / original_leaf_size;
-    let height_scale = s.height * s.maturity / species.height;
-    species.trunk_radius = s.trunk_radius * (0.55 + 0.45 * s.maturity);
+    // Grow younger stems at their actual length. Compressing only the Y axis after growing a
+    // mature crown makes saplings unnaturally broad and also squashes their leaf geometry.
+    let height_scale = s.height / species.height;
+    species.height *= s.maturity;
+    let juvenile = ((1. - s.maturity) / 0.6).clamp(0., 1.);
+    let needle = species.leaves.kind == LeafKind::Needles;
+    species.trunk_radius = s.trunk_radius * tree::age_radius_scale(s.maturity);
+    species.root_flare *= 1. - 0.55 * juvenile;
     species.trunk_gnarl = species.trunk_gnarl * 2. * (1. - s.trunk_straightness)
         + 0.03 * (0.5 - s.trunk_straightness).max(0.);
+    species.trunk_gnarl *= 1. - 0.55 * juvenile;
     species.levels[0].per_metre *= s.branches as f32 / Settings::default().branches as f32 * (0.7 + 0.3 * s.maturity);
-    for level in &mut species.levels {
+    // Young conifer leaders carry relatively closely spaced whorls; retain their conical form.
+    if needle { species.levels[0].per_metre *= 1. + 0.4 * juvenile; }
+    if juvenile > 0. && !needle && s.species != "solstice-bush" {
+        let old = species.crown.clone();
+        let young = [0.58, 0.83, 1.0, 0.84, 0.58, 0.32, 0.12];
+        species.crown = Crown::Profile(young.iter().enumerate().map(|(i, &target)| {
+            let original = old.envelope(i as f32 / (young.len() - 1) as f32);
+            original + (target - original) * juvenile * 0.75
+        }).collect());
+    }
+    for (depth, level) in species.levels.iter_mut().enumerate() {
         level.angle.0 = (level.angle.0 * s.branch_angle).clamp(0., 180.);
         level.angle.1 = (level.angle.1 * s.branch_angle).clamp(0., 180.);
         level.droop = level.droop * s.branch_droop + 0.1 * (s.branch_droop - 1.).max(0.);
+        level.droop *= 1. - 0.5 * juvenile;
+        level.gnarl *= 1. - 0.35 * juvenile;
+        if depth == 0 && s.species != "solstice-bush" {
+            level.span.0 *= 1. - 0.4 * juvenile;
+            level.length *= 1. - if needle { 0.08 } else { 0.20 } * juvenile;
+            if !needle { level.angle.0 *= 1. - 0.18 * juvenile; level.angle.1 *= 1. - 0.12 * juvenile; }
+        }
     }
     let deciduous = species.leaves.kind != LeafKind::Needles;
     let season_density = if deciduous { match s.season { 1 => 0.82, 2 => 0.80, _ => 1. } } else { 1. };
     let season_leaf = if deciduous && s.season == 2 { 0.82 } else { 1. };
     species.leaves.per_metre *= s.density * season_density;
+    if !needle { species.leaves.per_metre *= 1. + 1.5 * juvenile; }
     species.leaves.length.0 *= leaf_scale * season_leaf;
     species.leaves.length.1 *= leaf_scale * season_leaf;
-    let plant = species.grow(s.seed);
+    let plant = species.grow_with_juvenile_foliage(s.seed, juvenile);
     let mut bark_branch = vec![0; plant.wood.vertices.len()];
     let mut original_leaf_branch = vec![0; plant.leaves.vertices.len()];
     for (i, branch) in plant.branches.iter().enumerate() {
@@ -134,8 +159,7 @@ pub fn grow(s: &Settings, lod: u32) -> Option<Tree> {
     };
     for (vertex, &owner) in bark.v.iter_mut().zip(&bark_branch) { vertex.branch = owner; }
     bark.i = keep_area(&bark.i, |i| bark.v[i as usize].p);
-    let needle = species.leaves.kind == LeafKind::Needles;
-    let (verts, indices) = if needle { (3, 3) } else { (8, 24) };
+    let (verts, indices) = if needle { (3, 3) } else { let n = species.leaves.kind.rows().len(); (2 + n * 3, n * 12) };
     let mut leaves = Part::default();
     let mut leaf_branch = Vec::new();
     let stride = [1, 2, 5][lod as usize];
@@ -237,12 +261,16 @@ pub fn leaf_atlas(s: &Settings) -> Option<&'static [u8]> {
     static BROADLEAF: OnceLock<Vec<u8>> = OnceLock::new();
     static BIRCH: OnceLock<Vec<u8>> = OnceLock::new();
     static NEEDLES: OnceLock<Vec<u8>> = OnceLock::new();
+    static WILLOW: OnceLock<Vec<u8>> = OnceLock::new();
+    static OAK: OnceLock<Vec<u8>> = OnceLock::new();
     let kind = species(s)?.leaves.kind;
     // One atlas per leaf kind, shared by every species that uses it.
     let cache = match kind {
         LeafKind::Broadleaf => &BROADLEAF,
         LeafKind::Birch => &BIRCH,
         LeafKind::Needles => &NEEDLES,
+        LeafKind::Willow => &WILLOW,
+        LeafKind::Oak => &OAK,
     };
     Some(cache.get_or_init(|| kind.atlas(0).bake(256).color_mips.remove(0)))
 }
@@ -258,18 +286,18 @@ pub fn bark_images(s: &Settings) -> Option<&'static BarkImages> {
     let i = IDS.iter().position(|id| *id == s.species)?;
     Some(CACHE[i].get_or_init(|| {
         const EDGE: u32 = 512;
-        let mut layer = species(s).unwrap().bark.surface(0).bake(EDGE);
+        let surface = species(s).unwrap().bark.surface(0);
+        let height = surface.height_map(EDGE);
+        let mut layer = surface.bake(EDGE);
         let mut color = layer.color_mips.remove(0);
-        let mut height = Vec::new();
-        for p in color.chunks_exact_mut(4) {
-            // Cavity and albedo approximate a matching relief map from the upstream bake.
-            let light = (u32::from(p[0]) + 2 * u32::from(p[1]) + u32::from(p[2])) / 4;
-            height.push((light * u32::from(p[3]) / 255) as u8);
+        // The upstream bake is deliberately subtle and can quantize to nearly flat grey at
+        // tree scale. Retain its species colors while bringing out the measured relief in
+        // the diffuse map. Custom imported albedos bypass this generated texture entirely.
+        for (p, &h) in color.chunks_exact_mut(4).zip(&height) {
+            let relief = h as f32 / 255.;
+            let gain = 0.62 + 0.76 * relief;
+            for channel in &mut p[..3] { *channel = (*channel as f32 * gain).round().clamp(0.,255.) as u8; }
             p[3] = 255;
-        }
-        let (min, max) = (*height.iter().min().unwrap(), *height.iter().max().unwrap());
-        for y in &mut height {
-            *y = ((u32::from(*y - min) * 255) / u32::from((max - min).max(1))) as u8;
         }
         let normal = layer
             .normal_mips
@@ -330,6 +358,102 @@ mod tests {
         }
         assert!(mature.bark_branch.iter().chain(&mature.leaf_branch).all(|&id| (id as usize) < mature.branches.len()));
         assert!(mature.leaf_branch.iter().any(|&id| id > 0));
+    }
+
+    #[test]
+    fn juvenile_trees_grow_smaller_stems_without_flattening_leaves() {
+        for id in ["solstice-oak", "solstice-birch", "solstice-fir", "solstice-cwa-buk"] {
+            let mature_settings = settings(id).unwrap();
+            let mature = grow(&mature_settings, 0).unwrap();
+            let mut young_settings = mature_settings.clone();
+            young_settings.maturity = 0.4;
+            let young = grow(&young_settings, 0).unwrap();
+            assert!(young.valid(), "{id}");
+            assert!(young.branches.len() < mature.branches.len(), "{id}: juvenile shoots should develop over time");
+            assert!(young.branches[0].radii[0] < mature.branches[0].radii[0] * 0.4, "{id}: juvenile trunk should be slender");
+            let (mlo, mhi) = mature.bounds(); let (ylo, yhi) = young.bounds();
+            assert!((yhi.y - ylo.y) < (mhi.y - mlo.y) * 0.65, "{id}");
+            let mw = (mhi.x - mlo.x).max(mhi.z - mlo.z);
+            let yw = (yhi.x - ylo.x).max(yhi.z - ylo.z);
+            assert!(yw < mw * 0.7, "{id}: young crown should not retain mature width");
+            let vertices = if species(&mature_settings).unwrap().leaves.kind == LeafKind::Needles { 3 } else { 2 + species(&mature_settings).unwrap().leaves.kind.rows().len() * 3 };
+            let leaf_length = |tree: &Tree| {
+                let mut lengths: Vec<f32> = tree.leaves.v.chunks_exact(vertices).take(1000)
+                    .map(|piece| piece[0].p.distance(piece[vertices - 1].p)).collect();
+                lengths.sort_by(f32::total_cmp); lengths[lengths.len()/2]
+            };
+            let ratio = leaf_length(&young) / leaf_length(&mature);
+            assert!((0.65..1.45).contains(&ratio), "{id}: leaf dimensions changed by {ratio}");
+            young_settings.maturity = 0.15;
+            let sapling = grow(&young_settings, 0).unwrap();
+            assert!(sapling.valid(), "{id}: youngest sapling must keep wood and foliage");
+            assert!(sapling.bounds().1.y < young.bounds().1.y, "{id}: sapling should be shorter than young tree");
+        }
+    }
+
+    #[test]
+    fn bark_height_comes_from_relief_not_albedo() {
+        use solstice_procgen::surface::{Surface, Texel};
+        let surface = Surface::new(1., |u, _| Texel { color: glam::Vec3::splat(0.5), height: u, roughness: 0.5, cavity: 1. });
+        let height = surface.height_map(16);
+        assert_eq!(height[0], 0);
+        assert_eq!(height[15], 255);
+        assert!(height[8] > height[4]);
+    }
+
+    #[test]
+    fn generated_beech_bark_maps_have_detail() {
+        let settings = settings("solstice-forest-beech").unwrap();
+        let maps = bark_images(&settings).unwrap();
+        let albedo = image::load_from_memory(&maps.color).unwrap().to_rgba8();
+        let height = image::load_from_memory(&maps.height).unwrap().to_luma8();
+        let normal = image::load_from_memory(&maps.normal).unwrap().to_rgb8();
+        let range = |v: Vec<u8>| v.iter().max().unwrap() - v.iter().min().unwrap();
+        assert!(range(albedo.pixels().map(|p| p[0]).collect()) > 40);
+        assert!(range(height.pixels().map(|p| p[0]).collect()) > 100);
+        assert!(range(normal.pixels().map(|p| p[1]).collect()) > 20);
+    }
+
+    #[test]
+    fn thick_trunk_normals_follow_surface_without_a_uv_seam() {
+        let plant = Species::by_name("old_oak").unwrap().grow(0);
+        let sides = 40usize;
+        let row = sides + 1;
+        let trunk = &plant.wood.vertices[plant.branches[0].wood_vertices.clone()];
+        assert_eq!(trunk.len() % row, 0);
+        for ring in trunk.chunks_exact(row) {
+            assert!(ring[0].position.distance(ring[sides].position) < 0.0001);
+            assert!(ring[0].normal.distance(ring[sides].normal) < 0.0001);
+            assert!(ring.iter().all(|v| v.normal.is_finite() && v.normal.length_squared() > 0.9));
+        }
+    }
+
+    #[test]
+    fn garden_specimen_tip_shoots_retain_branch_parents() {
+        for id in ["solstice-willow", "solstice-old_oak"] {
+            let mut settings = settings(id).unwrap();
+            settings.maturity = 0.4;
+            let tree = grow(&settings, 0).unwrap();
+            let continuing = tree.branches.iter().skip(1).filter(|branch| {
+                let parent = &tree.branches[branch.parent.unwrap()];
+                let start = Vec3::from_array(branch.points[0]);
+                let end = Vec3::from_array(*parent.points.last().unwrap());
+                let origin = Vec3::from_array(parent.points[0]);
+                start.distance(end) < origin.distance(end) * 0.025 + 0.002
+            }).count();
+            assert!(continuing > 0, "{id}: continuation shoots should start near a parent tip");
+            assert!(tree.leaf_branch.iter().all(|&branch| (branch as usize) < tree.branches.len()));
+        }
+    }
+
+    #[test]
+    fn all_catalog_species_grow_at_the_youngest_supported_stage() {
+        for &id in IDS.iter() {
+            let mut settings = settings(id).unwrap();
+            settings.maturity = if id == "solstice-bush" { 0.4 } else { 0.15 };
+            settings.validate().unwrap();
+            assert!(grow(&settings, 0).unwrap().valid(), "{id}: young tree must have valid wood and foliage");
+        }
     }
 
     #[test]

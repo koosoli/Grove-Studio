@@ -200,6 +200,24 @@ impl Surface {
         }
     }
 
+    /// Samples the same relief used for the normal map, normalized to an 8-bit height map.
+    /// White is raised. Unlike albedo-derived estimates this preserves cracks and ridges
+    /// even where their color is changed independently by moss or lichen.
+    pub fn height_map(&self, size: u32) -> Vec<u8> {
+        let n = size as usize;
+        let heights: Vec<f32> = (0..n * n).into_par_iter().map(|i| {
+            let u = ((i % n) as f32 + 0.5) / size as f32;
+            let v = ((i / n) as f32 + 0.5) / size as f32;
+            match &self.source {
+                Source::Direct { sample, .. } => sample(u, v).height,
+                Source::Shaped { height, .. } => height(u, v).0,
+            }
+        }).collect();
+        let lo = heights.iter().copied().fold(f32::INFINITY, f32::min);
+        let hi = heights.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        heights.iter().map(|h| ((h - lo) / (hi - lo).max(1e-9) * 255.0).round() as u8).collect()
+    }
+
     /// Generates texture maps of `size`x`size` with full mip chains, uncompressed.
     pub fn bake(&self, size: u32) -> TextureLayer {
         match self.source {

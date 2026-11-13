@@ -28,7 +28,7 @@ fn hierarchy_local(i: Instance, p: vec3f, vertex: PackedVertex, clock: f32, para
             let phase = dot(pivot, vec3f(0.73, 0.27, 0.91)) + f32(id) * 0.618 + dot(vec2f(i.world_0.w, i.world_2.w), vec2f(0.37, 0.29));
             let response = spring_response(t * 1.31 + phase, 1.31, natural, damping);
             let flexibility = clamp(length_stem / max(branch.roughness * 35.0, 0.1), 0.2, 1.0);
-            let gust = 1.0 + params.y * (0.5 + 0.5 * sin(t * 0.19 + phase));
+            let gust = vegetation_gust(vec2f(i.world_0.w, i.world_2.w), t, direction, params.y);
             let angle = clamp(0.045 * params.x * params.w * gust * flexibility * response * axis_length, -0.12, 0.12);
             let relative = result - select(pivot, vec3f(0.0), vector);
             let rotated = relative * cos(angle) + cross(axis, relative) * sin(angle) + axis * dot(axis, relative) * (1.0 - cos(angle));

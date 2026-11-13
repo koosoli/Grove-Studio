@@ -74,6 +74,9 @@ pub fn wind_weights(v: &V, height: f32, foliage: bool) -> [f32; 2] {
     ]
 }
 
+/// Young stems thicken as they grow; mature presets retain their exact radius at 100%.
+pub fn age_radius_scale(maturity: f32) -> f32 { maturity.powf(1.15) }
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
@@ -124,6 +127,61 @@ impl Default for Settings {
     }
 }
 impl Settings {
+    pub fn randomize_field(&mut self, field: &str, seed: u32) -> Result<(), String> {
+        if field == "season" { self.season = seed.wrapping_mul(1664525).wrapping_add(1013904223) % 4; return Ok(()); }
+        let scope = match field {
+            "density" | "leaf_size" => "foliage",
+            "height" | "maturity" | "spread" | "trunk_straightness" | "branches" | "branch_angle" | "branch_droop" | "trunk_radius" | "parallax_depth" => "shape",
+            _ => return Err("Unknown randomization field".into()),
+        };
+        let mut variant = self.clone();
+        variant.randomize(scope, seed)?;
+        match field {
+            "height" => self.height = variant.height,
+            "maturity" => self.maturity = variant.maturity,
+            "spread" => self.spread = variant.spread,
+            "trunk_straightness" => self.trunk_straightness = variant.trunk_straightness,
+            "branches" => self.branches = variant.branches,
+            "branch_angle" => self.branch_angle = variant.branch_angle,
+            "branch_droop" => self.branch_droop = variant.branch_droop,
+            "trunk_radius" => self.trunk_radius = variant.trunk_radius,
+            "parallax_depth" => self.parallax_depth = variant.parallax_depth,
+            "density" => self.density = variant.density,
+            "leaf_size" => self.leaf_size = variant.leaf_size,
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+    /// Seeded variations stay within the species' normal proportions and preserve materials.
+    pub fn randomize(&mut self, scope: &str, seed: u32) -> Result<(), String> {
+        if !["all", "shape", "foliage"].contains(&scope) { return Err("Randomization scope must be all, shape or foliage".into()); }
+        let base = Self::preset(&self.species)?;
+        let mut state = seed as u64 ^ 0x9e3779b97f4a7c15;
+        let mut sample = |lo: f32, hi: f32| {
+            state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+            let u = (state.wrapping_mul(0x2545f4914f6cdd1d) >> 40) as f32 / (1u32 << 24) as f32;
+            lo + (hi - lo) * u
+        };
+        if scope != "foliage" {
+            let shrub = self.species == "solstice-bush";
+            self.height = (base.height * sample(0.80, 1.20)).clamp(if shrub { 0.25 } else { 3. }, if shrub { 0.65 } else { 40. });
+            self.maturity = sample(if shrub { 0.4 } else { 0.15 }, 1.15);
+            self.spread = sample(0.75, 1.25);
+            self.trunk_radius = (base.trunk_radius * sample(0.8, 1.2)).clamp(0.05, 1.0);
+            self.trunk_straightness = sample(0.20, 0.85);
+            self.branches = sample(8., 15.).round() as u32;
+            self.branch_angle = sample(0.75, 1.25);
+            self.branch_droop = sample(0.55, 1.45);
+            self.parallax_depth = sample(0.015, 0.055);
+        }
+        if scope != "shape" {
+            self.density = sample(0.75, 1.3);
+            self.leaf_size = (base.leaf_size * sample(0.80, 1.20)).clamp(0.025, 0.4);
+        }
+        if scope == "all" { self.seed = seed; }
+        self.validate()
+    }
+
     pub fn is_reference(&self) -> bool {
         crate::reference::IDS.contains(&self.species.as_str())
     }
@@ -150,10 +208,10 @@ impl Settings {
                 if shrub { 0.65 } else { 40. },
             ),
             ("spread", self.spread, 0.4, 1.6),
-            ("maturity", self.maturity, 0.4, 1.2),
+            ("maturity", self.maturity, if shrub { 0.4 } else { 0.15 }, 1.2),
             ("density", self.density, 0.25, 1.8),
             ("leaf_size", self.leaf_size, 0.025, 0.40),
-            ("trunk_radius", self.trunk_radius, 0.05, 0.45),
+            ("trunk_radius", self.trunk_radius, 0.05, 1.0),
             ("trunk_straightness", self.trunk_straightness, 0., 1.),
             ("branch_angle", self.branch_angle, 0.5, 1.5),
             ("branch_droop", self.branch_droop, 0., 2.),
@@ -499,6 +557,36 @@ fn export_gltf(t: &Tree, path: &Path, s: &Settings) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn randomized_settings_are_repeatable_valid_and_scoped() {
+        for &name in crate::reference::IDS.iter() {
+            let original = Settings::preset(name).unwrap();
+            for scope in ["all", "shape", "foliage"] {
+                for seed in [0, 42, u32::MAX] {
+                    let mut a = original.clone(); let mut b = original.clone();
+                    a.randomize(scope, seed).unwrap(); b.randomize(scope, seed).unwrap();
+                    assert_eq!(a, b, "{name} {scope}");
+                    a.validate().unwrap();
+                    assert_eq!(a.species, original.species);
+                    assert_eq!(a.season, original.season);
+                    if scope == "shape" { assert_eq!(a.density, original.density); assert_eq!(a.leaf_size, original.leaf_size); }
+                    if scope == "foliage" { assert_eq!(a.height, original.height); assert_eq!(a.branches, original.branches); assert_eq!(a.seed, original.seed); }
+                }
+            }
+        }
+        assert!(Settings::default().randomize("unknown", 1).is_err());
+        for field in ["height", "maturity", "spread", "trunk_straightness", "branches", "branch_angle", "branch_droop", "trunk_radius", "parallax_depth", "density", "leaf_size", "season"] {
+            let original = Settings::default();
+            let mut changed = original.clone();
+            changed.randomize_field(field, 91).unwrap();
+            let mut a = serde_json::to_value(original).unwrap();
+            let mut b = serde_json::to_value(changed).unwrap();
+            a.as_object_mut().unwrap().remove(field);
+            b.as_object_mut().unwrap().remove(field);
+            assert_eq!(a, b, "only {field} should change");
+        }
+    }
 
     #[test]
     fn custom_materials_and_branch_hierarchy_export() {
