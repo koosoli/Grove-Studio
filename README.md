@@ -219,7 +219,7 @@ Generated leaf textures retain species veins and mottling through seasonal recol
 
 ## Grass authoring
 
-Open the **Grass** tab and choose **Preview grass**, or launch `grove-studio --grass meadow`. Presets are meadow, lawn, dry, tall and verge. Full tufts use Solstice-style branching blades; six-blade clumps use a compact OpenPoseidon-inspired blade count. Adjust patch size, density, blade height/width/bend, dry fraction, weeds and bare gaps; New seed varies the patch. Grass supports its own undo/redo, JSON projects and glTF/OBJ mesh exports. Use Weather and Light while grass preview is active. The first three mesh LODs reduce plant density and widen retained blades; they are authoring mesh LODs, not the engine's GPU placement rings. Grass preview needs the Solstice renderer. The forest viewer's existing ground/understory is unchanged.
+Open the **Grass** tab and choose **Preview grass**, or launch `grove-studio --grass meadow`. Presets are meadow, lawn, dry, tall and verge. Full tufts use Solstice-style branching blades; six-blade clumps use a compact OpenPoseidon-inspired blade count. Adjust patch size, density, blade height/width/bend, dry fraction, weeds and bare gaps; New seed varies the patch. Grass supports its own undo/redo, JSON projects and glTF/OBJ mesh exports. Use Weather and Light while grass preview is active. The first three mesh LODs reduce plant density and widen retained blades; they are authoring mesh LODs, not the engine's GPU placement rings. Grass preview needs the Solstice renderer. Enable **Grass ON** in the viewport to add grass to the tree or forest scene; **Preview grass** isolates the patch for editing.
 
 ```
 grove-studio --headless --grass meadow --inspect
@@ -231,3 +231,25 @@ grove-studio --headless --grass meadow --format engine --out exports/grass-pack
 The **Engine bundle** button writes an optional procedural blade set under `exports/grass-PRESET-SEED/assets/grass`. Its eight 64x256 opaque PNGs use OpenPoseidon's loader filenames, layer order, and tip-at-top orientation. On compatible engine builds, point `WGR_GRASS_BLADE_DIR` to that `assets/grass` directory; the newer look2 loader supports this override. Grove does not install into the game directory. The bundle includes a JSON manifest, editable project and Solstice `.grass` source text. The engine retains its own clump geometry, species selection, terrain placement, density/ring LODs, trampling and rotor wash; these settings are not automatically imported from Grove. This set is procedural, not the engine's photographed look2 assets.
 
 MCP tools: `grass_presets`, `grass_inspect`, `grass_generate` (`gltf`, `obj`, or `engine`) and `grass_preview`. Outputs remain beneath the configured MCP output root. Grass P3D export is not provided; tree P3D and FOREST-PROXY exports remain available.
+
+
+## Combined scenes and navigation
+
+Use **Forest**, **Grass ON**, and **Sky ON** together to preview a planted forest with ground grass and the procedural sky. Each layer can be toggled independently. The Forest tab still controls species ratios, random mixing, and tree count. Grass presets and settings update the scene layer without switching back to the isolated patch. Weather controls cloud cover and wind; Light controls solar time and sun azimuth.
+
+**N** cycles Orbit / Fly / Walk, also available in the viewport. In Fly or Walk, use **WASD** to move, **Shift** to move four times faster, and drag inside the viewport to look around. **Q/E** move down/up in Fly. Walk fixes eye height to 1.7 m on the flat ground; it does not simulate collision with trees or the pond. **F** frames the scene and returns to Orbit. **F11** or Fullscreen toggles fullscreen. Controls retain their proportions on wide displays, with extra width used by the viewport.
+
+**Garden** loads a compact template inspired by Solstice Garden: birch, willow, old oak, shrub borders, lawn, and a simple pond. This is an original 32-tree preview composition, not the complete upstream garden bake, terrain or water renderer. Scene grass uses sparse LOD 2 geometry in a 64 m square for forest/garden scenes, or a 16 m square around an individual tree. It is a bounded authoring preview, not OpenPoseidon's camera-following GPU grass placement. The isolated patch editor retains the full grass mesh LODs.
+
+Sound starts off. Enable **Weather > Ambience** or press **M**, and adjust Sound volume. Wind, daytime chirps, nighttime insects and distance-triggered walking footsteps are synthesized locally; no recordings are downloaded. These are Grove's own ambience, not Solstice's lightning-synchronized thunder system.
+
+Saving a project also writes `NAME.json.scene.json` alongside its ordinary tree or grass JSON. Keep both files together to restore forest composition, grass settings, sky, clouds and solar lighting. Mesh exports remain individual tree/grass assets; this does not export a complete forest scene into the engine.
+
+```
+grove-studio --forest solstice-forest-oak,solstice-forest-birch --scene-grass --fullscreen
+grove-studio --garden
+grove-studio --headless --preview --forest solstice-oak,solstice-birch --scene-grass --distance 60 --out exports/scene.png
+grove-studio --headless --preview --garden --out exports/garden.png
+```
+
+MCP `tree_preview` also accepts `"garden": true` and `"sceneGrass": {"preset":"meadow","style":"poseidon","seed":42}`. Combine `sceneGrass` with the existing `forest`, `sky`, `skybox`, `timeOfDay` and `sunAzimuth` inputs. Six-blade clumps are the OpenPoseidon-inspired geometry choice; the grass presets and generated atlas originate in Solstice's Meadow generator, not an exact copy of OpenPoseidon's runtime grass.

@@ -19,3 +19,5 @@ Full dependency license and copyright notices are included in THIRD-PARTY-NOTICE
 The old oak and weeping willow presets and related growth ideas also draw on [Solstice Garden](https://github.com/SamG-Coder/solstice-garden) by SamG-Coder (MIT).
 
 Grass uses the existing MIT-licensed Solstice Meadow generator and its procedural plant atlas. Grove's optional OpenPoseidon grass bundle matches the reviewed engine loader's eight-layer file layout and orientation. Grass clump count, density-gap and wind ideas are adapted into Grove's own authoring code; no OpenPoseidon engine source or photographed assets are redistributed by this feature.
+
+The compact Garden preview draws on Solstice Garden's pond/specimen/grove composition, with Grove's own layout and simple pond surface. It does not reproduce the complete upstream bake. Ambience and footsteps are synthesized by Grove; no third-party recordings are bundled. The optional audio backend and decoders are credited in THIRD-PARTY-NOTICES.txt.

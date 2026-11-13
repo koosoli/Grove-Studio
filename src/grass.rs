@@ -51,6 +51,11 @@ impl Settings {
             ..Self::default()
         })
     }
+    /// A safe slider ceiling at the current patch size, with one blade of rounding margin.
+    pub fn max_density(&self) -> f32 {
+        let Some(m) = Meadow::by_name(&self.preset) else { return 0.05; };
+        (29999. / (self.size*self.size*(m.tufts_per_square_metre*m.blades_per_tuft.1 as f32+m.undergrowth_per_square_metre))).min(1.5)
+    }
     pub fn validate(&self) -> Result<(), String> {
         if !["solstice", "poseidon"].contains(&self.style.as_str()) {
             return Err("Grass style is solstice or poseidon".into());
@@ -400,6 +405,11 @@ mod tests {
     }
     #[test]
     fn limits_and_engine_layout() {
+        for preset in PRESETS {
+            let mut patch=Settings::preset(preset).unwrap();
+            patch.size=4.; patch.density=patch.max_density();
+            assert!(patch.validate().is_ok(),"the editor's largest {preset} patch must stay valid");
+        }
         let mut s = Settings::default();
         s.size = f32::NAN;
         assert!(s.validate().is_err());

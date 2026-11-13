@@ -3,6 +3,7 @@ mod agent;
 mod catalog;
 mod gamelod;
 mod grass;
+mod ambience;
 mod gui;
 mod log;
 mod poseidon;
@@ -22,7 +23,7 @@ fn main() {
     }
     let mut i = 0;
     while i < args.len() {
-        if ["--classic", "--structure", "--wind"].contains(&args[i].as_str()) {
+        if ["--classic", "--structure", "--wind", "--garden", "--scene-grass", "--fullscreen"].contains(&args[i].as_str()) {
             i += 1;
             continue;
         }
@@ -65,7 +66,8 @@ fn main() {
     }
     if args.iter().any(|arg| arg == "--classic")
         && (agent::option(&args, "--grass").is_some() || agent::option(&args, "--forest").is_some()
-            || agent::option(&args, "--preview-view").is_some())
+            || agent::option(&args, "--preview-view").is_some()
+            || args.iter().any(|a|["--garden","--scene-grass"].contains(&a.as_str())))
     {
         eprintln!("Grove Studio: forest and diagnostic views require the Solstice renderer.");
         std::process::exit(1);

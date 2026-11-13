@@ -12,6 +12,11 @@ use std::{
 
 const W: f32 = 1440.;
 const H: f32 = 900.;
+thread_local! { static CANVAS_WIDTH: Cell<f32> = const { Cell::new(W) }; }
+fn canvas_width() -> f32 { CANVAS_WIDTH.with(Cell::get) }
+fn extra_width() -> f32 { canvas_width() - W }
+fn viewport_width() -> f32 { 864. + extra_width() }
+
 // Distance change per wheel notch, as a fraction (0.05 is about 5 %; 14 notches double the range).
 const ZOOM_PER_NOTCH: f32 = 0.05;
 /// Smooth wind starts/stops and keep phase continuous when the speed slider changes.
@@ -307,14 +312,15 @@ impl Ui {
             y,
             TextParams {
                 font: self.font.as_ref(),
-                font_size: size as u16,
+                font_size: (size * self.scale).round().max(1.) as u16,
+                font_scale: 1. / self.scale,
                 color: c,
                 ..Default::default()
             },
         );
     }
     fn width(&self, s: &str, size: f32) -> f32 {
-        measure_text(s, self.font.as_ref(), size as u16, 1.).width
+        measure_text(s, self.font.as_ref(), (size * self.scale).round().max(1.) as u16, 1. / self.scale).width
     }
     fn center(&self, s: &str, r: Rect, size: f32, c: Color) {
         self.text(
@@ -559,9 +565,117 @@ enum Modal {
     BarkNormal,
     LeafAtlas,
 }
+/// Saved alongside the portable tree/grass JSON, leaving mesh export formats unchanged.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SceneState {
+    forest: bool,
+    forest_random: bool,
+    forest_floor: bool,
+    forest_share: Vec<f32>,
+    forest_count: u32,
+    scene_grass: bool,
+    garden: bool,
+    grass: crate::grass::Settings,
+    sky: bool,
+    skybox: usize,
+    cloud_cover: f32,
+    hours: f32,
+    azimuth: f32,
+}
+impl SceneState {
+    fn validate(&self) -> Result<(), String> {
+        self.grass.validate()?;
+        if self.forest_share.len() != crate::catalog::GROUPS.len()
+            || self
+                .forest_share
+                .iter()
+                .any(|v| !v.is_finite() || !(0. ..=1.).contains(v))
+            || self.forest_share.iter().sum::<f32>() <= 0.
+            || !(1..=1000).contains(&self.forest_count)
+            || self.skybox >= preview::SKYBOXES.len()
+            || !self.cloud_cover.is_finite()
+            || !(0. ..=1.).contains(&self.cloud_cover)
+            || !self.hours.is_finite()
+            || !(0. ..=24.).contains(&self.hours)
+            || !self.azimuth.is_finite()
+            || !(0. ..=360.).contains(&self.azimuth)
+        {
+            return Err("Invalid scene composition or lighting in project sidecar".into());
+        }
+        Ok(())
+    }
+    fn apply(self, e: &mut Editor) {
+        e.forest = self.forest;
+        e.forest_random = self.forest_random;
+        e.forest_floor = self.forest_floor;
+        e.forest_count = self.forest_count;
+        e.forest_share.copy_from_slice(&self.forest_share);
+        e.scene_grass = self.scene_grass;
+        e.garden = self.garden;
+        e.grass = self.grass;
+        e.sky = self.sky;
+        e.skybox = self.skybox;
+        e.cloud_cover = self.cloud_cover;
+        e.lighting = preview::Lighting {
+            hours: self.hours,
+            azimuth: self.azimuth,
+        };
+    }
+}
+#[cfg(test)]
+mod scene_project_tests {
+    use super::*;
+    #[test]
+    fn project_roundtrip_preserves_forest_grass_sky_and_validates_sidecar() {
+        let root = std::env::temp_dir().join(format!(
+            "grove-scene-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut e = Editor::new();
+        e.path = root.join("tree.json").to_string_lossy().into();
+        e.forest = true;
+        e.scene_grass = true;
+        e.sky = true;
+        e.skybox = 2;
+        e.cloud_cover = 0.65;
+        e.forest_count = 83;
+        e.grass = crate::grass::Settings::preset("tall").unwrap();
+        e.grass.seed = 482;
+        e.lighting.hours = 18.25;
+        let expected = e.scene_state();
+        e.project_action(true).unwrap();
+        e.forest = false;
+        e.scene_grass = false;
+        e.sky = false;
+        e.grass.seed = 5;
+        e.project_action(false).unwrap();
+        assert!(e.scene_state() == expected);
+        let mut invalid = expected.clone();
+        invalid.forest_share.clear();
+        assert!(invalid.validate().is_err());
+        invalid = expected;
+        invalid.cloud_cover = f32::NAN;
+        assert!(invalid.validate().is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 struct Editor {
+    scene_saved: Option<SceneState>,
     grass: crate::grass::Settings,
     grass_mode: bool,
+    scene_grass: bool,
+    garden: bool,
+    navigation: u32,
+    eye: Vec3,
+    fullscreen: bool,
+    ambience: bool,
+    volume: f32,
     grass_saved: crate::grass::Settings,
     grass_history: Vec<crate::grass::Settings>,
     grass_redo: Vec<crate::grass::Settings>,
@@ -630,8 +744,16 @@ impl Editor {
         let s = Settings::preset("solstice-oak").expect("built-in Solstice oak");
         let distance = s.height * 2.32;
         Self {
+            scene_saved: None,
             grass: crate::grass::Settings::default(),
             grass_mode: false,
+            scene_grass: false,
+            garden: false,
+            navigation: 0,
+            eye: Vec3::ZERO,
+            fullscreen: false,
+            ambience: false,
+            volume: 0.35,
             grass_saved: crate::grass::Settings::default(),
             grass_history: vec![], grass_redo: vec![],
             model: Model::new(&s, 0),
@@ -694,6 +816,31 @@ impl Editor {
             project_name: "Untitled grove".into(),
         }
     }
+    fn orbit_position(&self) -> Vec3 {
+        vec3(0., if self.grass_mode { 0.35 * self.grass.height_hint() } else { self.scene_height() * 0.49 }, 0.) + self.pan
+            + vec3(self.yaw.sin()*self.pitch.cos(), self.pitch.sin(), self.yaw.cos()*self.pitch.cos()) * self.distance
+    }
+    fn scene_state(&self) -> SceneState {
+        SceneState {forest:self.forest,forest_random:self.forest_random,forest_floor:self.forest_floor,
+            forest_share:self.forest_share.to_vec(),forest_count:self.forest_count,
+            scene_grass:self.scene_grass,garden:self.garden,grass:self.grass.clone(),sky:self.sky,
+            skybox:self.skybox,cloud_cover:self.cloud_cover,hours:self.lighting.hours,azimuth:self.lighting.azimuth}
+    }
+    fn cycle_navigation(&mut self) {
+        if self.navigation == 0 { self.eye=self.orbit_position(); }
+        self.navigation=(self.navigation+1)%3;
+        if self.navigation == 2 { self.eye.y=1.7; }
+        if self.navigation == 0 { self.frame(); }
+        self.rotate=false;
+    }
+    fn garden_template(&mut self) {
+        self.garden=true; self.forest=true; self.grass_mode=false;
+        self.scene_grass=true; self.grass=crate::grass::Settings::preset("lawn").unwrap();
+        self.grass.density=0.55;
+        self.forest_count=32; self.view=0; self.grid=false; self.frame();
+        self.distance=100.; self.pitch=0.48;
+        self.notice("Garden template: willow, oak, birch, hedges and pond. N: fly / walk.");
+    }
     fn rebuild(&mut self) {
         self.model = Model::new(&self.s, self.lod);
         self.dirty = self.s != self.saved;
@@ -703,6 +850,7 @@ impl Editor {
         self.status_until = get_time() + 5.;
     }
     fn apply_preset(&mut self, name: &str) {
+        self.garden=false;
         self.grass_mode=false;
         self.s = Settings::preset(name).unwrap();
         self.lod = 0;
@@ -720,7 +868,7 @@ impl Editor {
     }
     fn orbit(&mut self, delta: Vec2) {
         self.yaw -= delta.x * 0.008;
-        self.pitch = (self.pitch + delta.y * 0.006).clamp(-0.55, 1.1);
+        self.pitch = (self.pitch + delta.y * 0.006).clamp(if self.navigation==0 {-0.55}else{-1.45}, if self.navigation==0 {1.1}else{1.45});
     }
     /// Species in the stand: those with a non-zero share.
     fn forest_mask(&self) -> u128 {
@@ -735,6 +883,7 @@ impl Editor {
         preview::scene_height(&self.s, if self.forest { self.forest_mask() } else { 0 })
     }
     fn frame(&mut self) {
+        self.navigation = 0;
         self.yaw = 0.65;
         self.pitch = if self.grass_mode { 0.4 } else if self.forest { 0.44 } else { 0.15 };
         self.distance = if self.forest {
@@ -832,26 +981,35 @@ impl Editor {
         if self.path.is_empty() {
             return Err("Enter a project filename.".into());
         }
-        if self.grass_mode && save { self.grass.save(Path::new(&self.path))?; self.grass_saved=self.grass.clone(); self.dirty=false; return Ok(()); }
+        let sidecar=PathBuf::from(format!("{}.scene.json",self.path));
+        let scene=if !save && sidecar.exists() {
+            let state:SceneState=serde_json::from_slice(&fs::read(&sidecar).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+            state.validate()?; Some(state)
+        } else {None};
+        if save {
+            if self.grass_mode {self.grass.save(Path::new(&self.path))?;}
+            else {tree::save_project(&self.s,Path::new(&self.path))?;}
+            let state=self.scene_state(); state.validate()?;
+            tree::write(&sidecar,serde_json::to_vec_pretty(&state).map_err(|e|e.to_string())?)?;
+            self.scene_saved=Some(state); self.saved=self.s.clone(); self.grass_saved=self.grass.clone(); self.dirty=false;
+        }
         if !save {
             let value: serde_json::Value = serde_json::from_slice(&fs::read(&self.path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
             if value.get("preset").is_some() && value.get("species").is_none() {
                 self.grass = crate::grass::Settings::load(Path::new(&self.path))?;
-                self.grass_mode=true; self.grass_saved=self.grass.clone(); self.grass_history.clear();self.grass_redo.clear();self.tab=6; self.frame(); self.dirty=false; return Ok(());
+                if let Some(scene)=scene {scene.apply(self);}
+                self.grass_mode=true; self.grass_saved=self.grass.clone(); self.grass_history.clear();self.grass_redo.clear();self.tab=6;
+                self.scene_saved=Some(self.scene_state()); self.frame(); self.dirty=false; return Ok(());
             }
             self.grass_mode=false;
-        }
-        if save {
-            tree::save_project(&self.s, Path::new(&self.path))?;
-            self.saved = self.s.clone();
-            self.dirty = false;
-        } else {
             self.record_edit = false;
             let s = tree::load_project(Path::new(&self.path))?;
             self.history.push(self.s.clone());
             self.redo.clear();
             self.s = s;
+            if let Some(scene)=scene {scene.apply(self);} else {self.forest=false;self.garden=false;self.scene_grass=false;}
             self.saved = self.s.clone();
+            self.grass_saved=self.grass.clone(); self.scene_saved=Some(self.scene_state());
             self.rebuild();
             self.frame();
         }
@@ -910,14 +1068,15 @@ pub async fn run(args: Vec<String>) {
     }
     if args.iter().any(|arg| arg == "--structure") { e.view = 2; }
     if args.iter().any(|arg| arg == "--wind") { e.wind = true; }
-    let target = render_target(864, 730);
+    if args.iter().any(|a| a=="--garden") { e.garden_template(); }
+    if args.iter().any(|a| a=="--scene-grass") { e.scene_grass=true; }
+    e.fullscreen=args.iter().any(|a| a=="--fullscreen");
+    if e.fullscreen { set_fullscreen(true); }
+    e.scene_saved=Some(e.scene_state());
+    let mut audio = crate::ambience::Ambience::new().await;
+    let mut target = render_target(864, 730);
     // Macroquad negates Camera2D's Y zoom on the backbuffer. A positive zoom
     // keeps the layout's top-left origin aligned with mouse_position().
-    let ui_camera = Camera2D {
-        target: vec2(W * 0.5, H * 0.5),
-        zoom: vec2(2. / W, 2. / H),
-        ..Default::default()
-    };
     let mut textures = Textures::new(&e.s);
     let tree_material = load_material(
         ShaderSource::Glsl {
@@ -971,11 +1130,22 @@ pub async fn run(args: Vec<String>) {
         if frames == 1 {
             crate::log::log(format!("first frame: forest={} count={} mask={:#x} skybox={} tab={}", e.forest, e.forest_count, e.forest_mask(), e.skybox, e.tab));
         }
-        let scx = screen_width() / W;
-        let scy = screen_height() / H;
-        let (mx, my) = mouse_position();
-        ui.mouse = vec2(mx / scx, my / scy);
-        ui.scale = scx;
+        let scale=(screen_width()/W).min(screen_height()/H).max(0.1);
+        let logical_width=screen_width()/scale;
+        CANVAS_WIDTH.with(|w| w.set(logical_width));
+        let offset_y=(screen_height()-H*scale)*0.5;
+        let scx=scale; let scy=scale;
+        let ui_camera=Camera2D { target:vec2(logical_width*0.5,H*0.5),
+            zoom:vec2(2./logical_width,2./(screen_height()/scale)), ..Default::default() };
+        let (mx,my)=mouse_position();
+        ui.mouse=vec2(mx/scale,(my-offset_y)/scale);
+        ui.scale=scale;
+        let aspect=viewport_width()/730.;
+        let render_height=648_f32.min(2048./aspect).round() as u32;
+        let render_size=((render_height as f32*aspect).round() as u32,render_height);
+        if target.texture.width() as u32 != (viewport_width().round() as u32) {
+            target=render_target(viewport_width().round() as u32,730);
+        }
         ui.enabled = e.modal.is_none();
         let delta = ui.mouse - prev;
         prev = ui.mouse;
@@ -1062,7 +1232,7 @@ pub async fn run(args: Vec<String>) {
             let vp = Rect::new(
                 258.,
                 if e.forest { 198. } else { 162. },
-                864.,
+                viewport_width(),
                 if e.forest { 538. } else { 574. },
             );
             if vp.contains(ui.mouse) {
@@ -1071,9 +1241,10 @@ pub async fn run(args: Vec<String>) {
                     || (is_mouse_button_down(MouseButton::Right)
                         && !is_mouse_button_pressed(MouseButton::Right))
                 {
-                    e.orbit(delta)
+                    e.orbit(delta);
+                    if e.navigation != 0 { e.pitch=e.pitch.clamp(-1.45,1.45); }
                 }
-                if is_mouse_button_down(MouseButton::Middle) {
+                if e.navigation == 0 && is_mouse_button_down(MouseButton::Middle) {
                     let right = vec3(e.yaw.cos(), 0., -e.yaw.sin());
                     e.pan -= right * delta.x * e.distance * 0.001;
                     e.pan.y += delta.y * e.distance * 0.001;
@@ -1095,6 +1266,29 @@ pub async fn run(args: Vec<String>) {
             } else if ctrl && is_key_pressed(KeyCode::Y) {
                 e.redo()
             }
+            if is_key_pressed(KeyCode::F11) { e.fullscreen=!e.fullscreen; set_fullscreen(e.fullscreen); }
+            if !ctrl && is_key_pressed(KeyCode::N) { e.cycle_navigation(); }
+            if !ctrl && is_key_pressed(KeyCode::M) { e.ambience=!e.ambience; }
+            if e.navigation != 0 && !ctrl {
+                let forward=if e.navigation==2 { vec3(-e.yaw.sin(),0.,-e.yaw.cos()) }
+                    else { vec3(-e.yaw.sin()*e.pitch.cos(),-e.pitch.sin(),-e.yaw.cos()*e.pitch.cos()) };
+                let right=vec3(e.yaw.cos(),0.,-e.yaw.sin());
+                let mut movement=Vec3::ZERO;
+                if is_key_down(KeyCode::W) { movement+=forward; }
+                if is_key_down(KeyCode::S) { movement-=forward; }
+                if is_key_down(KeyCode::D) { movement+=right; }
+                if is_key_down(KeyCode::A) { movement-=right; }
+                if e.navigation==1 {
+                    if is_key_down(KeyCode::E) { movement.y+=1.; }
+                    if is_key_down(KeyCode::Q) { movement.y-=1.; }
+                }
+                let fast=is_key_down(KeyCode::LeftShift)||is_key_down(KeyCode::RightShift);
+                let speed=if e.navigation==2 { 2.2 } else { 6. } * if fast { 4. } else { 1. };
+                let distance=speed*get_frame_time().min(0.1);
+                e.eye+=movement.normalize_or_zero()*distance;
+                if e.navigation==2 { e.eye.y=1.7; }
+                if e.navigation==2 && movement.length_squared()>0. { audio.walk(distance); }
+            }
             if is_key_pressed(KeyCode::Space) {
                 e.reroll()
             }
@@ -1104,7 +1298,7 @@ pub async fn run(args: Vec<String>) {
             if is_key_pressed(KeyCode::G) {
                 e.grid = !e.grid
             }
-            if !e.forest && is_key_pressed(KeyCode::W) {
+            if e.navigation == 0 && !e.forest && is_key_pressed(KeyCode::W) {
                 e.view = if e.view == 1 { 0 } else { 1 }
             }
             if is_key_pressed(KeyCode::B) {
@@ -1136,17 +1330,22 @@ pub async fn run(args: Vec<String>) {
         }
         wind_playback.step(e.wind, e.wind_speed, e.branch_springiness, get_frame_time());
         let center = vec3(0., if e.grass_mode { 0.35 * e.grass.height_hint() } else { e.scene_height() * 0.49 }, 0.) + e.pan;
-        let pos = center
+        let pos = if e.navigation != 0 { e.eye } else { center
             + vec3(
                 e.yaw.sin() * e.pitch.cos(),
                 e.pitch.sin(),
                 e.yaw.cos() * e.pitch.cos(),
-            ) * e.distance;
+            ) * e.distance };
+        audio.update(e.ambience, e.volume, e.wind_strength, e.lighting.hours);
         let scene = preview::SceneKey {
             grass: e.grass_mode.then(|| e.grass.clone()),
+            scene_grass: (!e.grass_mode && e.scene_grass).then(|| e.grass.clone()),
+            garden: e.garden,
             settings: e.s.clone(),
             lod: if e.auto_lod && e.game_preview {
-                Some(if e.distance > e.scene_height() * 10. { 3 } else if e.distance > e.scene_height() * 5. { 2 } else if e.distance > e.scene_height() * 2.8 { 1 } else { 0 })
+                // In first person, let the cluster DAG choose detail per instance rather
+                // than freezing every tree at the old orbit camera's distance.
+                if e.navigation != 0 { None } else { Some(if e.distance > e.scene_height() * 10. { 3 } else if e.distance > e.scene_height() * 5. { 2 } else if e.distance > e.scene_height() * 2.8 { 1 } else { 0 }) }
             } else { (!e.auto_lod).then_some(e.lod) },
             forest: if e.forest { e.forest_mask() } else { 0 },
             count: e.forest_count,
@@ -1182,7 +1381,8 @@ pub async fn run(args: Vec<String>) {
                         preview_fps_frames = 0;
                         preview_fps_start = now;
                     }
-                    let (w, h) = preview::SIZE;
+                    let (w, h) = frame.size;
+                    if preview_texture.as_ref().is_some_and(|t: &Texture2D| t.width() as u32 != w || t.height() as u32 != h) { preview_texture=None; }
                     if let Some(texture) = &preview_texture {
                         Texture2D::update_from_bytes(texture, w, h, &frame.pixels);
                     } else {
@@ -1209,6 +1409,7 @@ pub async fn run(args: Vec<String>) {
         if use_solstice {
             if let Some(renderer) = worker.as_mut() {
                 renderer.request(preview::Request {
+                    size: render_size,
                     scene: scene.clone(),
                     camera: solstice_render::Camera {
                         position: ::glam::Vec3::from_array(pos.to_array()),
@@ -1244,10 +1445,10 @@ pub async fn run(args: Vec<String>) {
         if !awaiting_solstice {
             set_camera(&Camera3D {
                 position: pos,
-                target: center,
+                target: if e.navigation==0 { center } else { pos-vec3(e.yaw.sin()*e.pitch.cos(),e.pitch.sin(),e.yaw.cos()*e.pitch.cos()) },
                 up: Vec3::Y,
                 fovy: 40_f32.to_radians(),
-                aspect: Some(864. / 730.),
+                aspect: Some(viewport_width() / 730.),
                 render_target: Some(target.clone()),
                 z_near: 0.05,
                 z_far: 150.,
@@ -1343,14 +1544,15 @@ pub async fn run(args: Vec<String>) {
                 72.,
                 WHITE,
                 DrawTextureParams {
-                    dest_size: Some(vec2(864., 730.)),
+                    dest_size: Some(vec2(viewport_width(), 730.)),
                     flip_y: !showing_solstice,
                     ..Default::default()
                 },
             );
         } else {
-            draw_rectangle(258., 72., 864., 730., col(0xf4f6f0));
+            draw_rectangle(258., 72., viewport_width(), 730., col(0xf4f6f0));
         }
+        e.dirty = e.s!=e.saved || e.grass!=e.grass_saved || e.scene_saved.as_ref().is_some_and(|state| *state!=e.scene_state());
         header(&ui, &mut e);
         library(&ui, &mut e);
         inspector(&ui, &mut e, worker.is_some());
@@ -1383,7 +1585,7 @@ pub async fn run(args: Vec<String>) {
                 format!("Loading{dots}")
             };
             let width = ui.width(&label, 12.) + 24.;
-            let x = 1112. - width;
+            let x = 1112.+extra_width() - width;
             rounded(Rect::new(x, 778., width, 22.), 6., col(0xe8eee4));
             ui.text(&label, x + 12., 793., 12., ink());
         }
@@ -1425,7 +1627,7 @@ pub async fn run(args: Vec<String>) {
                 let screen = get_screen_data();
                 let mut pixels = vec![];
                 // Compare only the 3D viewport, excluding changed slider text and UI.
-                for y in (170. * scy) as usize..(700. * scy) as usize {
+                for y in (offset_y + 170. * scy) as usize..(offset_y + 700. * scy) as usize {
                     let a = (y * screen.width as usize + (300. * scx) as usize) * 4;
                     let b = (y * screen.width as usize + (1080. * scx) as usize) * 4;
                     pixels.extend_from_slice(&screen.bytes[a..b]);
@@ -1551,7 +1753,7 @@ fn disc(p: Vec3, rx: f32, rz: f32, c: Color) {
 }
 
 fn header(ui: &Ui, e: &mut Editor) {
-    draw_rectangle(0., 0., W, 72., col(0x172a22));
+    draw_rectangle(0., 0., canvas_width(), 72., col(0x172a22));
     tree_icon(35., 18., 29., "oak", mint());
     ui.text("grove", 59., 40., 28., col(0xf1f7e9));
     ui.text("S T U D I O", 143., 39., 11., col(0xa5b99f));
@@ -1572,31 +1774,31 @@ fn header(ui: &Ui, e: &mut Editor) {
         11.,
         col(0x9dad9d),
     );
-    if ui.button("Undo", Rect::new(816., 21., 64., 32.), 3) {
+    if ui.button("Undo", Rect::new(816.+extra_width(), 21., 64., 32.), 3) {
         e.undo()
     }
     if ui.button(
         if dark_mode() { "Light" } else { "Dark" },
-        Rect::new(730., 21., 75., 32.),
+        Rect::new(730.+extra_width(), 21., 75., 32.),
         3,
     ) {
         if let Err(error) = toggle_theme() {
             e.notice(error);
         }
     }
-    if ui.button("Redo", Rect::new(890., 21., 64., 32.), 3) {
+    if ui.button("Redo", Rect::new(890.+extra_width(), 21., 64., 32.), 3) {
         e.redo()
     }
-    if ui.button("Open", Rect::new(964., 21., 65., 32.), 3) {
+    if ui.button("Open", Rect::new(964.+extra_width(), 21., 65., 32.), 3) {
         e.open_modal(Modal::Open)
     }
-    if ui.button("Save project", Rect::new(1039., 21., 118., 32.), 3) {
+    if ui.button("Save project", Rect::new(1039.+extra_width(), 21., 118., 32.), 3) {
         e.open_modal(Modal::Save)
     }
-    if ui.button("Export model  >", Rect::new(1177., 16., 205., 42.), 1) {
+    if ui.button("Export model  >", Rect::new(1177.+extra_width(), 16., 205., 42.), 1) {
         e.open_modal(Modal::Export)
     }
-    if ui.button("?", Rect::new(1394., 23., 27., 28.), 3) {
+    if ui.button("?", Rect::new(1394.+extra_width(), 23., 27., 28.), 3) {
         e.open_modal(Modal::Help)
     }
 }
@@ -1623,7 +1825,7 @@ fn library(ui: &Ui, e: &mut Editor) {
     draw_rectangle(0., 72., 258., 796., col(0xf6f7f2));
     draw_line(257., 72., 257., 868., 1., line());
     ui.text("T R E E   L I B R A R Y", 22., 106., 11., muted());
-    for (i, name) in ["Solstice", "CWA"].iter().enumerate() {
+    for (i, name) in ["Solstice", "OpenPoseidon"].iter().enumerate() {
         if ui.button(
             name,
             Rect::new(18. + i as f32 * 112., 124., 107., 31.),
@@ -1743,7 +1945,7 @@ fn library(ui: &Ui, e: &mut Editor) {
     }
 }
 fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
-    let x = 1122.;
+    let x = canvas_width()-318.;
     let p = x + 28.;
     draw_rectangle(x, 72., 318., 796., col(0xfafbF7));
     draw_line(x, 72., x, 868., 1., line());
@@ -1781,16 +1983,18 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
         let before=e.grass.clone();
         ui.heading("07", "Grass generator", p, 223.);
         if ui.button(if e.grass_mode { "Preview trees" } else { "Preview grass" }, Rect::new(p,238.,262.,28.),0) {
-            e.grass_mode=!e.grass_mode; e.forest=false; e.view=0; e.leaves=true; e.frame();
+            e.grass_mode=!e.grass_mode; e.view=0; e.leaves=true; e.frame();
         }
         for (i,name) in crate::grass::PRESETS.iter().enumerate() {
             if ui.button(name,Rect::new(p+i as f32*52.,279.,50.,26.),if e.grass.preset==*name {2}else{0}) {
-                e.grass=crate::grass::Settings::preset(name).unwrap(); e.grass_mode=true; e.view=0; e.leaves=true; e.frame();
+                e.grass=crate::grass::Settings::preset(name).unwrap(); e.view=0; e.leaves=true; e.frame();
             }
         }
         for (i,(id,label)) in [("solstice","Full tufts"),("poseidon","Six-blade clumps")].iter().enumerate(){ if ui.button(label,Rect::new(p+i as f32*132.,312.,128.,24.),if e.grass.style==*id{2}else{0}){e.grass.style=(*id).into();} }
         ui.slider("Patch size",&mut e.grass.size,0.25,4.,p,350.,"m");
-        ui.slider("Density",&mut e.grass.density,0.05,1.5,p,388.,"%");
+        let maximum_density=e.grass.max_density();
+        e.grass.density=e.grass.density.min(maximum_density);
+        ui.slider("Density",&mut e.grass.density,0.05,maximum_density,p,388.,"%");
         ui.slider("Blade height",&mut e.grass.height,0.25,2.,p,426.,"x");
         ui.slider("Blade width",&mut e.grass.width,0.5,3.,p,464.,"x");
         ui.slider("Blade bend",&mut e.grass.lean,0.,1.5,p,502.,"x");
@@ -1803,8 +2007,9 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
         }
         ui.slider("Bare gaps",&mut e.grass.patchiness,0.,1.,p,655.,"%");
         ui.text(&format!("Seed {} / 3 mesh LODs",e.grass.seed),p,708.,12.,muted());
-        ui.text("Save/Open project and Export model",p,730.,11.,muted());
-        ui.text("also work for the active grass patch.",p,748.,11.,muted());
+        if ui.button(if e.scene_grass {"Scene grass: ON"}else{"Scene grass: OFF"},Rect::new(p,720.,262.,27.),if e.scene_grass {2}else{0}) { e.scene_grass=!e.scene_grass; e.grass_mode=false; e.view=0; e.frame(); }
+        ui.text("Preview grass isolates the editable patch.",p,771.,11.,muted());
+        ui.text("Scene grass uses these settings in the stand.",p,792.,10.,muted());
         if let Err(err)=e.grass.validate() {ui.text(&err,p,780.,10.,muted());}
         if e.grass!=before { e.grass_history.push(before);if e.grass_history.len()>60{e.grass_history.remove(0);}e.grass_redo.clear();e.dirty=e.grass!=e.grass_saved; }
         return;
@@ -1977,6 +2182,14 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
         ui.slider("Gust strength", &mut e.wind_gust, 0., 1., p, 506., "%");
         ui.slider("Leaf flutter", &mut e.leaf_flutter, 0., 2., p, 535., "%");
         ui.slider("Wind direction", &mut e.wind_direction, 0., 360., p, 564., "°");
+        ui.heading("03", "Scene sound", p, 628.);
+        if ui.button(if e.ambience {"Ambience ON  M"}else{"Ambience OFF  M"}, Rect::new(p,647.,262.,28.), if e.ambience {2}else{0}) {
+            e.ambience=!e.ambience;
+        }
+        ui.slider("Sound volume",&mut e.volume,0.,1.,p,716.,"%");
+        ui.text("Wind, birds by day, insects at night.",p,763.,11.,muted());
+        ui.text("Walking adds footsteps. Sound starts off.",p,784.,11.,muted());
+        return;
     } else if e.tab == 4 {
         ui.heading("01", "Leaf lighting", p, 229.);
         if ui.button(if e.leaf_specular { "Leaf specular: ON" } else { "Leaf specular: OFF" }, Rect::new(p, 250., 252., 32.), if e.leaf_specular { 2 } else { 0 }) {
@@ -2007,7 +2220,7 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
         }
         let mut count = e.forest_count as f32;
         if ui.slider("Trees in the stand", &mut count, 10., 1000., p, 262., "") {
-            e.forest_count = count.round() as u32;
+            e.garden=false; e.forest_count = count.round() as u32;
         }
         let groups = crate::catalog::GROUPS;
         let pages = groups.len().div_ceil(FOREST_PAGE);
@@ -2029,7 +2242,7 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
                     .filter(|(j, _)| *j != i)
                     .map(|(_, s)| *s)
                     .sum();
-                e.forest_share[i] = if others + value > 0. { value } else { previous };
+                e.garden=false; e.forest_share[i] = if others + value > 0. { value } else { previous };
                 if !e.forest {
                     e.forest = true;
                     e.frame();
@@ -2051,7 +2264,7 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
         if ui.button(">", Rect::new(p + 222., 566., 40., 26.), 0) && e.forest_page + 1 < pages {
             e.forest_page += 1;
         }
-    }    draw_line(p, 600., 1412., 600., 1., line());
+    }    draw_line(p, 600., p+262., 600., 1., line());
     ui.text("VARIATION SEED", p, 616., 10., muted());
     if ui.button("-", Rect::new(p, 625., 31., 32.), 0) {
         e.s.seed = e.s.seed.wrapping_sub(1)
@@ -2135,7 +2348,7 @@ fn viewport_ui(ui: &Ui, e: &mut Editor, stats: Option<(u32, u32)>, renderer: &st
             "solstice-old_oak" => "Solstice old oak",
             _ => "Solstice oak",
         });    ui.text(
-        if e.grass_mode { "Grass patch" } else if e.forest { "Forest preview" } else { name },
+        if e.grass_mode { "Grass patch" } else if e.garden { "Garden template" } else if e.forest { "Forest preview" } else { name },
         284.,
         145.,
         29.,
@@ -2159,38 +2372,38 @@ fn viewport_ui(ui: &Ui, e: &mut Editor, stats: Option<(u32, u32)>, renderer: &st
     ui.text(renderer, 285., 192., 10., ink());
     let fps = preview_fps.map(|n| format!("Preview {n:.0} FPS  /  UI {} FPS", get_fps()))
         .unwrap_or_else(|| format!("Preview -- FPS  /  UI {} FPS", get_fps()));
-    rounded(Rect::new(914., 172., 184., 25.), 5., col(0xf7f9f2));
-    ui.center(&fps, Rect::new(914., 172., 184., 25.), 10., ink());
-    if gpu && !e.grass_mode && ui.button(if e.game_preview { "Game cards" } else { "Original leaves" }, Rect::new(783., 136., 145., 29.), if e.game_preview { 2 } else { 0 }) {
+    rounded(Rect::new(914.+extra_width(), 172., 184., 25.), 5., col(0xf7f9f2));
+    ui.center(&fps, Rect::new(914.+extra_width(), 172., 184., 25.), 10., ink());
+    if gpu && !e.grass_mode && ui.button(if e.game_preview { "Game cards" } else { "Original leaves" }, Rect::new(783.+extra_width(), 136., 145., 29.), if e.game_preview { 2 } else { 0 }) {
         e.game_preview = !e.game_preview;
         if !e.game_preview && e.lod > 2 { e.lod = 2; }
         e.view = 0;
     }
-    if gpu && !e.grass_mode && e.game_preview && ui.button(if e.trim_cards { "Trim ON" } else { "Trim OFF" }, Rect::new(936., 136., 162., 29.), if e.trim_cards { 2 } else { 0 }) {
+    if gpu && !e.grass_mode && e.game_preview && ui.button(if e.trim_cards { "Trim ON" } else { "Trim OFF" }, Rect::new(936.+extra_width(), 136., 162., 29.), if e.trim_cards { 2 } else { 0 }) {
         e.trim_cards = !e.trim_cards;
         e.view = 0;
     }
     if gpu && !e.grass_mode && e.game_preview && ((!e.auto_lod && e.lod == 0) || (e.auto_lod && e.distance <= e.scene_height() * 2.8)) {
-        rounded(Rect::new(914., 201., 184., 24.), 5., col(0xf7f9f2));
-        ui.center("Trim applies from Mid onward", Rect::new(914., 201., 184., 24.), 10., ink());
+        rounded(Rect::new(914.+extra_width(), 201., 184., 24.), 5., col(0xf7f9f2));
+        ui.center("Trim applies from Mid onward", Rect::new(914.+extra_width(), 201., 184., 24.), 10., ink());
     }
     if gpu
         && ui.button(
             if e.forest { "Single tree" } else { "Forest" },
-            Rect::new(681., 97., 93., 26.),
+            Rect::new(681.+extra_width(), 97., 93., 26.),
             if e.forest { 2 } else { 0 },
         )
     {
-        e.forest = !e.forest;
+        e.garden=false; e.forest = !e.forest;
         if e.forest { e.grass_mode=false; }
         e.view = 0;
         e.frame();
     }
     if !e.forest && !e.grass_mode {
         let labels = ["Shaded", "Wireframe", "Structure"];
-        rounded(Rect::new(783., 93., 315., 34.), 7., col(0xf7f9f2));
+        rounded(Rect::new(783.+extra_width(), 93., 315., 34.), 7., col(0xf7f9f2));
         for (i, s) in labels.iter().enumerate() {
-            let r = Rect::new(787. + i as f32 * 103., 97., 101., 26.);
+            let r = Rect::new(787.+extra_width() + i as f32 * 103., 97., 101., 26.);
             if e.view == i as u32 {
                 rounded(r, 4., col(0xe1e9d8));
             }
@@ -2203,6 +2416,16 @@ fn viewport_ui(ui: &Ui, e: &mut Editor, stats: Option<(u32, u32)>, renderer: &st
             }
         }
     }
+    if ui.button(["Orbit  N", "Fly  N", "Walk  N"][e.navigation as usize], Rect::new(282., 698., 92., 29.), if e.navigation>0 {2}else{0}) { e.cycle_navigation(); }
+    if ui.button("Garden",Rect::new(384.,698.,85.,29.),0) { e.garden_template(); }
+    if ui.button(if e.scene_grass {"Grass ON"}else{"Grass OFF"},Rect::new(479.,698.,85.,29.),if e.scene_grass {2}else{0}) {
+        e.scene_grass=!e.scene_grass;
+        if e.grass_mode { e.grass_mode=false; e.frame(); }
+        e.view=0;
+    }
+    if ui.button("Fullscreen",Rect::new(574.,698.,93.,29.),0) { e.fullscreen=!e.fullscreen; set_fullscreen(e.fullscreen); }
+    if ui.button(if e.sky {"Sky ON"}else{"Sky OFF"},Rect::new(677.,698.,85.,29.),if e.sky {2}else{0}) { e.sky=!e.sky; }
+    if e.navigation!=0 { ui.text("WASD move / Shift faster / drag look / Q E up-down (fly)",282.,687.,11.,ink()); }
     if ui.button(
         if e.rotate {
             "Pause orbit"
@@ -2235,7 +2458,7 @@ fn viewport_ui(ui: &Ui, e: &mut Editor, stats: Option<(u32, u32)>, renderer: &st
         .iter()
         .position(|(mode, _)| *mode == e.debug)
         .unwrap_or(0);
-    if gpu && ui.button(views[view].1, Rect::new(911., 740., 109., 30.), 0) {
+    if gpu && ui.button(views[view].1, Rect::new(911.+extra_width(), 740., 109., 30.), 0) {
         e.debug = views[(view + 1) % views.len()].0;
         e.view = 0;
     }
@@ -2269,7 +2492,7 @@ fn viewport_ui(ui: &Ui, e: &mut Editor, stats: Option<(u32, u32)>, renderer: &st
         11.,
         col(0x5c7055),
     );
-    let o = vec2(1061., 730.);
+    let o = vec2(1061.+extra_width(), 730.);
     let right = vec3(e.yaw.cos(), 0., -e.yaw.sin());
     let backward = vec3(
         e.yaw.sin() * e.pitch.cos(),
@@ -2290,8 +2513,8 @@ fn viewport_ui(ui: &Ui, e: &mut Editor, stats: Option<(u32, u32)>, renderer: &st
     }
 }
 fn lod_strip(ui: &Ui, e: &mut Editor) {
-    draw_rectangle(258., 802., 864., 66., col(0xf3f5ee));
-    draw_line(258., 802., 1122., 802., 1., line());
+    draw_rectangle(258., 802., viewport_width(), 66., col(0xf3f5ee));
+    draw_line(258., 802., canvas_width()-318., 802., 1., line());
     if ui.button(
         "Auto LOD   0",
         Rect::new(280., 813., 168., 44.),
@@ -2308,7 +2531,7 @@ fn lod_strip(ui: &Ui, e: &mut Editor) {
     .iter()
     .enumerate()
     {
-        let r = if e.game_preview && !e.grass_mode { Rect::new(450. + i as f32 * 165., 813., 157., 44.) } else { Rect::new(467. + i as f32 * 209., 813., 199., 44.) };
+        let step=(viewport_width()-208.)/labels.len() as f32; let r=Rect::new(450.+i as f32*step,813.,step-8.,44.);
         let active = !e.auto_lod && e.lod == i as u32;
         rounded(r, 6., if active { col(0xe0ead6) } else { col(0xebeee5) });
         ui.text(
@@ -2333,12 +2556,12 @@ fn lod_strip(ui: &Ui, e: &mut Editor) {
     }
 }
 fn footer(ui: &Ui, e: &Editor) {
-    draw_rectangle(0., 868., W, 32., col(0x21372b));
+    draw_rectangle(0., 868., canvas_width(), 32., col(0x21372b));
     draw_circle(19., 884., 3., mint());
     ui.text(&e.status, 30., 889., 11., col(0xc9d8bf));
     ui.text(
         "Drag: orbit    /    Wheel: zoom    /    Middle drag: pan    /    Space: variation",
-        793.,
+        canvas_width()-647.,
         889.,
         10.,
         col(0x9db296),
@@ -2353,7 +2576,7 @@ fn commas(n: usize) -> String {
 }
 
 fn modal(ui: &Ui, e: &mut Editor, m: Modal) {
-    draw_rectangle(0., 0., W, H, Color::new(0.07, 0.07, 0.08, 0.58));
+    draw_rectangle(0., 0., canvas_width(), H, Color::new(0.07, 0.07, 0.08, 0.58));
     let r = Rect::new(408., 216., 624., 470.);
     rounded(
         Rect::new(r.x + 6., r.y + 8., r.w, r.h),
@@ -2438,13 +2661,13 @@ fn modal(ui: &Ui, e: &mut Editor, m: Modal) {
             muted(),
         );
         for (i, (a, b)) in [
-            ("Left / right drag", "Orbit the tree"),
-            ("Middle drag / wheel", "Pan / zoom"),
-            ("F / G / W", "Frame / grid / wireframe"),
-            ("Space / 0, 1, 2, 3", "New variation / detail level"),
-            ("B / T", "Wind / light and dark theme"),
-            ("Ctrl+S / Ctrl+O", "Save / open settings"),
-            ("Ctrl+Z / Ctrl+Y", "Undo / redo"),
+            ("N / WASD / Shift", "Orbit-fly-walk / move / faster"),
+            ("Drag / Q E (fly)", "Look / move down-up"),
+            ("F / G / F11", "Frame / grid / fullscreen"),
+            ("Wheel / middle drag", "Zoom / pan in orbit mode"),
+            ("B / T / M", "Wind / theme / ambience"),
+            ("Space / 0, 1, 2, 3", "Variation / detail level"),
+            ("Ctrl+S O / Ctrl+Z Y", "Save-open / undo-redo"),
         ]
         .iter()
         .enumerate()

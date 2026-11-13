@@ -21,6 +21,8 @@ const TEX_SIZE: u32 = 256;
 pub struct SceneKey {
     pub settings: Settings,
     pub grass: Option<crate::grass::Settings>,
+    pub scene_grass: Option<crate::grass::Settings>,
+    pub garden: bool,
     pub lod: Option<u32>,
     pub forest: u128,
     pub count: u32,
@@ -153,6 +155,7 @@ pub fn camera_for(settings: &Settings, forest: u128, count: u32, distance: Optio
 }
 
 pub struct Request {
+    pub size: (u32,u32),
     pub scene: SceneKey,
     pub camera: Camera,
     pub debug: DebugView,
@@ -207,6 +210,7 @@ impl Lighting {
 }
 
 pub struct Frame {
+    pub size: (u32,u32),
     pub scene: SceneKey,
     pub debug: DebugView,
     pub pixels: Vec<u8>,
@@ -269,7 +273,7 @@ pub fn capture(request: Request, path: &std::path::Path) -> Result<Frame, String
         .receive
         .recv_timeout(Duration::from_secs(120))
         .map_err(|error| format!("Waiting for Solstice preview: {error}"))??;
-    let image = image::RgbaImage::from_raw(SIZE.0, SIZE.1, frame.pixels.clone())
+    let image = image::RgbaImage::from_raw(frame.size.0, frame.size.1, frame.pixels.clone())
         .ok_or("Solstice returned an incomplete frame")?;
     let mut buffer = std::io::Cursor::new(Vec::new());
     image
@@ -294,34 +298,50 @@ fn run_worker(
     ))
     .map_err(|error| error.to_string())?;
     crate::log::log("Solstice: GPU ready");
-    let extent = wgpu::Extent3d {
-        width: SIZE.0,
-        height: SIZE.1,
-        depth_or_array_layers: 1,
-    };
-    let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("Grove viewport"),
-        size: extent,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let view = texture.create_view(&Default::default());
-    let row_bytes = SIZE.0 * 4;
-    debug_assert_eq!(row_bytes % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 0);
-    let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Grove viewport transfer"),
-        size: u64::from(row_bytes) * u64::from(SIZE.1),
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
     let mut active: Option<(SceneKey, Renderer)> = None;
     let (bake_send, bake_receive) = mpsc::channel();
     let mut baking = false;
+    let mut targets: Option<((u32, u32), wgpu::Texture, wgpu::Buffer)> = None;
     while let Ok(request) = requests.recv() {
+        let size = (
+            request.size.0.clamp(256, 2048),
+            request.size.1.clamp(256, 1440),
+        );
+        if targets.as_ref().is_none_or(|(old, _, _)| *old != size) {
+            let extent = wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            };
+            let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Grove viewport"),
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let row_bytes = (size.0 * 4).div_ceil(256) * 256;
+            debug_assert_eq!(row_bytes % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 0);
+            let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Grove viewport transfer"),
+                size: u64::from(row_bytes) * u64::from(size.1),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            targets = Some((size, texture, staging));
+        }
+        let (_, texture, staging) = targets.as_ref().unwrap();
+        let view = texture.create_view(&Default::default());
+        let row_bytes = (size.0 * 4).div_ceil(256) * 256;
+        let extent = wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        };
+
         let mut ready = None;
         if baking {
             if let Ok((key, result)) = bake_receive.try_recv() {
@@ -332,7 +352,10 @@ fn run_worker(
             }
         }
         if active.is_none() {
-            crate::log::log(format!("Solstice: building first scene ({} trees)", request.scene.count));
+            crate::log::log(format!(
+                "Solstice: building first scene ({} trees)",
+                request.scene.count
+            ));
             ready = Some((request.scene.clone(), build_scene(&request.scene)?));
             crate::log::log("Solstice: first scene built");
         } else if !baking
@@ -370,8 +393,14 @@ fn run_worker(
         renderer.settings_mut().vegetation_wind = request
             .wind_time
             .map(|t| t % 10000. + ((request.wind_direction / 22.5).round() % 16.) * 10000.);
-        renderer.settings_mut().vegetation_wind_parameters = glam::Vec4::new(request.wind_strength, request.wind_gust, request.leaf_flutter, request.branch_sway);
-        renderer.settings_mut().vegetation_wind_dynamics = glam::Vec4::new(request.branch_springiness, 0., 0., 0.);
+        renderer.settings_mut().vegetation_wind_parameters = glam::Vec4::new(
+            request.wind_strength,
+            request.wind_gust,
+            request.leaf_flutter,
+            request.branch_sway,
+        );
+        renderer.settings_mut().vegetation_wind_dynamics =
+            glam::Vec4::new(request.branch_springiness, 0., 0., 0.);
         renderer.settings_mut().show_sky = request.sky;
         renderer.settings_mut().clouds = request.sky;
         // A fixed skybox: the renderer's own weather cycle stays off while the editor drives it.
@@ -384,7 +413,7 @@ fn run_worker(
         renderer.settings_mut().temporal_accumulation = request.debug == DebugView::Lit;
         // Allow the initial GI and visibility histories to accumulate before displaying a scene.
         for _ in 0..if new_scene { 5 } else { 1 } {
-            renderer.render(&gpu, &request.camera, &environment, &view, SIZE, 1. / 60.);
+            renderer.render(&gpu, &request.camera, &environment, &view, size, 1. / 60.);
             if new_scene {
                 // Let the asynchronous culling statistics map and get collected by the
                 // following frame, including when this is a single offscreen capture.
@@ -404,7 +433,7 @@ fn run_worker(
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(row_bytes),
-                    rows_per_image: Some(SIZE.1),
+                    rows_per_image: Some(size.1),
                 },
             },
             extent,
@@ -426,15 +455,21 @@ fn run_worker(
             .recv_timeout(Duration::from_secs(1))
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())?;
-        let pixels = staging
-            .slice(..)
-            .get_mapped_range()
-            .map_err(|error| error.to_string())?
-            .to_vec();
+        let pixels = {
+            let mapped = staging
+                .slice(..)
+                .get_mapped_range()
+                .map_err(|e| e.to_string())?;
+            mapped
+                .chunks_exact(row_bytes as usize)
+                .flat_map(|row| row[..size.0 as usize * 4].iter().copied())
+                .collect()
+        };
         staging.unmap();
         let stats = renderer.stats();
         if results
             .send(Ok(Frame {
+                size,
                 scene: active_key.clone(),
                 debug: request.debug,
                 pixels,
@@ -914,6 +949,142 @@ fn species_asset(settings: &Settings, lod: u32, game_cards: bool, trim_cards: bo
     cache.insert(key, asset.clone());
     Ok(asset)
 }
+/// A compact preview composition inspired by Garden's willow/oak pond and birch grove.
+/// This deliberately does not import its billion-triangle terrain and planting bake.
+fn garden_placements(seed: u32) -> Vec<(usize, Mat4)> {
+    let mut placed = Vec::new();
+    let mut add = |kind: usize, x: f32, z: f32, scale: f32| {
+        placed.push((
+            kind,
+            Mat4::from_scale_rotation_translation(
+                Vec3::splat(scale),
+                glam::Quat::from_rotation_y((x * 1.7 + z * 0.3 + seed as f32).sin() * 3.),
+                Vec3::new(x, 0., z),
+            ),
+        ))
+    };
+    for (x, z) in [(-13., -7.), (15., 5.), (-9., 15.)] {
+        add(1, x, z, 1.);
+    }
+    for (x, z) in [(-26., -22.), (23., -20.), (28., 23.)] {
+        add(2, x, z, 1.);
+    }
+    for i in 0..10 {
+        add(
+            0,
+            -30. + (i % 3) as f32 * 6.,
+            8. + (i / 3) as f32 * 7.,
+            0.85 + (i % 3) as f32 * 0.08,
+        );
+    }
+    for i in 0..16 {
+        add(3, -27. + i as f32 * 3.6, -32., 1.);
+    }
+    placed
+}
+
+fn in_pond(x: f32, z: f32, margin: f32) -> bool {
+    ((x + 3.) / (8. + margin)).powi(2) + ((z + 3.) / (5. + margin)).powi(2) < 1.
+        || ((x - 3.) / (6. + margin)).powi(2) + ((z - 3.) / (7. + margin)).powi(2) < 1.
+}
+
+fn add_scene_grass(
+    scene: &mut SceneAsset,
+    settings: &crate::grass::Settings,
+    stand: bool,
+    garden: bool,
+) -> Result<(), String> {
+    settings.validate()?;
+    let mut patch = settings.clone();
+    patch.size = 4.;
+    // Scene coverage uses a sparse budget, separate from the isolated patch editor.
+    // In particular, a full-density 4 m lawn exceeds the authoring allocation limit.
+    patch.density = (settings.density * 0.2).clamp(0.05, 0.2);
+    // Sparse, wider blades at the scene scale. The dedicated patch editor retains all LODs.
+    let mesh = patch.mesh(2)?;
+    let index = scene.meshes.len() as u32;
+    scene
+        .meshes
+        .push(build_virtual_mesh(&mesh, &BuildOptions::default()));
+    let texture = scene.textures.len() as i32;
+    scene.textures.push(patch.atlas()?);
+    let material = scene.materials.len() as u32;
+    scene.materials.push(Material {
+        texture_layer: texture,
+        roughness: 0.75,
+        flags: Material::TWO_SIDED
+            | Material::FOLIAGE
+            | solstice_render::scene::MATERIAL_WIND
+            | solstice_render::scene::MATERIAL_GRASS
+            | 128
+            | (65 << 16),
+        normal_strength: 0.3,
+        ..Default::default()
+    });
+    let half = if stand { 8 } else { 2 };
+    for z in -half..half {
+        for x in -half..half {
+            let (x, z) = (x as f32 * 4. + 2., z as f32 * 4. + 2.);
+            // Leave the pond and its bank bare instead of growing grass through water.
+            if garden && in_pond(x, z, 3.) {
+                continue;
+            }
+            let hash = ((x / 4.).floor() as i64 * 73856093)
+                ^ ((z / 4.).floor() as i64 * 19349663)
+                ^ i64::from(settings.seed);
+            let quarter = (hash ^ (hash >> 13)).rem_euclid(4) as f32;
+            scene.instances.push(Instance {
+                mesh: index,
+                material,
+                transform: Mat4::from_rotation_translation(
+                    glam::Quat::from_rotation_y(quarter * std::f32::consts::FRAC_PI_2),
+                    Vec3::new(x, 0., z),
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn add_garden_site(scene: &mut SceneAsset) {
+    let mut pond = Mesh::default();
+    // A union of small surface tiles gives the two-lobed pond one surface without overlap.
+    for z in -12..12 {
+        for x in -14..14 {
+            let (x, z) = (x as f32, z as f32);
+            if !in_pond(x + 0.5, z + 0.5, 0.) {
+                continue;
+            }
+            let first = pond.vertices.len() as u32;
+            for (dx, dz) in [(0., 0.), (0., 1.), (1., 1.), (1., 0.)] {
+                pond.vertices.push(Vertex {
+                    position: Vec3::new(x + dx, 0.025, z + dz),
+                    normal: Vec3::Y,
+                    uv: Vec2::new(x + dx, z + dz),
+                });
+            }
+            pond.indices
+                .extend([first, first + 1, first + 2, first, first + 2, first + 3]);
+        }
+    }
+    let index = scene.meshes.len() as u32;
+    scene
+        .meshes
+        .push(build_virtual_mesh(&pond, &BuildOptions::default()));
+    let material = scene.materials.len() as u32;
+    scene.materials.push(Material {
+        base_color: [0.055, 0.15, 0.17, 1.],
+        roughness: 0.18,
+        normal_strength: 0.,
+        ..Default::default()
+    });
+    scene.instances.push(Instance {
+        mesh: index,
+        material,
+        transform: Mat4::IDENTITY,
+    });
+}
+
 fn build_scene(key: &SceneKey) -> Result<LoadedScene, String> {
     let mut scene = SceneAsset {
         texture_size: TEX_SIZE,
@@ -931,7 +1102,9 @@ fn build_scene(key: &SceneKey) -> Result<LoadedScene, String> {
         indices: vec![0, 1, 2, 0, 2, 3],
     };
     let n = (TEX_SIZE * TEX_SIZE * 2) as usize;
-    let grid: Vec<u8> = if key.forest != 0 && key.forest_floor {
+    let grid: Vec<u8> = if key.garden || (key.scene_grass.is_some() && (key.forest==0 || !key.forest_floor)) {
+        (0..TEX_SIZE*TEX_SIZE).flat_map(|i| {let v=((i*17+i/256*7)%19) as u8; [62+v,81+v,39+v/2,255]}).collect()
+    } else if key.forest != 0 && key.forest_floor {
         forest_floor_texture(key.settings.seed, key.settings.season)
     } else { (0..TEX_SIZE)
         .flat_map(|y| {
@@ -974,7 +1147,9 @@ fn build_scene(key: &SceneKey) -> Result<LoadedScene, String> {
     }
     let mut trees = Vec::new();
     let mut understory = Vec::new();
-    if key.forest == 0 {
+    if key.garden {
+        for id in ["solstice-birch","solstice-willow","solstice-old_oak","solstice-bush"] { let mut t=Settings::preset(id)?; t.season=key.settings.season; trees.push(t); }
+    } else if key.forest == 0 {
         trees.push(key.settings.clone());
     } else {
         for (i, species) in SPECIES.iter().enumerate() {
@@ -989,7 +1164,7 @@ fn build_scene(key: &SceneKey) -> Result<LoadedScene, String> {
             }
         }
     }
-    let placed = if key.forest == 0 { Vec::new() } else {
+    let placed = if key.garden { garden_placements(key.settings.seed) } else if key.forest == 0 { Vec::new() } else {
         let weights: Vec<u32> = SPECIES.iter().enumerate()
             .filter(|(index, _)| key.forest & (1 << index) != 0)
             .map(|(index, _)| key.ratios[index]).collect();
@@ -1051,7 +1226,7 @@ fn build_scene(key: &SceneKey) -> Result<LoadedScene, String> {
             }
         }
     };
-    if key.forest == 0 {
+    if key.forest == 0 && !key.garden {
         place(assets[0], Mat4::IDENTITY);
     } else {
         let spacing = forest_spacing(&key.settings, key.forest);
@@ -1085,6 +1260,10 @@ fn build_scene(key: &SceneKey) -> Result<LoadedScene, String> {
             flags: Material::TWO_SIDED | Material::FOLIAGE, normal_strength: 0., ..Default::default() });
         for transform in understory { scene.instances.push(Instance { mesh: index, material: material_index, transform }); }
     }
+    if let Some(grass)=&key.scene_grass {
+        add_scene_grass(&mut scene,grass,key.garden || key.forest!=0,key.garden)?;
+    }
+    if key.garden { add_garden_site(&mut scene); }
     Ok(paginate(&scene))
 }
 
@@ -1182,7 +1361,7 @@ mod tests {
         let mut ratios = [0; SPECIES.len()];
         let index = SPECIES.iter().position(|s| *s == "solstice-bush").unwrap();
         ratios[index] = 1;
-        let key = SceneKey { settings, grass:None, lod: Some(2), forest: 1u128 << index, count: 40, ratios,
+        let key = SceneKey { settings, grass:None, scene_grass:None, garden:false, lod: Some(2), forest: 1u128 << index, count: 40, ratios,
             grid: false, bark: true, leaves: true, game_cards: false, trim_cards: false,
             random_mix: true, forest_floor: false, leaf_specular: true, leaf_roughness: 0.55, leaf_transmission: 0.8 };
         let scene = build_scene(&key).unwrap().scene;
@@ -1190,6 +1369,47 @@ mod tests {
         let young: Vec<_> = scene.instances.iter().filter(|i| i.mesh == 3).collect();
         assert!(!young.is_empty(), "the young prototype is instantiated");
         assert!(young.iter().all(|i| (0.89..=1.11).contains(&i.transform.x_axis.truncate().length())), "young leaves must not be scaled down with an adult mesh");
+    }
+
+    #[test]
+    fn grass_composes_with_forest_and_keeps_branch_material_records_separate() {
+        let settings=Settings::preset("solstice-bush").unwrap();
+        let index=SPECIES.iter().position(|s|*s=="solstice-bush").unwrap();
+        let mut ratios=[0;SPECIES.len()]; ratios[index]=1;
+        let key=SceneKey { settings,grass:None,scene_grass:Some(crate::grass::Settings::default()),garden:false,
+            lod:Some(2),forest:1u128<<index,count:4,ratios,grid:false,bark:true,leaves:true,
+            game_cards:false,trim_cards:true,random_mix:false,forest_floor:false,
+            leaf_specular:true,leaf_roughness:0.55,leaf_transmission:0.8 };
+        let scene=build_scene(&key).unwrap().scene;
+        let grass:Vec<_>=scene.instances.iter().filter(|i| scene.materials[i.material as usize].flags & solstice_render::scene::MATERIAL_GRASS != 0).collect();
+        assert_eq!(grass.len(),256);
+        assert_eq!(scene.instances.len(),1+4*2+256,"ground, bark, leaves and grass coexist");
+        assert!(grass.iter().all(|i|i.material as usize>i.mesh as usize),"grass must not index a branch hierarchy as its material");
+        for instance in &scene.instances {
+            assert!((instance.mesh as usize)<scene.meshes.len());
+            let texture=scene.materials[instance.material as usize].texture_layer;
+            assert!(texture>=0 && (texture as usize)<scene.base_textures.len());
+        }
+        let isolated=build_scene(&SceneKey{forest:0,scene_grass:None,..key}).unwrap().scene;
+        assert_eq!(isolated.instances.len(),3,"switching off the stand/grass retains a single tree");
+    }
+
+    #[test]
+    fn garden_grass_leaves_water_clear_and_specimens_are_repeatable() {
+        let placed=garden_placements(42);
+        assert_eq!(placed,garden_placements(42));
+        assert_eq!(placed.len(),32);
+        assert!((0..4).all(|kind| placed.iter().any(|(k,_)|*k==kind)));
+        let mut scene=SceneAsset::default();
+        // Simulate hierarchy records preceding the grass draw material.
+        scene.materials.resize(10,Material::default());
+        add_scene_grass(&mut scene,&crate::grass::Settings::preset("lawn").unwrap(),true,true).unwrap();
+        assert!(!scene.instances.is_empty() && scene.instances.len()<256);
+        assert!(scene.instances.iter().all(|i| {let p=i.transform.w_axis; !in_pond(p.x,p.z,3.)}));
+        assert!(scene.instances.iter().all(|i|i.material==10));
+        add_garden_site(&mut scene);
+        assert_eq!(scene.meshes.len(),2);
+        assert_eq!(scene.instances.last().unwrap().material,11);
     }
 
     #[test]
