@@ -28,6 +28,9 @@ const GOLDEN_ANGLE: f32 = 2.399_963;
 pub struct Plant {
     pub wood: Mesh,
     pub leaves: Mesh,
+    /// The youngest shoots, for a species whose [`Species::twigs`] are another colour than its
+    /// bark. Empty otherwise. (Upstream Solstice `Plant::twigs`, tree.rs:204-212.)
+    pub twigs: Mesh,
     pub branches: Vec<Branch>,
 }
 
@@ -36,8 +39,11 @@ pub struct Branch {
     pub parent: Option<usize>,
     pub points: Vec<Vec3>,
     pub radii: Vec<f32>,
+    /// Vertices in `Plant::wood`, or in `Plant::twigs` when `twig` is set.
     pub wood_vertices: std::ops::Range<usize>,
     pub leaf_vertices: std::ops::Range<usize>,
+    /// The stem is one of the youngest shoots, in `Plant::twigs`.
+    pub twig: bool,
 }
 
 /// A stem as a curve: points along it, the radius at each, and the direction it grows there.
@@ -192,12 +198,16 @@ impl Species {
         }
 
         let mut wood = Mesh::default();
+        let mut twigs = Mesh::default();
+        let twig_radius = self.twigs.map_or(0.0, |(below, _)| below);
         let mut branches = Vec::with_capacity(stems.len());
         for (index, stem) in stems.iter().enumerate() {
             let flare = if index == 0 { self.root_flare } else { 0.0 };
-            let start = wood.vertices.len();
-            add_tube(&mut wood, stem, flare, &mut rng);
-            branches.push(Branch { parent: parents[index], points: stem.points.clone(), radii: stem.radii.clone(), wood_vertices: start..wood.vertices.len(), leaf_vertices: 0..0 });
+            let twig = stem.radii[0] < twig_radius;
+            let mesh = if twig { &mut twigs } else { &mut wood };
+            let start = mesh.vertices.len();
+            add_tube(mesh, stem, flare, &mut rng);
+            branches.push(Branch { parent: parents[index], points: stem.points.clone(), radii: stem.radii.clone(), wood_vertices: start..mesh.vertices.len(), leaf_vertices: 0..0, twig });
         }
 
         let crown_center = crown_center(&stems, &generation);
@@ -231,7 +241,7 @@ impl Species {
                 branches[index].leaf_vertices = start..leaves.vertices.len();
             }
         }
-        Plant { wood, leaves, branches }
+        Plant { wood, leaves, twigs, branches }
     }
 }
 

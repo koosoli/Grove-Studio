@@ -121,10 +121,15 @@ pub fn grow(s: &Settings, lod: u32) -> Option<Tree> {
     species.leaves.length.0 *= leaf_scale * season_leaf;
     species.leaves.length.1 *= leaf_scale * season_leaf;
     let plant = species.grow_with_juvenile_foliage(s.seed, juvenile);
-    let mut bark_branch = vec![0; plant.wood.vertices.len()];
+    // The youngest shoots of a species with a twig colour (`twigs below= color=`) follow the wood,
+    // with that colour in their vertex colour.
+    let wood_count = plant.wood.vertices.len();
+    let mut bark_branch = vec![0; wood_count + plant.twigs.vertices.len()];
     let mut original_leaf_branch = vec![0; plant.leaves.vertices.len()];
     for (i, branch) in plant.branches.iter().enumerate() {
-        bark_branch[branch.wood_vertices.clone()].fill(i as u32);
+        let r = branch.wood_vertices.clone();
+        let r = if branch.twig { r.start + wood_count..r.end + wood_count } else { r };
+        bark_branch[r].fill(i as u32);
         original_leaf_branch[branch.leaf_vertices.clone()].fill(i as u32);
     }
     let mut branches: Vec<tree::Branch> = plant.branches.iter().map(|branch| tree::Branch {
@@ -148,14 +153,18 @@ pub fn grow(s: &Settings, lod: u32) -> Option<Tree> {
         c,
         branch: 0,
     };
+    let twig_color = species.twigs.map_or([1.; 4], |(_, [r, g, b])| [r, g, b, 1.]);
     let mut bark = Part {
         v: plant
             .wood
             .vertices
             .iter()
             .map(|v| convert(v, [1.; 4]))
+            .chain(plant.twigs.vertices.iter().map(|v| convert(v, twig_color)))
             .collect(),
-        i: plant.wood.indices,
+        i: plant.wood.indices.iter().copied()
+            .chain(plant.twigs.indices.iter().map(|&i| i + wood_count as u32))
+            .collect(),
     };
     for (vertex, &owner) in bark.v.iter_mut().zip(&bark_branch) { vertex.branch = owner; }
     bark.i = keep_area(&bark.i, |i| bark.v[i as usize].p);

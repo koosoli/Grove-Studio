@@ -369,7 +369,15 @@ fn bake(tree: &Tree, view: &View, leaf_tris: &[u32], bark_tris: &[u32], atlas: &
                     let sx = ((uv.x.rem_euclid(1.) * *w as f32) as u32).min(w - 1);
                     let sy = ((uv.y.rem_euclid(1.) * *h as f32) as u32).min(h - 1);
                     let si = ((sy * w + sx) * 4) as usize;
-                    [0, 1, 2].map(|ch| gamelod::linear(px[si + ch]))
+                    // a species' young shoots carry their own colour (`twigs color=`)
+                    if vs[0].c[..3] != [1., 1., 1.] {
+                        let c = vs[0].c;
+                        let lum = [0, 1, 2].map(|ch| gamelod::linear(px[si + ch])).iter().sum::<f32>() / 3.;
+                        let shade = (lum / 0.2).clamp(0.5, 1.5);
+                        [c[0] * shade, c[1] * shade, c[2] * shade]
+                    } else {
+                        [0, 1, 2].map(|ch| gamelod::linear(px[si + ch]))
+                    }
                 };
                 depth[i] = z;
                 // the twig's own depth: its far side is shaded by its near side
