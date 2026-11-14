@@ -57,6 +57,8 @@ struct Cell {
 }
 
 const GUTTER: u32 = 8;
+/// How much a bare-stemmed conifer's needle fans are enlarged while baking.
+const SPARSE_NEEDLE_GROW: f32 = 1.;
 
 impl Cell {
     fn square(x: u32, y: u32, size: u32) -> Cell {
@@ -150,6 +152,9 @@ struct Tree<'a> {
     crown_radii: Vec3,
     /// Needle fans are slivers: baked at twice their size they read as the dense shoot.
     needles: bool,
+    /// A bare-stemmed conifer (the pine): needle tufts at the tips of a few limbs high in the
+    /// tree. Its cards are matched to the default tree and merged from tuft-sized groups.
+    sparse: bool,
 }
 
 impl Tree<'_> {
@@ -349,7 +354,8 @@ fn bake(tree: &Tree, view: &View, leaf_tris: &[u32], bark_tris: &[u32], atlas: &
             let mut vs: [V; 3] = std::array::from_fn(|k| part.v[part.i[t as usize * 3 + k] as usize]);
             if leaf && tree.needles {
                 let middle = (vs[0].p + vs[1].p + vs[2].p) / 3.;
-                for v in &mut vs { v.p = middle + (v.p - middle) * 2.; }
+                let grow = if tree.sparse { SPARSE_NEEDLE_GROW } else { 2. };
+                for v in &mut vs { v.p = middle + (v.p - middle) * grow; }
             }
             let [a, b, c] = vs.map(|v| project(v.p));
             gamelod::raster(a, b, c, |px, py, l0, l1, l2| {
@@ -587,6 +593,37 @@ fn coverage(level: &Level, atlas: &TwigAtlas, px: f32) -> [f32; 4] {
     })
 }
 
+/// Projected area (m^2) the default tree (single needle fans and wood) covers from each of
+/// `COVERAGE_VIEWS`, at `px` metres per pixel.
+fn default_coverage(tree: &Tree, px: f32) -> [f32; 4] {
+    COVERAGE_VIEWS.map(|(_, t, b)| {
+        let (t, b) = (Vec3::from_array(t), Vec3::from_array(b));
+        let points = tree.bark.v.iter().chain(&tree.leaves.v).map(|v| vec2(v.p.dot(t), v.p.dot(b)));
+        let (lo, hi) = points.fold((Vec2::splat(f32::MAX), Vec2::splat(f32::MIN)), |(a, c), p| (a.min(p), c.max(p)));
+        if lo.x > hi.x { return 0.; }
+        let (w, h) = (((hi.x - lo.x) / px) as usize + 2, ((hi.y - lo.y) / px) as usize + 2);
+        let mut hit = vec![false; w * h];
+        let project = |p: Vec3| (vec2((p.dot(t) - lo.x) / px, (hi.y - p.dot(b)) / px), 0.);
+        for (part, leaf) in [(tree.bark, false), (tree.leaves, true)] {
+            for tri in part.i.chunks_exact(3) {
+                let vs: [V; 3] = std::array::from_fn(|k| part.v[tri[k] as usize]);
+                let [a, bb, c] = vs.map(|v| project(v.p));
+                gamelod::raster(a, bb, c, |x, y, l0, l1, l2| {
+                    if x >= w || y >= h { return; }
+                    if leaf {
+                        let uv = vs[0].uv * l0 + vs[1].uv * l1 + vs[2].uv * l2;
+                        let sx = ((uv.x * 256.) as usize).min(255);
+                        let sy = ((uv.y * 256.) as usize).min(255);
+                        if tree.colors[(sy * 256 + sx) * 4 + 3] < 128 { return; }
+                    }
+                    hit[y * w + x] = true;
+                });
+            }
+        }
+        hit.iter().filter(|&&h| h).count() as f32 * px * px
+    })
+}
+
 /// Grows or shrinks every card of `leaves` (vertex ranges `cards`) about its centre, by `scale`
 /// across (x, z) and along y, from the positions `original`. `grounded`: a card keeps its lowest
 /// point (the whole-tree cards stand on the ground).
@@ -654,7 +691,10 @@ pub fn ladder(s: &Settings, budgets: Option<&[usize]>, trim: bool, bend: f32) ->
         crown,
         crown_radii,
         needles: crate::reference::leaf_kind(s) == Some(solstice_procgen::foliage::leaf::LeafKind::Needles),
+        sparse: false,
     };
+    let mut tree = tree;
+    tree.sparse = tree.needles && !full.leaves.v.is_empty() && lo.y > 0.35 * height;
     let edge = EDGE as usize;
     let cells = layout();
     let mut atlas = TwigAtlas { edge: EDGE, color: vec![0; edge * edge * 4], normal: vec![0; edge * edge * 4], report: Vec::new(),
@@ -696,6 +736,8 @@ pub fn ladder(s: &Settings, budgets: Option<&[usize]>, trim: bool, bend: f32) ->
             if fits(radii[m]) { b = m } else { a = m + 1 }
         }
         let mut cutoff = if radii[a] == f32::MAX { f32::MAX } else { radii[a] * 1.0001 };
+        // a sparse conifer's tufts stay tufts: coarser levels merge the near level's groups
+        if tree.sparse && k > 0 { cutoff = previous_cutoff; }
         let (mut groups, mut wood) = tree.groups_at(cutoff);
         if k > 0 && groups.len() < 8 {
             // No branch thickness splits the crown into few enough cards (a conifer's limbs all
@@ -783,7 +825,12 @@ pub fn ladder(s: &Settings, budgets: Option<&[usize]>, trim: bool, bend: f32) ->
     let crown_points: Vec<Vec3> = full.leaves.v.iter().map(|v| v.p).collect();
     let mut leaves = Part::default();
     let mut ranges = Vec::new();
-    for (v, (t, b)) in [(Vec3::X, Vec3::Y), (-Vec3::Z, Vec3::Y), (Vec3::X, -Vec3::Z)].into_iter().enumerate() {
+    // a sparse conifer's crossed cards stand turned by 22.5 degrees: its side and its 45 degree
+    // views then meet the pair alike (axis aligned, the 45 degree view would see a denser tree)
+    let turn = if tree.sparse { std::f32::consts::FRAC_PI_8 } else { 0. };
+    let (cs, sn) = (turn.cos(), turn.sin());
+    let (card_x, card_z) = (Vec3::new(cs, 0., -sn), Vec3::new(-sn, 0., -cs));
+    for (v, (t, b)) in [(card_x, Vec3::Y), (card_z, Vec3::Y), (Vec3::X, -Vec3::Z)].into_iter().enumerate() {
         let top = v == 2;
         let bake_view = View::fit(Vec3::ZERO, t, b, if top { &crown_points } else { &points });
         let cell = cells[3][v];
@@ -808,10 +855,18 @@ pub fn ladder(s: &Settings, budgets: Option<&[usize]>, trim: bool, bend: f32) ->
     // forest would show rings): grow or shrink each level's cards, across and along the height
     // separately, until each of the four views is within 4 % of the near level's.
     let px = height / 320.;
-    let near = coverage(&levels[0], &atlas, px);
-    let mut matched = vec![serde_json::json!({"level": levels[0].rung.name, "scale": [1.0, 1.0],
-        "coverageM2": near, "ratio": [1.0, 1.0, 1.0, 1.0]})];
-    for k in 1..levels.len() {
+    let mut near = coverage(&levels[0], &atlas, px);
+    let default = if tree.sparse { default_coverage(&tree, px) } else { [0.; 4] };
+    let mut matched = Vec::new();
+    if tree.sparse {
+        atlas.report.push(serde_json::json!({"defaultCoverageM2": default, "nearVsDefault": std::array::from_fn::<f32, 4, _>(|d| near[d] / default[d])}));
+    } else {
+        matched.push(serde_json::json!({"level": levels[0].rung.name, "scale": [1.0, 1.0],
+            "coverageM2": near, "ratio": [1.0, 1.0, 1.0, 1.0]}));
+    }
+    for k in (if tree.sparse { 0 } else { 1 })..levels.len() {
+        // a sparse conifer's near cards are matched to the default tree, the rest to near
+        let target = if k == 0 { default } else { near };
         let original = levels[k].leaves.v.clone();
         let mut scale = Vec2::ONE;
         let mut best = (f32::MAX, scale, [1f32; 4]);
@@ -824,7 +879,7 @@ pub fn ladder(s: &Settings, budgets: Option<&[usize]>, trim: bool, bend: f32) ->
             scale_cards(&mut levels[k].leaves, &original, standing, scale, k == 3);
             scale_cards(&mut levels[k].leaves, &original, lying, Vec2::new(top, 1.), false);
             let c = coverage(&levels[k], &atlas, px);
-            let ratios: [f32; 4] = std::array::from_fn(|d| if near[d] > 0. { c[d] / near[d] } else { 1. });
+            let ratios: [f32; 4] = std::array::from_fn(|d| if target[d] > 0. { c[d] / target[d] } else { 1. });
             let worst = ratios.iter().map(|r| (r - 1.).abs()).fold(0., f32::max);
             if worst < best.0 { best = (worst, scale, ratios); best_top = top; }
             if worst < 0.04 { break; }
@@ -837,14 +892,15 @@ pub fn ladder(s: &Settings, budgets: Option<&[usize]>, trim: bool, bend: f32) ->
             }
             let across = (1. / vertical).sqrt().clamp(0.85, 1.18);
             // never taller than the tree: the silhouette stays, height only shrinks
-            scale.x = (scale.x * across).clamp(0.6, 1.4);
-            scale.y = (scale.y * (1. / (side * across)).clamp(0.85, 1.18)).clamp(0.6, 1.0);
+            scale.x = (scale.x * across).clamp(if k == 0 { 0.4 } else { 0.6 }, if tree.sparse { 1.9 } else { 1.4 });
+            scale.y = (scale.y * (1. / (side * across)).clamp(0.85, 1.18)).clamp(if k == 0 { 0.4 } else { 0.6 }, if tree.sparse { 1.3 } else { 1.0 });
         }
         let (_, scale, ratios) = best;
         let top = best_top;
         scale_cards(&mut levels[k].leaves, &original, standing, scale, k == 3);
         scale_cards(&mut levels[k].leaves, &original, lying, Vec2::new(top, 1.), false);
         let c = coverage(&levels[k], &atlas, px);
+        if k == 0 { near = c; }
         matched.push(serde_json::json!({"level": levels[k].rung.name, "scale": [scale.x, scale.y, top], "coverageM2": c, "ratio": ratios}));
     }
     atlas.report.push(serde_json::json!({"coverage": matched, "views": COVERAGE_VIEWS.map(|v| v.0)}));
