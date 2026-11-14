@@ -592,7 +592,7 @@ impl SceneState {
                 .iter()
                 .any(|v| !v.is_finite() || !(0. ..=1.).contains(v))
             || self.forest_share.iter().sum::<f32>() <= 0.
-            || !(1..=1000).contains(&self.forest_count)
+            || !(1..=2000).contains(&self.forest_count)
             || self.skybox >= preview::SKYBOXES.len()
             || !self.cloud_cover.is_finite()
             || !(0. ..=1.).contains(&self.cloud_cover)
@@ -609,7 +609,7 @@ impl SceneState {
         e.forest = self.forest;
         e.forest_random = self.forest_random;
         e.forest_floor = self.forest_floor;
-        e.forest_count = self.forest_count;
+        e.forest_count = if self.garden && self.forest_count<=192 {1800}else{self.forest_count};
         e.forest_share.copy_from_slice(&self.forest_share);
         e.scene_grass = self.scene_grass;
         e.garden = self.garden;
@@ -621,6 +621,7 @@ impl SceneState {
             hours: self.hours,
             azimuth: self.azimuth,
         };
+        if e.garden {e.game_preview=false;}
     }
 }
 #[cfg(test)]
@@ -662,6 +663,22 @@ mod scene_project_tests {
         invalid.cloud_cover = f32::NAN;
         assert!(invalid.validate().is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn movement_starts_flight_from_orbit_and_shift_scales_speed() {
+        let mut e=Editor::new();
+        let origin=e.orbit_position();
+        e.move_camera(vec3(0.,0.,1.),false,1./60.);
+        assert_eq!(e.navigation,1);
+        let normal=e.eye.distance(origin);
+        assert!((normal-0.1).abs()<0.0001);
+        assert_eq!(e.view,0,"movement must not turn on wireframe");
+        e.navigation=0;
+        e.move_camera(vec3(1.,0.,1.),true,1./60.);
+        assert!((e.eye.distance(origin)/normal-4.).abs()<0.001,"diagonal movement is normalized and Shift is fourfold");
+        e.navigation=2; e.eye.y=20.;
+        e.move_camera(vec3(0.,0.,1.),false,1./60.);
+        assert_eq!(e.eye.y,1.7);
     }
 }
 
@@ -829,17 +846,43 @@ impl Editor {
     fn cycle_navigation(&mut self) {
         if self.navigation == 0 { self.eye=self.orbit_position(); }
         self.navigation=(self.navigation+1)%3;
-        if self.navigation == 2 { self.eye.y=1.7; }
+        if self.navigation == 2 {
+            if self.garden {self.eye=Vec3::from_array(crate::garden::walk_spawn(self.eye.x,self.eye.z).to_array());}
+            else {self.eye.y=1.7;}
+        }
         if self.navigation == 0 { self.frame(); }
         self.rotate=false;
+    }
+    fn move_camera(&mut self,axes:Vec3,fast:bool,dt:f32)->f32 {
+        if axes.length_squared()==0. {return 0.;}
+        if self.navigation==0 {self.cycle_navigation();}
+        let forward=if self.navigation==2 {vec3(-self.yaw.sin(),0.,-self.yaw.cos())}
+            else {vec3(-self.yaw.sin()*self.pitch.cos(),-self.pitch.sin(),-self.yaw.cos()*self.pitch.cos())};
+        let right=vec3(self.yaw.cos(),0.,-self.yaw.sin());
+        let mut movement=right*axes.x+forward*axes.z;
+        if self.navigation==1 {movement.y+=axes.y;}
+        let distance=if self.navigation==2 {2.2}else{6.}*if fast {4.}else{1.}*dt.clamp(0.,0.1);
+        let previous=self.eye;
+        self.eye+=movement.normalize_or_zero()*distance;
+        if self.navigation==2 {
+            if self.garden && !crate::garden::walk_allowed(self.eye.x,self.eye.z) {self.eye=previous;}
+            self.eye.y=1.7+if self.garden {crate::garden::walk_height(self.eye.x,self.eye.z)}else{0.};
+            return vec2(self.eye.x-previous.x,self.eye.z-previous.z).length();
+        }
+        0.
+    }
+    fn garden_view(&mut self,index:usize) {
+        let (eye,yaw,pitch)=crate::garden::view(index);
+        self.navigation=1;self.eye=Vec3::from_array(eye.to_array());self.yaw=yaw;self.pitch=-pitch;self.rotate=false;
     }
     fn garden_template(&mut self) {
         self.garden=true; self.forest=true; self.grass_mode=false;
         self.scene_grass=true; self.grass=crate::grass::Settings::preset("lawn").unwrap();
+        self.game_preview=false;
         self.grass.density=0.55;
-        self.forest_count=32; self.view=0; self.grid=false; self.frame();
-        self.distance=100.; self.pitch=0.48;
-        self.notice("Garden template: willow, oak, birch, hedges and pond. N: fly / walk.");
+        self.forest_count=1800; self.view=0; self.grid=false; self.frame();
+        self.garden_view(0);
+        self.notice("Garden: WASD fly, Shift faster, N fly/walk, F overview.");
     }
     fn rebuild(&mut self) {
         self.model = Model::new(&self.s, self.lod);
@@ -879,6 +922,7 @@ impl Editor {
         preview::stand(&self.forest_share).1
     }
     fn scene_height(&self) -> f32 {
+        if self.garden && !self.grass_mode {return 24.;}
         if self.grass_mode { return self.grass.size.max(self.grass.height_hint()).max(0.5); }
         preview::scene_height(&self.s, if self.forest { self.forest_mask() } else { 0 })
     }
@@ -892,6 +936,7 @@ impl Editor {
             self.scene_height() * 2.32
         };
         self.pan = Vec3::ZERO;
+        if self.garden && !self.grass_mode {self.distance=115.;self.pitch=0.5;self.pan=Vec3::ZERO;}
     }
     fn set_lod(&mut self, n: u32) {
         if self.grass_mode {self.auto_lod=false;self.lod=n.min(2);return;}
@@ -1012,6 +1057,7 @@ impl Editor {
             self.grass_saved=self.grass.clone(); self.scene_saved=Some(self.scene_state());
             self.rebuild();
             self.frame();
+            if self.garden {self.garden_view(0);}
         }
         self.project_name = Path::new(&self.path)
             .file_stem()
@@ -1068,7 +1114,10 @@ pub async fn run(args: Vec<String>) {
     }
     if args.iter().any(|arg| arg == "--structure") { e.view = 2; }
     if args.iter().any(|arg| arg == "--wind") { e.wind = true; }
-    if args.iter().any(|a| a=="--garden") { e.garden_template(); }
+    if args.iter().any(|a| a=="--garden") || agent::option(&args,"--garden-view").is_some() { e.garden_template(); }
+    if let Some(view)=agent::option(&args,"--garden-view") {
+        match view.as_str() {"pond"=>e.garden_view(0),"bridge"=>e.garden_view(1),"entrance"=>e.garden_view(2),_=>{eprintln!("Unknown garden view {view:?}");return;}}
+    }
     if args.iter().any(|a| a=="--scene-grass") { e.scene_grass=true; }
     e.fullscreen=args.iter().any(|a| a=="--fullscreen");
     if e.fullscreen { set_fullscreen(true); }
@@ -1104,6 +1153,8 @@ pub async fn run(args: Vec<String>) {
     let mut frames = 0;
     let mut shot_saved = false;
     let shot = agent::option(&args, "--screenshot");
+    let loading_shot = agent::option(&args, "--loading-screenshot");
+    let mut loading_shot_saved=false;
     let self_test = agent::option(&args, "--self-test");
     let classic = args.iter().any(|arg| arg == "--classic") || self_test.is_some();
     let mut worker = (!classic).then(preview::Worker::start);
@@ -1115,6 +1166,7 @@ pub async fn run(args: Vec<String>) {
     let mut preview_last_frame = 0.0f64;
     let mut preview_error = None;
     let mut wind_playback = WindPlayback::default();
+    let mut loading_since: Option<f64> = None;
     let initial_yaw = e.yaw;
     let initial_seed = e.s.seed;
     let initial_mesh = e.model.tree.leaves.v.first().map(|v| v.p);
@@ -1141,7 +1193,7 @@ pub async fn run(args: Vec<String>) {
         ui.mouse=vec2(mx/scale,(my-offset_y)/scale);
         ui.scale=scale;
         let aspect=viewport_width()/730.;
-        let render_height=648_f32.min(2048./aspect).round() as u32;
+        let render_height=(730.*scale).min(1440.).min(2048./aspect).round() as u32;
         let render_size=((render_height as f32*aspect).round() as u32,render_height);
         if target.texture.width() as u32 != (viewport_width().round() as u32) {
             target=render_target(viewport_width().round() as u32,730);
@@ -1269,25 +1321,13 @@ pub async fn run(args: Vec<String>) {
             if is_key_pressed(KeyCode::F11) { e.fullscreen=!e.fullscreen; set_fullscreen(e.fullscreen); }
             if !ctrl && is_key_pressed(KeyCode::N) { e.cycle_navigation(); }
             if !ctrl && is_key_pressed(KeyCode::M) { e.ambience=!e.ambience; }
-            if e.navigation != 0 && !ctrl {
-                let forward=if e.navigation==2 { vec3(-e.yaw.sin(),0.,-e.yaw.cos()) }
-                    else { vec3(-e.yaw.sin()*e.pitch.cos(),-e.pitch.sin(),-e.yaw.cos()*e.pitch.cos()) };
-                let right=vec3(e.yaw.cos(),0.,-e.yaw.sin());
-                let mut movement=Vec3::ZERO;
-                if is_key_down(KeyCode::W) { movement+=forward; }
-                if is_key_down(KeyCode::S) { movement-=forward; }
-                if is_key_down(KeyCode::D) { movement+=right; }
-                if is_key_down(KeyCode::A) { movement-=right; }
-                if e.navigation==1 {
-                    if is_key_down(KeyCode::E) { movement.y+=1.; }
-                    if is_key_down(KeyCode::Q) { movement.y-=1.; }
-                }
+            // WASD starts flight directly. W is no longer a wireframe shortcut.
+            if !ctrl {
+                let axis=|positive,negative|is_key_down(positive) as u8 as f32-is_key_down(negative) as u8 as f32;
+                let axes=vec3(axis(KeyCode::D,KeyCode::A),axis(KeyCode::E,KeyCode::Q),axis(KeyCode::W,KeyCode::S));
                 let fast=is_key_down(KeyCode::LeftShift)||is_key_down(KeyCode::RightShift);
-                let speed=if e.navigation==2 { 2.2 } else { 6. } * if fast { 4. } else { 1. };
-                let distance=speed*get_frame_time().min(0.1);
-                e.eye+=movement.normalize_or_zero()*distance;
-                if e.navigation==2 { e.eye.y=1.7; }
-                if e.navigation==2 && movement.length_squared()>0. { audio.walk(distance); }
+                let walked=e.move_camera(axes,fast,get_frame_time());
+                if walked>0. {audio.walk(walked);}
             }
             if is_key_pressed(KeyCode::Space) {
                 e.reroll()
@@ -1298,7 +1338,7 @@ pub async fn run(args: Vec<String>) {
             if is_key_pressed(KeyCode::G) {
                 e.grid = !e.grid
             }
-            if e.navigation == 0 && !e.forest && is_key_pressed(KeyCode::W) {
+            if !ctrl && !e.forest && is_key_pressed(KeyCode::V) {
                 e.view = if e.view == 1 { 0 } else { 1 }
             }
             if is_key_pressed(KeyCode::B) {
@@ -1340,14 +1380,14 @@ pub async fn run(args: Vec<String>) {
         let scene = preview::SceneKey {
             grass: e.grass_mode.then(|| e.grass.clone()),
             scene_grass: (!e.grass_mode && e.scene_grass).then(|| e.grass.clone()),
-            garden: e.garden,
+            garden: e.garden && !e.grass_mode,
             settings: e.s.clone(),
-            lod: if e.auto_lod && e.game_preview {
+            lod: if e.auto_lod && (e.forest || e.scene_grass || e.garden) { None } else if e.auto_lod && e.game_preview {
                 // In first person, let the cluster DAG choose detail per instance rather
                 // than freezing every tree at the old orbit camera's distance.
                 if e.navigation != 0 { None } else { Some(if e.distance > e.scene_height() * 10. { 3 } else if e.distance > e.scene_height() * 5. { 2 } else if e.distance > e.scene_height() * 2.8 { 1 } else { 0 }) }
             } else { (!e.auto_lod).then_some(e.lod) },
-            forest: if e.forest { e.forest_mask() } else { 0 },
+            forest: if e.forest && !e.grass_mode { e.forest_mask() } else { 0 },
             count: e.forest_count,
             ratios: e.forest_ratios(),
             grid: e.grid && !e.forest,
@@ -1409,13 +1449,14 @@ pub async fn run(args: Vec<String>) {
         if use_solstice {
             if let Some(renderer) = worker.as_mut() {
                 renderer.request(preview::Request {
+                    settle_frames: 5,
                     size: render_size,
                     scene: scene.clone(),
                     camera: solstice_render::Camera {
                         position: ::glam::Vec3::from_array(pos.to_array()),
                         yaw: e.yaw,
                         pitch: -e.pitch,
-                        fov_y: 40_f32.to_radians(),
+                        fov_y: if e.garden && !e.grass_mode {60_f32}else{40_f32}.to_radians(),
                         near: 0.05,
                     },
                     debug: e.debug,
@@ -1573,24 +1614,32 @@ pub async fn run(args: Vec<String>) {
             worker.is_some(),
             if use_solstice && preview_fps > 0.0 && get_time() - preview_last_frame < 2.0 { Some(preview_fps) } else { None },
         );
-        // Small corner notice while the Solstice frame for the current settings is still rendering.
+        // Stay visible through CPU generation, GPU upload and the first complete frame.
         let rendering = use_solstice && worker.is_some() && solstice_stats.is_none();
         if rendering {
-            // A small pill in the viewport's corner, with a pulsing dot while the view rebuilds.
-            let dots = ".".repeat(1 + (get_time() * 3.) as usize % 3);
+            let started=*loading_since.get_or_insert_with(get_time);
             let (built, total) = preview::build_progress();
-            let label = if total > 0 && built < total {
-                format!("Building {built} of {total} species")
+            let x=258.+(viewport_width()-410.)*0.5;
+            rounded(Rect::new(x,310.,410.,144.),10.,col(0xeff2e9));
+            let phase=(get_time()*2.2) as f32;
+            for i in 0..10 {let a=phase+i as f32*0.6283; draw_circle(x+34.+a.cos()*10.,345.+a.sin()*10.,2.5,col(if i>6 {0x61735a}else{0xa4afa0}));}
+            ui.text(if e.garden {"Loading garden"}else if e.forest {"Loading forest"}else{"Preparing preview"},x+61.,352.,21.,ink());
+            let detail=if total>0 && built<total {format!("Growing species: {built} / {total}")}else{preview::build_stage().to_string()};
+            ui.text(&detail,x+22.,383.,13.,ink());
+            rounded(Rect::new(x+22.,398.,366.,7.),3.,line());
+            if total>0 && built<total {
+                rounded(Rect::new(x+22.,398.,366.*(built as f32/total as f32).max(0.025),7.),3.,green());
             } else {
-                format!("Loading{dots}")
-            };
-            let width = ui.width(&label, 12.) + 24.;
-            let x = 1112.+extra_width() - width;
-            rounded(Rect::new(x, 778., width, 22.), 6., col(0xe8eee4));
-            ui.text(&label, x + 12., 793., 12., ink());
-        }
+                let slide=((get_time()*0.7).fract() as f32)*286.;
+                rounded(Rect::new(x+22.+slide,398.,80.,7.),3.,green());
+            }
+            ui.text(&format!("{:.0}s elapsed / controls remain available",get_time()-started),x+22.,432.,11.,muted());
+        } else { loading_since=None; }
         lod_strip(&ui, &mut e);
         footer(&ui, &e);
+        if rendering && frames>5 && !loading_shot_saved {
+            if let Some(path)=&loading_shot {set_default_camera();save_screen(path);loading_shot_saved=true;set_camera(&ui_camera);}
+        }
         hud_drawn |= ui.hud_markers.get() == 7 && e.model.tree.valid();
         if let Some(m) = e.modal {
             ui.enabled = true;
@@ -1697,7 +1746,7 @@ pub async fn run(args: Vec<String>) {
             }
             if frames >= 120
                 && !shot_saved
-                && (solstice_stats.is_some() || worker.is_none() || !use_solstice)
+                && ((solstice_stats.is_some() && preview_fps>0.) || worker.is_none() || !use_solstice)
             {
                 set_default_camera();
                 save_screen(path);
@@ -1995,7 +2044,9 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
         let maximum_density=e.grass.max_density();
         e.grass.density=e.grass.density.min(maximum_density);
         ui.slider("Density",&mut e.grass.density,0.05,maximum_density,p,388.,"%");
-        ui.slider("Blade height",&mut e.grass.height,0.25,2.,p,426.,"x");
+        let base_height=e.grass.height_hint()/e.grass.height;
+        let mut height_metres=e.grass.height_hint();
+        if ui.slider("Blade length",&mut height_metres,base_height*0.25,base_height*2.,p,426.,"m") { e.grass.height=height_metres/base_height; }
         ui.slider("Blade width",&mut e.grass.width,0.5,3.,p,464.,"x");
         ui.slider("Blade bend",&mut e.grass.lean,0.,1.5,p,502.,"x");
         ui.slider("Dry blades",&mut e.grass.dry,0.,1.,p,540.,"%");
@@ -2219,7 +2270,7 @@ fn inspector(ui: &Ui, e: &mut Editor, gpu: bool) {
             e.forest_random = !e.forest_random;
         }
         let mut count = e.forest_count as f32;
-        if ui.slider("Trees in the stand", &mut count, 10., 1000., p, 262., "") {
+        if ui.slider("Trees in the stand", &mut count, 10., 2000., p, 262., "") {
             e.garden=false; e.forest_count = count.round() as u32;
         }
         let groups = crate::catalog::GROUPS;
@@ -2348,7 +2399,7 @@ fn viewport_ui(ui: &Ui, e: &mut Editor, stats: Option<(u32, u32)>, renderer: &st
             "solstice-old_oak" => "Solstice old oak",
             _ => "Solstice oak",
         });    ui.text(
-        if e.grass_mode { "Grass patch" } else if e.garden { "Garden template" } else if e.forest { "Forest preview" } else { name },
+        if e.grass_mode { "Grass patch" } else if e.garden { "Solstice garden" } else if e.forest { "Forest preview" } else { name },
         284.,
         145.,
         29.,
@@ -2425,6 +2476,7 @@ fn viewport_ui(ui: &Ui, e: &mut Editor, stats: Option<(u32, u32)>, renderer: &st
     }
     if ui.button("Fullscreen",Rect::new(574.,698.,93.,29.),0) { e.fullscreen=!e.fullscreen; set_fullscreen(e.fullscreen); }
     if ui.button(if e.sky {"Sky ON"}else{"Sky OFF"},Rect::new(677.,698.,85.,29.),if e.sky {2}else{0}) { e.sky=!e.sky; }
+    if e.garden && !e.grass_mode { for (i,label) in ["Pond view","Bridge view","Entrance"].iter().enumerate() {if ui.button(label,Rect::new(772.+i as f32*109.,698.,103.,29.),0) {e.garden_view(i);}} }
     if e.navigation!=0 { ui.text("WASD move / Shift faster / drag look / Q E up-down (fly)",282.,687.,11.,ink()); }
     if ui.button(
         if e.rotate {
@@ -2560,7 +2612,7 @@ fn footer(ui: &Ui, e: &Editor) {
     draw_circle(19., 884., 3., mint());
     ui.text(&e.status, 30., 889., 11., col(0xc9d8bf));
     ui.text(
-        "Drag: orbit    /    Wheel: zoom    /    Middle drag: pan    /    Space: variation",
+        "WASD: fly / Shift: faster / N: walk / F: frame / Drag: look-orbit",
         canvas_width()-647.,
         889.,
         10.,

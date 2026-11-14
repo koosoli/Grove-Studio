@@ -116,6 +116,10 @@ impl Settings {
         }
         for weed in &mut m.weeds {
             weed.per_square_metre *= self.density * keep;
+            weed.length=(weed.length.0*self.height,weed.length.1*self.height);
+            weed.stalk=(weed.stalk.0*self.height,weed.stalk.1*self.height);
+            weed.flower_height=(weed.flower_height.0*self.height,weed.flower_height.1*self.height);
+            weed.flower_size*=self.height;
         }
         Ok(m)
     }
@@ -193,7 +197,9 @@ impl Settings {
         let mut levels = Vec::new();
         for lod in 0..3 {
             let m = self.mesh(lod)?;
-            levels.push(json!({"lod":lod,"triangles":m.indices.len()/3,"vertices":m.vertices.len(),"vertexBytes":m.vertices.len()*std::mem::size_of::<Vertex>(),"indexBytes":m.indices.len()*4}));
+            let min=m.vertices.iter().fold(Vec3::splat(f32::INFINITY),|a,v|a.min(v.position));
+            let max=m.vertices.iter().fold(Vec3::splat(f32::NEG_INFINITY),|a,v|a.max(v.position));
+            levels.push(json!({"lod":lod,"triangles":m.indices.len()/3,"vertices":m.vertices.len(),"vertexBytes":m.vertices.len()*std::mem::size_of::<Vertex>(),"indexBytes":m.indices.len()*4,"bounds":{"min":min.to_array(),"max":max.to_array()},"height_m":max.y-min.y,"above_ground_m":max.y}));
         }
         Ok(
             json!({"settings":self,"levels":levels,"units":"metres","wind":"preview only; runtime grass placement and interaction are engine-owned"}),

@@ -3,6 +3,7 @@ mod agent;
 mod catalog;
 mod gamelod;
 mod grass;
+mod garden;
 mod ambience;
 mod gui;
 mod log;
@@ -28,8 +29,10 @@ fn main() {
             continue;
         }
         if ![
+            "--garden-view",
             "--grass",
             "--screenshot",
+            "--loading-screenshot",
             "--self-test",
             "--preset",
             "--config",
@@ -66,6 +69,7 @@ fn main() {
     }
     if args.iter().any(|arg| arg == "--classic")
         && (agent::option(&args, "--grass").is_some() || agent::option(&args, "--forest").is_some()
+            || agent::option(&args,"--garden-view").is_some()
             || agent::option(&args, "--preview-view").is_some()
             || args.iter().any(|a|["--garden","--scene-grass"].contains(&a.as_str())))
     {
