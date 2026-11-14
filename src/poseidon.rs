@@ -160,6 +160,8 @@ pub struct GameOptions {
     /// `--twig-cards`: every level's foliage is cards of baked twigs (gamelod's ladder replaced by
     /// twigs.rs), sampling `<name>_twigs_ca.paa` and its `_nohq`; the far level casts the shadow.
     pub twig_cards: bool,
+    /// `--card-bend`: share of the crown ellipsoid in the twig cards' normals (None = default).
+    pub card_bend: Option<f32>,
     /// Trim alpha-card outlines using the generated atlas.
     pub trim_cards: bool,
 }
@@ -199,7 +201,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
         material: String::new(),
     };
     let mut ladder = if options.twig_cards {
-        crate::twigs::ladder(s, options.budgets.as_deref(), options.trim_cards)?
+        crate::twigs::ladder(s, options.budgets.as_deref(), options.trim_cards, options.card_bend.unwrap_or(crate::twigs::DEFAULT_BEND))?
     } else if options.opaque_leaves {
         crate::gamelod::ladder_with(s, &crate::gamelod::opaque_rungs(options.budgets.as_deref())?)
     } else {
@@ -344,7 +346,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
             tree::write(&file("twigs_ca.rgba"), &twig.color)?;
             tree::write(&file("twigs_ca_nohq.rgba"), &twig.normal)?;
         }
-        tree::write(&twigs, paa_with(color, CompressionVariant::BC3, true, Some(twig.edge / crate::twigs::CELL)))?;
+        tree::write(&twigs, paa_with(color, CompressionVariant::BC3, true, Some(&twig.cells)))?;
         tree::write(&twigs_n, paa(normal, CompressionVariant::BC3, false))?;
     }
     tree::write(&bark, paa(bark_pixels, CompressionVariant::BC1, false))?;
@@ -380,7 +382,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
         "pboPrefix": prefix, "model": reference(path), "levels": counts,
         "forestProxy": options.forest_proxy, "opaqueLeaves": true, "trimCards": options.trim_cards,
         "twigCards": ladder.twig.as_ref().map(|t| json!({"texture": reference(&twigs), "normal": reference(&twigs_n),
-            "edge": t.edge, "levels": t.report})),
+            "edge": t.edge, "cells": t.cells, "levels": t.report})),
         "geometryLod": "Convex trunk collision",
         "shadowProxy": {"resolution":11000.0,"triangles":shadow.triangles(),"p3dFaces":shadow.bark.i.len()/3 + shadow.leaves.i.len()*2/3,"runtimeSelection":"requires engine support"},
         "occlusionProxy": occlusion_path.file_name().unwrap().to_string_lossy(),
@@ -572,21 +574,20 @@ fn paa(image: RgbaImage, compression: CompressionVariant, alpha: bool) -> Vec<u8
     paa_with(image, compression, alpha, None)
 }
 
-/// Alpha-test coverage per region of a `grid` x `grid` atlas: the share of texels at or above
-/// half alpha.
-fn coverage(image: &RgbaImage, grid: u32) -> Vec<f32> {
-    let cell = (image.width() / grid).max(1);
-    let mut out = vec![0f32; (grid * grid) as usize];
-    for (x, y, p) in image.enumerate_pixels() {
-        if p[3] >= 128 { out[((y / cell).min(grid - 1) * grid + (x / cell).min(grid - 1)) as usize] += 1.; }
-    }
-    out.iter().map(|n| n / (cell * cell) as f32).collect()
+/// Alpha-test coverage of a texel rectangle (x, y, w, h): the share at or above half alpha.
+fn coverage(image: &RgbaImage, r: [u32; 4]) -> f32 {
+    let mut n = 0;
+    for y in r[1]..r[1] + r[3] { for x in r[0]..r[0] + r[2] { if image.get_pixel(x, y)[3] >= 128 { n += 1; } } }
+    n as f32 / (r[2] * r[3]).max(1) as f32
 }
 
-/// `coverage_grid`: scale each mip's alpha per atlas cell so the alpha test keeps the base
-/// level's coverage (a box-filtered twig otherwise dissolves at a distance).
-fn paa_with(mut image: RgbaImage, compression: CompressionVariant, alpha: bool, coverage_grid: Option<u32>) -> Vec<u8> {
-    let base = coverage_grid.map(|g| (g, coverage(&image, g)));
+/// `cells`: scale each mip's alpha per atlas cell (texel rectangles of the base level) so the
+/// alpha test keeps the base level's coverage; a box-filtered twig otherwise dissolves at a
+/// distance. This is the one coverage lift: the engine's `cutout_mip_alpha` must stay off for
+/// these textures (its shadow pass does not apply one, this one reaches the shadows too).
+fn paa_with(mut image: RgbaImage, compression: CompressionVariant, alpha: bool, cells: Option<&[[u32; 4]]>) -> Vec<u8> {
+    let base: Option<Vec<([u32; 4], f32)>> = cells.map(|c| c.iter().map(|&r| (r, coverage(&image, r))).collect());
+    let edge = image.width();
     let magic = if matches!(compression, CompressionVariant::BC1) {
         0xff01_u16
     } else {
@@ -618,17 +619,18 @@ fn paa_with(mut image: RgbaImage, compression: CompressionVariant, alpha: bool, 
             break;
         }
         image = image::imageops::resize(&image, size / 2, size / 2, FilterType::Triangle);
-        if let Some((grid, wanted)) = &base {
-            let cell = image.width() / grid;
-            if cell >= 2 {
-                for (k, &want) in wanted.iter().enumerate() {
-                    let (cx, cy) = (k as u32 % grid * cell, k as u32 / grid * cell);
+        if let Some(wanted) = &base {
+            let down = edge / image.width();
+            for &(r, want) in wanted {
+                let (cx, cy, cw, ch) = (r[0] / down, r[1] / down, r[2] / down, r[3] / down);
+                if cw < 2 || ch < 2 { continue; }
+                {
                     let covered = |scale: f32, image: &RgbaImage| {
                         let mut n = 0;
-                        for y in cy..cy + cell { for x in cx..cx + cell {
+                        for y in cy..cy + ch { for x in cx..cx + cw {
                             if image.get_pixel(x, y)[3] as f32 * scale >= 127.5 { n += 1; }
                         } }
-                        n as f32 / (cell * cell) as f32
+                        n as f32 / (cw * ch) as f32
                     };
                     let (mut lo, mut hi) = (1f32, 8f32);
                     if covered(lo, &image) >= want { continue; }
@@ -636,7 +638,7 @@ fn paa_with(mut image: RgbaImage, compression: CompressionVariant, alpha: bool, 
                         let mid = (lo + hi) * 0.5;
                         if covered(mid, &image) < want { lo = mid } else { hi = mid }
                     }
-                    for y in cy..cy + cell { for x in cx..cx + cell {
+                    for y in cy..cy + ch { for x in cx..cx + cw {
                         let p = image.get_pixel_mut(x, y);
                         p[3] = (p[3] as f32 * hi).min(255.).round() as u8;
                     } }
@@ -664,6 +666,7 @@ mod tests {
             budgets: None,
             opaque_leaves: false,
             twig_cards: false,
+            card_bend: None,
             trim_cards: true,
         };
         let asset = export_game(&s, &path, &options).unwrap();
@@ -710,6 +713,7 @@ mod tests {
             budgets: Some(vec![40_000, 400]),
             opaque_leaves: true,
             twig_cards: false,
+            card_bend: None,
             trim_cards: true,
         };
         let asset = export_game(&s, &path, &options).unwrap();

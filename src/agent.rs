@@ -19,8 +19,9 @@ Game LOD ladder (near/mid/far/very far, P3D): grove-studio --headless --preset s
   --lod game --out exports/beech.p3d [--prefix PBO_PREFIX] [--forest-proxy] (also with --inspect)
   [--no-trim-cards] [--budgets near,mid,far,veryfar] [--opaque-leaves [--budgets near,veryfar]]: opaque leaf pieces
   in one near level for an engine that simplifies per cluster, plus the very far spray level
-  [--twig-cards [--budgets near,mid,far,veryfar]]: leafy twigs baked into a 2048 atlas (colour, coverage,
-  normal) and drawn as crossed cards; default budgets 8000,3000,900,250 faces; very far = 2 crossed tree cards
+  [--twig-cards [--budgets near,mid,far,veryfar] [--card-bend 0..1]]: leafy twigs baked into a 2048 atlas
+  (colour, coverage, normal) drawn as crossed cards; budgets in P3D faces (default 8000,3000,900,250);
+  --card-bend bends card normals to the crown (default 0: the engine bends them)
 Species file: --species-file species/forest/forest-beech.species --preset solstice-cwa-buk
   grows the preset from that text (forest-grown heights up to 40 m).
 PNG preview: grove-studio --headless --preview --out exports/forest.png --forest solstice-oak,solstice-fir
@@ -42,6 +43,11 @@ Preview options: --garden, --scene-grass, --forest SPECIES, --preview-view lit|c
 MCP: grove-studio --mcp [--output-root DIRECTORY]
 Validation: --self-test results.json; --screenshot image.png
 ";
+
+/// `--card-bend 0..1`: share of the crown ellipsoid in the twig cards' normals.
+fn card_bend(args: &[String]) -> Result<Option<f32>, String> {
+    option(args, "--card-bend").map(|v| v.parse::<f32>().map_err(|_| "Invalid --card-bend".to_string())).transpose()
+}
 
 pub fn option(args: &[String], key: &str) -> Option<String> {
     args.windows(2).find(|a| a[0] == key).map(|a| a[1].clone())
@@ -92,7 +98,7 @@ fn headless(args: &[String]) -> Result<(), String> {
         match args[i].as_str() {
             "--headless" | "--budget-report" | "--inspect" | "--preview" | "--forest-proxy" | "--opaque-leaves" | "--twig-cards" | "--no-trim-cards" | "--original-leaves" | "--no-leaf-specular" | "--no-forest-floor" | "--even-mix" | "--structure" | "--garden" | "--scene-grass" => i += 1,
             "--randomize" | "--random-field" | "--random-seed" | "--bark-weathering" | "--bark-color" | "--bark-height" | "--bark-normal" | "--leaf-atlas" | "--preset" | "--seed" | "--height" | "--maturity" | "--density" | "--format" | "--lod" | "--count"
-            | "--prefix" | "--species-file" | "--budgets"
+            | "--prefix" | "--species-file" | "--budgets" | "--card-bend"
             | "--config" | "--out" | "--season" | "--parallax-depth" | "--forest"
             | "--preview-view" | "--distance" | "--wind-time" | "--time-of-day" | "--forest-count"
             | "--garden-view" | "--sun-azimuth" | "--skybox" | "--cloud-cover" | "--leaf-roughness" | "--leaf-transmission" | "--wind-direction" | "--wind-strength" | "--wind-gust" | "--branch-sway" | "--branch-springiness" | "--leaf-flutter" => {
@@ -171,7 +177,7 @@ fn headless(args: &[String]) -> Result<(), String> {
         for name in names {
             let settings = if name == s.species { s.clone() } else { Settings::preset(&name)? };
             let mut ladder = if report_twigs {
-                crate::twigs::ladder(&settings, report_budgets.as_deref(), !args.iter().any(|a| a == "--no-trim-cards"))?
+                crate::twigs::ladder(&settings, report_budgets.as_deref(), !args.iter().any(|a| a == "--no-trim-cards"), card_bend(args)?.unwrap_or(crate::twigs::DEFAULT_BEND))?
             } else if report_opaque {
                 crate::gamelod::ladder_with(&settings, &crate::gamelod::opaque_rungs(report_budgets.as_deref())?)
             } else if let Some(b) = &report_budgets {
@@ -298,7 +304,7 @@ fn headless(args: &[String]) -> Result<(), String> {
     if game {
         if args.iter().any(|a| a == "--inspect") {
             let mut ladder = if twig_cards {
-                crate::twigs::ladder(&s, budgets.as_deref(), !args.iter().any(|a| a == "--no-trim-cards"))?
+                crate::twigs::ladder(&s, budgets.as_deref(), !args.iter().any(|a| a == "--no-trim-cards"), card_bend(args)?.unwrap_or(crate::twigs::DEFAULT_BEND))?
             } else if opaque_leaves {
                 crate::gamelod::ladder_with(&s, &crate::gamelod::opaque_rungs(budgets.as_deref())?)
             } else {
@@ -327,6 +333,7 @@ fn headless(args: &[String]) -> Result<(), String> {
             budgets,
             opaque_leaves,
             twig_cards,
+            card_bend: card_bend(args)?,
             trim_cards: !args.iter().any(|a| a == "--no-trim-cards"),
         };
         let mut files = vec![];
@@ -623,7 +630,7 @@ pub fn call_tool(name: &str, args: &Value, root: &Path) -> Result<Value, String>
         }
         let trim = args.get("trimCards").map(|v| v.as_bool().ok_or("trimCards must be a boolean")).transpose()?.unwrap_or(true);
         check_outputs(Some(&root), std::iter::once(base.clone()).chain(crate::poseidon::game_sidecars(&base)))?;
-        let options = crate::poseidon::GameOptions { prefix: None, forest_proxy: false, budgets: None, opaque_leaves: false, twig_cards: false, trim_cards: trim };
+        let options = crate::poseidon::GameOptions { prefix: None, forest_proxy: false, budgets: None, opaque_leaves: false, twig_cards: false, card_bend: None, trim_cards: trim };
         let file = crate::poseidon::export_game(&s, &base, &options)?;
         return Ok(json!({"ok":true,"files":[file]}));
     }

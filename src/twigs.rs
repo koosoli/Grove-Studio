@@ -1,5 +1,5 @@
 //! Baked twig cards (`--twig-cards`): a game LOD ladder that stays full at Reforger-style
-//! triangle budgets (8k / 3k / 900 / 250 triangles).
+//! budgets (8000 / 3000 / 900 / 250 P3D faces, the reversed face of each card triangle counted).
 //!
 //! At such budgets the classic ladder thins single leaves until the crown reads as a sapling.
 //! Here the thin wood and its leaves are not drawn as geometry at all: every leafy twig (the
@@ -7,28 +7,28 @@
 //! texture is a real twig of the same tree, rendered orthographically into an atlas with its
 //! colour, coverage and tangent-space normal. Thousands of leaves then cost a few triangles.
 //!
-//! | level    | wood                         | foliage                                         |
-//! |----------|------------------------------|-------------------------------------------------|
-//! | near     | branches above the cutoff    | twig cards (front + crossed side view)          |
-//! | mid      | thicker cutoff               | branch cards baked from larger subtrees         |
-//! | far      | trunk and limbs              | limb cards                                      |
-//! | very far | none (baked into the cards)  | two crossed whole-tree cards, ellipsoid normals |
+//! | level    | wood                                | foliage                                       |
+//! |----------|-------------------------------------|-----------------------------------------------|
+//! | near     | branches above the cutoff           | twig cards (front + crossed side view)        |
+//! | mid      | thicker cutoff, inside the cards    | branch cards baked from larger subtrees       |
+//! | far      | trunk and limbs, inside the cards   | limb cards, 4 variants                        |
+//! | very far | none (baked into the cards)         | 2 crossed trimmed 2x2 cards + 1 horizontal    |
 //!
 //! The cutoff of each level is searched so its cards fill the level's budget, and what the
-//! cards leave is given to the wood, so a level lands close to its budget instead of at ~60 %.
-//! Atlas: `EDGE` x `EDGE`, a 4 x 4 grid of `CELL` cells (near 4 variants x 2 views, mid 2 x 2,
-//! far 1 x 2, very far 1 x 2).
+//! cards leave is given to the wood. Past near the wood is clipped to the crown the cards draw
+//! (no bare limbs). Each level's cards are then scaled until its projected coverage (side, 45
+//! degrees, below, above) is within 3 % of the near level's, so density does not step.
+//! Atlas: `EDGE` x `EDGE`, cells with an 8 texel transparent gutter (see `layout`).
 use crate::gamelod::{self, Ladder, Level, Rung, LADDER};
 use crate::tree::{Part, Settings, V};
 use macroquad::prelude::{vec2, Vec2, Vec3};
 use std::collections::HashMap;
 
 pub const EDGE: u32 = 2048;
-pub const CELL: u32 = 512;
 /// Supersampling per axis while baking.
 const SS: u32 = 3;
-/// The default budgets of `--twig-cards`, in triangles as Reforger counts them (one per card
-/// triangle). The P3D also writes a reversed face per foliage triangle, so it holds more faces.
+/// The default budgets of `--twig-cards`, in P3D faces as the engine draws them: every card
+/// triangle counts twice (its reversed face), wood once.
 pub const BUDGETS: [usize; 4] = [8_000, 3_000, 900, 250];
 
 /// The baked atlas: `color` is sRGB RGBA with coverage in alpha; `normal` is the tangent-space
@@ -38,23 +38,45 @@ pub struct TwigAtlas {
     pub edge: u32,
     pub color: Vec<u8>,
     pub normal: Vec<u8>,
-    /// Debug: per level, how many groups (cards' subtrees) and the radius cutoff used.
+    /// Debug: per level, how many groups (cards' subtrees) and the radius cutoff used, and the
+    /// projected coverage per level.
     pub report: Vec<serde_json::Value>,
+    /// Every cell (x, y, w, h in texels); the PAA writer keeps alpha-test coverage per cell.
+    pub cells: Vec<[u32; 4]>,
 }
 
+/// An atlas cell in texels. The outer `GUTTER` texels stay transparent (colour bled into them),
+/// so mipmaps and BC blocks of neighbouring cells do not bleed into each other.
 #[derive(Clone, Copy)]
 struct Cell {
     x: u32,
     y: u32,
+    w: u32,
+    h: u32,
 }
 
+const GUTTER: u32 = 8;
+
 impl Cell {
-    fn slot(k: u32) -> Cell {
-        Cell { x: (k % (EDGE / CELL)) * CELL, y: (k / (EDGE / CELL)) * CELL }
+    fn square(x: u32, y: u32, size: u32) -> Cell {
+        Cell { x, y, w: size, h: size }
     }
+    /// UV of the point (s, t) in 0..1 (t down) of the cell's inner area.
     fn uv(&self, s: f32, t: f32) -> Vec2 {
-        vec2((self.x as f32 + s * CELL as f32) / EDGE as f32, (self.y as f32 + t * CELL as f32) / EDGE as f32)
+        vec2((self.x as f32 + GUTTER as f32 + s * (self.w - 2 * GUTTER) as f32) / EDGE as f32,
+            (self.y as f32 + GUTTER as f32 + t * (self.h - 2 * GUTTER) as f32) / EDGE as f32)
     }
+}
+
+/// The atlas layout: near 4 twigs x 2 views (512), mid 2 x 2 (512), far 4 x 2 (256), very far
+/// front and side (256 x 512) and top (512).
+fn layout() -> [Vec<Cell>; 4] {
+    let near = (0..8).map(|k| Cell::square(k % 4 * 512, k / 4 * 512, 512)).collect();
+    let mid = (0..4).map(|k| Cell::square(k * 512, 1024, 512)).collect();
+    let far = (0..8).map(|k| Cell::square(k % 4 * 256, 1536 + k / 4 * 256, 256)).collect();
+    let very_far = vec![Cell { x: 1024, y: 1536, w: 256, h: 512 }, Cell { x: 1280, y: 1536, w: 256, h: 512 },
+        Cell::square(1536, 1536, 512)];
+    [near, mid, far, very_far]
 }
 
 /// An orthographic view of a subtree: image X along `t`, image up along `b`, the viewer on the
@@ -309,16 +331,17 @@ fn principal_axes(points: &[Vec3], centre: Vec3) -> ([f32; 3], [Vec3; 3]) {
     (order.map(|k| m[k][k] as f32), axes)
 }
 
-/// Renders the triangles of a subtree in `view` into `cell` of the atlas.
+/// Renders the triangles of a subtree in `view` into the inner area of `cell`.
 fn bake(tree: &Tree, view: &View, leaf_tris: &[u32], bark_tris: &[u32], atlas: &mut TwigAtlas, cell: Cell) {
-    let size = (CELL * SS) as usize;
-    let mut depth = vec![f32::MIN; size * size];
-    let mut color = vec![[0f32; 3]; size * size];
-    let mut normal = vec![Vec3::ZERO; size * size];
+    let (iw, ih) = ((cell.w - 2 * GUTTER) as usize, (cell.h - 2 * GUTTER) as usize);
+    let (sw, sh) = (iw * SS as usize, ih * SS as usize);
+    let mut depth = vec![f32::MIN; sw * sh];
+    let mut color = vec![[0f32; 3]; sw * sh];
+    let mut normal = vec![Vec3::ZERO; sw * sh];
     let zr = (view.z.0, (view.z.1 - view.z.0).max(1e-4));
     let project = |p: Vec3| {
         let l = view.local(p);
-        (vec2((l.x - view.x.0) / (view.x.1 - view.x.0) * size as f32, (view.y.1 - l.y) / (view.y.1 - view.y.0) * size as f32), l.z)
+        (vec2((l.x - view.x.0) / (view.x.1 - view.x.0) * sw as f32, (view.y.1 - l.y) / (view.y.1 - view.y.0) * sh as f32), l.z)
     };
     for (part, tris, leaf) in [(tree.bark, bark_tris, false), (tree.leaves, leaf_tris, true)] {
         for &t in tris {
@@ -329,8 +352,8 @@ fn bake(tree: &Tree, view: &View, leaf_tris: &[u32], bark_tris: &[u32], atlas: &
             }
             let [a, b, c] = vs.map(|v| project(v.p));
             gamelod::raster(a, b, c, |px, py, l0, l1, l2| {
-                if px >= size || py >= size { return; }
-                let i = py * size + px;
+                if px >= sw || py >= sh { return; }
+                let i = py * sw + px;
                 let z = a.1 * l0 + b.1 * l1 + c.1 * l2;
                 if z <= depth[i] { return; }
                 let uv = vs[0].uv * l0 + vs[1].uv * l1 + vs[2].uv * l2;
@@ -358,43 +381,46 @@ fn bake(tree: &Tree, view: &View, leaf_tris: &[u32], bark_tris: &[u32], atlas: &
         }
     }
     let edge = atlas.edge as usize;
-    let mut texels = vec![None::<([f32; 3], Vec3)>; (CELL * CELL) as usize];
-    for ty in 0..CELL as usize {
-        for tx in 0..CELL as usize {
+    let (cw, ch) = (cell.w as usize, cell.h as usize);
+    let g = GUTTER as usize;
+    let mut texels = vec![None::<([f32; 3], Vec3)>; cw * ch];
+    for ty in 0..ch {
+        for tx in 0..cw {
+            let o = ((cell.y as usize + ty) * edge + cell.x as usize + tx) * 4;
+            atlas.color[o + 3] = 0;
+            if tx < g || ty < g || tx >= g + iw || ty >= g + ih { continue; }
+            let (ix, iy) = (tx - g, ty - g);
             let (mut sum, mut nsum, mut k) = ([0f32; 3], Vec3::ZERO, 0);
             for sy in 0..SS as usize {
                 for sx in 0..SS as usize {
-                    let i = (ty * SS as usize + sy) * size + tx * SS as usize + sx;
+                    let i = (iy * SS as usize + sy) * sw + ix * SS as usize + sx;
                     if depth[i] > f32::MIN {
                         k += 1;
-                        for ch in 0..3 { sum[ch] += color[i][ch]; }
+                        for c in 0..3 { sum[c] += color[i][c]; }
                         nsum += normal[i];
                     }
                 }
             }
-            let o = ((cell.y as usize + ty) * edge + cell.x as usize + tx) * 4;
-            let coverage = k as f32 / (SS * SS) as f32;
-            atlas.color[o + 3] = (coverage * 255.).round() as u8;
+            atlas.color[o + 3] = (k as f32 / (SS * SS) as f32 * 255.).round() as u8;
             if k > 0 {
-                texels[ty * CELL as usize + tx] = Some((sum.map(|x| x / k as f32), nsum.normalize_or(Vec3::Z)));
+                texels[ty * cw + tx] = Some((sum.map(|x| x / k as f32), nsum.normalize_or(Vec3::Z)));
             }
         }
     }
-    // Bleed colour and normal into the empty texels, so mipmaps and BC blocks do not pull in
-    // black at the outline.
-    for _ in 0..12 {
+    // Bleed colour and normal into the empty texels and the gutter, so mipmaps and BC blocks do
+    // not pull in black at the outline.
+    for _ in 0..16 {
         let previous = texels.clone();
-        let cw = CELL as usize;
-        for y in 0..cw {
+        for y in 0..ch {
             for x in 0..cw {
                 if previous[y * cw + x].is_some() { continue; }
                 let (mut sum, mut nsum, mut k) = ([0f32; 3], Vec3::ZERO, 0);
                 for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
                     let (nx, ny) = (x as i32 + dx, y as i32 + dy);
-                    if nx < 0 || ny < 0 || nx >= cw as i32 || ny >= cw as i32 { continue; }
+                    if nx < 0 || ny < 0 || nx >= cw as i32 || ny >= ch as i32 { continue; }
                     if let Some((c, n)) = previous[ny as usize * cw + nx as usize] {
                         k += 1;
-                        for ch in 0..3 { sum[ch] += c[ch]; }
+                        for c2 in 0..3 { sum[c2] += c[c2]; }
                         nsum += n;
                     }
                 }
@@ -403,11 +429,11 @@ fn bake(tree: &Tree, view: &View, leaf_tris: &[u32], bark_tris: &[u32], atlas: &
         }
     }
     let fallback = texels.iter().flatten().next().map_or([0.05, 0.1, 0.03], |t| t.0);
-    for ty in 0..CELL as usize {
-        for tx in 0..CELL as usize {
+    for ty in 0..ch {
+        for tx in 0..cw {
             let o = ((cell.y as usize + ty) * edge + cell.x as usize + tx) * 4;
-            let (c, n) = texels[ty * CELL as usize + tx].unwrap_or((fallback, Vec3::Z));
-            for ch in 0..3 { atlas.color[o + ch] = gamelod::srgb_byte(c[ch]); }
+            let (c, n) = texels[ty * cw + tx].unwrap_or((fallback, Vec3::Z));
+            for k in 0..3 { atlas.color[o + k] = gamelod::srgb_byte(c[k]); }
             let n = Vec3::new(n.x, n.y, n.z.max(0.05)).normalize();
             let byte = |c: f32| ((c * 0.5 + 0.5) * 255.).round().clamp(0., 255.) as u8;
             atlas.normal[o..o + 4].copy_from_slice(&[0, byte(n.y), byte(n.z), byte(n.x)]);
@@ -415,19 +441,9 @@ fn bake(tree: &Tree, view: &View, leaf_tris: &[u32], bark_tris: &[u32], atlas: &
     }
 }
 
-/// The card outline of a baked cell in cell coordinates (0..1, t down): the trimmed hull, or
-/// the whole cell.
-fn outline(atlas: &TwigAtlas, cell: Cell, trim: bool) -> Vec<Vec2> {
-    let full = vec![vec2(0., 1.), vec2(1., 1.), vec2(1., 0.), vec2(0., 0.)];
-    if !trim { return full; }
-    let edge = atlas.edge;
-    let hull = gamelod::alpha_outline(&|x, y| atlas.color[((y * edge + x) * 4 + 3) as usize] >= 96,
-        (cell.x, cell.x + CELL), (cell.y, cell.y + CELL), edge, 2.);
-    if hull.len() < 3 { return full; }
-    // to cell coordinates, clipped to the cell
-    let mut poly: Vec<Vec2> = hull.iter().map(|p| vec2((p.x * edge as f32 - cell.x as f32) / CELL as f32,
-        (p.y * edge as f32 - cell.y as f32) / CELL as f32)).collect();
-    for (axis, limit, keep_below) in [(0, 0., false), (0, 1., true), (1, 0., false), (1, 1., true)] {
+/// Clips a polygon (cell coordinates) to the rectangle s0..s1 x t0..t1.
+fn clip_rect(mut poly: Vec<Vec2>, s: (f32, f32), t: (f32, f32)) -> Vec<Vec2> {
+    for (axis, limit, keep_below) in [(0, s.0, false), (0, s.1, true), (1, t.0, false), (1, t.1, true)] {
         let input = std::mem::take(&mut poly);
         if input.is_empty() { break; }
         let inside = |p: Vec2| { let c = if axis == 0 { p.x } else { p.y }; if keep_below { limit - c } else { c - limit } };
@@ -440,11 +456,30 @@ fn outline(atlas: &TwigAtlas, cell: Cell, trim: bool) -> Vec<Vec2> {
         }
     }
     poly.dedup_by(|a, b| a.distance_squared(*b) < 1e-10);
+    if poly.len() > 1 && poly[0].distance_squared(poly[poly.len() - 1]) < 1e-10 { poly.pop(); }
+    poly
+}
+
+/// The card outline of a baked cell in cell coordinates (0..1 over the inner area, t down): the
+/// trimmed hull, or the whole cell.
+fn outline(atlas: &TwigAtlas, cell: Cell, trim: bool) -> Vec<Vec2> {
+    let full = vec![vec2(0., 1.), vec2(1., 1.), vec2(1., 0.), vec2(0., 0.)];
+    if !trim { return full; }
+    let edge = atlas.edge;
+    let (x0, y0) = (cell.x + GUTTER, cell.y + GUTTER);
+    let (iw, ih) = ((cell.w - 2 * GUTTER) as f32, (cell.h - 2 * GUTTER) as f32);
+    let hull = gamelod::alpha_outline(&|x, y| atlas.color[((y * edge + x) * 4 + 3) as usize] >= 96,
+        (x0, cell.x + cell.w - GUTTER), (y0, cell.y + cell.h - GUTTER), edge, 2.);
+    if hull.len() < 3 { return full; }
+    let poly = hull.iter().map(|p| vec2((p.x * edge as f32 - x0 as f32) / iw, (p.y * edge as f32 - y0 as f32) / ih)).collect();
+    let poly = clip_rect(poly, (0., 1.), (0., 1.));
     if poly.len() >= 3 { poly } else { full }
 }
 
-/// Appends one card: `shape` (cell coordinates) on `view`'s plane, UVs into `cell`.
+/// Appends one card: `shape` (cell coordinates) on `view`'s plane, UVs into `cell`. Normals are
+/// the card's, bent by `bend` toward the crown ellipsoid.
 fn emit(out: &mut Part, tree: &Tree, view: &View, cell: Cell, shape: &[Vec2], owner: u32, bend: f32) {
+    if shape.len() < 3 { return; }
     let first = out.v.len() as u32;
     for &s in shape {
         let p = view.at(s.x, s.y);
@@ -460,17 +495,113 @@ fn emit(out: &mut Part, tree: &Tree, view: &View, cell: Cell, shape: &[Vec2], ow
     }
 }
 
-struct LevelSpec {
-    variants: usize,
-    views: usize,
-    first_slot: u32,
+/// The wood triangles (index triples into `bark`) that stay inside the crown the cards draw:
+/// per height band and compass sector, no farther from the trunk axis than a card reaches.
+/// Below the cards (the bole) everything stays; above them nothing.
+fn clip_to_cards(indices: Vec<u32>, bark: &Part, cards: &Part) -> Vec<u32> {
+    if cards.v.is_empty() { return indices; }
+    const BANDS: usize = 24;
+    const SECTORS: usize = 12;
+    let (lo, hi) = cards.v.iter().fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(v.p.y), b.max(v.p.y)));
+    let span = (hi - lo).max(1e-3);
+    let cell = |p: Vec3| {
+        let band = (((p.y - lo) / span) * BANDS as f32).floor().clamp(0., BANDS as f32 - 1.) as usize;
+        let angle = p.z.atan2(p.x) + std::f32::consts::PI;
+        let sector = ((angle / std::f32::consts::TAU) * SECTORS as f32).floor().clamp(0., SECTORS as f32 - 1.) as usize;
+        (band, sector)
+    };
+    let mut reach = [[0f32; SECTORS]; BANDS];
+    for v in &cards.v {
+        let (b, s) = cell(v.p);
+        reach[b][s] = reach[b][s].max(vec2(v.p.x, v.p.z).length());
+    }
+    // neighbours share their reach, so a gap between two cards does not cut a limb in half
+    let mut smooth = reach;
+    for b in 0..BANDS {
+        for s in 0..SECTORS {
+            for db in [-1i32, 0, 1] {
+                for ds in [-1i32, 0, 1] {
+                    let nb = b as i32 + db;
+                    if nb < 0 || nb >= BANDS as i32 { continue; }
+                    let ns = (s as i32 + ds).rem_euclid(SECTORS as i32) as usize;
+                    smooth[b][s] = smooth[b][s].max(reach[nb as usize][ns]);
+                }
+            }
+        }
+    }
+    indices.chunks_exact(3).filter(|t| {
+        let c = t.iter().map(|&i| bark.v[i as usize].p).sum::<Vec3>() / 3.;
+        if c.y < lo { return true; }
+        if c.y > hi { return false; }
+        let (b, s) = cell(c);
+        vec2(c.x, c.z).length() <= smooth[b][s]
+    }).flatten().copied().collect()
 }
 
-/// The `--twig-cards` ladder. `budgets` are triangles per level (default `BUDGETS`).
-pub fn ladder(s: &Settings, budgets: Option<&[usize]>, trim: bool) -> Result<Ladder, String> {
+/// The four directions the projected coverage is measured from: side, 45 degrees round, from
+/// below and from above (image right `t`, image up `b`).
+const COVERAGE_VIEWS: [(&str, [f32; 3], [f32; 3]); 4] = [
+    ("side", [1., 0., 0.], [0., 1., 0.]),
+    ("45deg", [std::f32::consts::FRAC_1_SQRT_2, 0., -std::f32::consts::FRAC_1_SQRT_2], [0., 1., 0.]),
+    ("below", [1., 0., 0.], [0., 0., 1.]),
+    ("above", [1., 0., 0.], [0., 0., -1.]),
+];
+
+/// Projected area (m^2) a level covers from each of `COVERAGE_VIEWS`: wood opaque, cards where
+/// the atlas alpha passes the 0.5 test, at `px` metres per pixel.
+fn coverage(level: &Level, atlas: &TwigAtlas, px: f32) -> [f32; 4] {
+    COVERAGE_VIEWS.map(|(_, t, b)| {
+        let (t, b) = (Vec3::from_array(t), Vec3::from_array(b));
+        let points = level.bark.v.iter().chain(&level.leaves.v).map(|v| vec2(v.p.dot(t), v.p.dot(b)));
+        let (lo, hi) = points.fold((Vec2::splat(f32::MAX), Vec2::splat(f32::MIN)), |(a, c), p| (a.min(p), c.max(p)));
+        if lo.x > hi.x { return 0.; }
+        let (w, h) = (((hi.x - lo.x) / px) as usize + 2, ((hi.y - lo.y) / px) as usize + 2);
+        let mut hit = vec![false; w * h];
+        let project = |p: Vec3| (vec2((p.dot(t) - lo.x) / px, (hi.y - p.dot(b)) / px), 0.);
+        for (part, cards) in [(&level.bark, false), (&level.leaves, true)] {
+            for tri in part.i.chunks_exact(3) {
+                let vs: [V; 3] = std::array::from_fn(|k| part.v[tri[k] as usize]);
+                let [a, bb, c] = vs.map(|v| project(v.p));
+                gamelod::raster(a, bb, c, |x, y, l0, l1, l2| {
+                    if x >= w || y >= h { return; }
+                    if cards {
+                        let uv = vs[0].uv * l0 + vs[1].uv * l1 + vs[2].uv * l2;
+                        let ax = ((uv.x * atlas.edge as f32) as u32).min(atlas.edge - 1);
+                        let ay = ((uv.y * atlas.edge as f32) as u32).min(atlas.edge - 1);
+                        if atlas.color[((ay * atlas.edge + ax) * 4 + 3) as usize] < 128 { return; }
+                    }
+                    hit[y * w + x] = true;
+                });
+            }
+        }
+        hit.iter().filter(|&&h| h).count() as f32 * px * px
+    })
+}
+
+/// Grows or shrinks every card of `leaves` (vertex ranges `cards`) about its centre, by `scale`
+/// across (x, z) and along y, from the positions `original`.
+fn scale_cards(leaves: &mut Part, original: &[V], cards: &[(usize, usize)], scale: Vec2) {
+    let s = Vec3::new(scale.x, scale.y, scale.x);
+    for &(a, b) in cards {
+        let centre = original[a..b].iter().map(|v| v.p).sum::<Vec3>() / (b - a) as f32;
+        for k in a..b { leaves.v[k].p = centre + (original[k].p - centre) * s; }
+    }
+}
+
+/// The default `--card-bend`: OpenPoseidon bends foliage normals toward the canopy itself, so
+/// the cards keep their own normals (the bend is applied once, by the engine).
+pub const DEFAULT_BEND: f32 = 0.0;
+
+/// The `--twig-cards` ladder. `budgets` are P3D faces per level, the reversed face of every card
+/// triangle included (default `BUDGETS`); `bend` is the share of the crown ellipsoid normal in the
+/// card vertex normals (`--card-bend`, default `DEFAULT_BEND`).
+pub fn ladder(s: &Settings, budgets: Option<&[usize]>, trim: bool, bend: f32) -> Result<Ladder, String> {
     let budgets: Vec<usize> = budgets.map_or(BUDGETS.to_vec(), |b| b.to_vec());
-    if budgets.len() != 4 || budgets.windows(2).any(|w| w[1] >= w[0]) || budgets[3] < 24 {
-        return Err("--twig-cards --budgets wants four shrinking triangle counts, the last at least 24".into());
+    if budgets.len() != 4 || budgets.windows(2).any(|w| w[1] >= w[0]) || budgets[3] < 48 {
+        return Err("--twig-cards --budgets wants four shrinking P3D face counts, the last at least 48".into());
+    }
+    if !(0. ..=1.).contains(&bend) {
+        return Err("--card-bend wants 0..1".into());
     }
     let mut full = crate::tree::generate(s, 0);
     let foot = gamelod::trunk_foot(&full.bark);
@@ -514,26 +645,27 @@ pub fn ladder(s: &Settings, budgets: Option<&[usize]>, trim: bool) -> Result<Lad
         needles: crate::reference::leaf_kind(s) == Some(solstice_procgen::foliage::leaf::LeafKind::Needles),
     };
     let edge = EDGE as usize;
-    let mut atlas = TwigAtlas { edge: EDGE, color: vec![0; edge * edge * 4], normal: vec![0; edge * edge * 4], report: Vec::new() };
+    let cells = layout();
+    let mut atlas = TwigAtlas { edge: EDGE, color: vec![0; edge * edge * 4], normal: vec![0; edge * edge * 4], report: Vec::new(),
+        cells: cells.iter().flatten().map(|c| [c.x, c.y, c.w, c.h]).collect() };
     for p in atlas.normal.chunks_exact_mut(4) { p.copy_from_slice(&[0, 128, 255, 128]); }
-    let specs = [
-        LevelSpec { variants: 4, views: 2, first_slot: 0 },
-        LevelSpec { variants: 2, views: 2, first_slot: 8 },
-        LevelSpec { variants: 1, views: 2, first_slot: 12 },
-    ];
+    // (variants, views) of near, mid, far
+    let specs = [(4usize, 2usize), (2, 2), (4, 2)];
     // every radius a cutoff can sit at, thinnest first
     let mut radii: Vec<f32> = tree.radius.clone();
     radii.push(f32::MAX);
     radii.sort_by(f32::total_cmp);
     radii.dedup();
     let mut levels = Vec::new();
+    let mut card_ranges: Vec<Vec<(usize, usize)>> = Vec::new();
     let mut previous_cutoff = 0f32;
-    for (k, spec) in specs.iter().enumerate() {
+    for (k, &(variants, views)) in specs.iter().enumerate() {
         let mut rung: Rung = LADDER[k];
         rung.budget = budgets[k];
         rung.min_branch = 0.;
-        // an untrimmed card is 2 triangles, a trimmed one at most 6 (usually 4)
-        let faces_per_group = spec.views * if trim { 5 } else { 2 };
+        // P3D faces: an untrimmed card is 2 triangles, a trimmed one at most 6 (usually 4-5),
+        // each drawn twice (the reversed face)
+        let faces_per_group = views * if trim { 10 } else { 4 };
         let wood_share = (rung.budget as f64 * LADDER[k].wood as f64 / LADDER[k].budget as f64) as usize;
         let total_leaf_tris = full.leaves.i.len() / 3;
         let fits = |cutoff: f32| {
@@ -549,7 +681,6 @@ pub fn ladder(s: &Settings, budgets: Option<&[usize]>, trim: bool) -> Result<Lad
             let m = (a + b) / 2;
             if fits(radii[m]) { b = m } else { a = m + 1 }
         }
-        // radii[a] is the first that fits; cut just above it so that radius is included
         let mut cutoff = if radii[a] == f32::MAX { f32::MAX } else { radii[a] * 1.0001 };
         let (mut groups, mut wood) = tree.groups_at(cutoff);
         if k > 0 && groups.len() < 8 {
@@ -571,19 +702,20 @@ pub fn ladder(s: &Settings, budgets: Option<&[usize]>, trim: bool) -> Result<Lad
         let mut candidates: Vec<&(usize, f32, f32)> = sizes.iter().filter(|(g, _, _)| groups[*g].twig && groups[*g].leaf_tris.len() >= 4).collect();
         if candidates.is_empty() { candidates = sizes.iter().filter(|(g, _, _)| !groups[*g].leaf_tris.is_empty()).collect(); }
         candidates.sort_by(|a, b| a.1.total_cmp(&b.1));
-        let quantiles: &[f32] = match spec.variants { 1 => &[0.75], 2 => &[0.55, 0.85], _ => &[0.4, 0.6, 0.75, 0.9] };
+        let quantiles: &[f32] = match variants { 1 => &[0.75], 2 => &[0.55, 0.85], _ => &[0.4, 0.6, 0.75, 0.9] };
         let mut reps: Vec<usize> = quantiles.iter().filter_map(|q| candidates.get(((candidates.len() as f32 - 1.) * q).round() as usize).map(|c| c.0)).collect();
         reps.dedup();
         let mut shapes = Vec::new();
         for (r, &g) in reps.iter().enumerate() {
-            let views = tree.views(&groups[g]);
-            for (v, view) in views.iter().enumerate().take(spec.views) {
-                let cell = Cell::slot(spec.first_slot + (r * spec.views + v) as u32);
+            let group_views = tree.views(&groups[g]);
+            for (v, view) in group_views.iter().enumerate().take(views) {
+                let cell = cells[k][r * views + v];
                 bake(&tree, view, &groups[g].leaf_tris, &groups[g].bark_tris, &mut atlas, cell);
                 shapes.push(outline(&atlas, cell, trim));
             }
         }
         let mut leaves = Part::default();
+        let mut ranges = Vec::new();
         if !reps.is_empty() {
             for (g, group) in groups.iter().enumerate() {
                 let (_, size, aspect) = sizes[g];
@@ -591,21 +723,25 @@ pub fn ladder(s: &Settings, budgets: Option<&[usize]>, trim: bool) -> Result<Lad
                     let score = |r: usize| { let (_, s, asp) = sizes[reps[r]]; (size / s).ln().abs() + (aspect / asp).ln().abs() };
                     score(a).total_cmp(&score(b))
                 }).unwrap();
-                for (v, view) in tree.views(group).iter().enumerate().take(spec.views) {
-                    let slot = r * spec.views + v;
-                    emit(&mut leaves, &tree, view, Cell::slot(spec.first_slot + slot as u32), &shapes[slot], group.owner, 0.6);
+                for (v, view) in tree.views(group).iter().enumerate().take(views) {
+                    let slot = r * views + v;
+                    let start = leaves.v.len();
+                    emit(&mut leaves, &tree, view, cells[k][slot], &shapes[slot], group.owner, bend);
+                    if leaves.v.len() > start { ranges.push((start, leaves.v.len())); }
                 }
             }
         }
-        // the wood that stays gets whatever the cards leave
-        let kept: Vec<u32> = (0..nb).filter(|&b| wood[b]).flat_map(|b| tree.bark_by_branch[b].iter().flat_map(|&t| (0..3).map(move |j| t * 3 + j))).map(|i| full.bark.i[i as usize]).collect();
+        // the wood that stays gets whatever the cards leave; past near only what the cards cover
+        let mut kept: Vec<u32> = (0..nb).filter(|&b| wood[b]).flat_map(|b| tree.bark_by_branch[b].iter().flat_map(|&t| (0..3).map(move |j| t * 3 + j))).map(|i| full.bark.i[i as usize]).collect();
+        if k > 0 { kept = clip_to_cards(kept, &full.bark, &leaves); }
         let kept = Part { v: full.bark.v.clone(), i: kept };
         let mut bark = Part::default();
-        let mut left = rung.budget.saturating_sub(leaves.i.len() / 3);
+        let card_faces = leaves.i.len() * 2 / 3;
+        let mut left = rung.budget.saturating_sub(card_faces);
         for _ in 0..3 {
             rung.wood = left.max(12);
             bark = gamelod::simplify_wood(&kept, &rung, height);
-            let total = bark.i.len() / 3 + leaves.i.len() / 3;
+            let total = bark.i.len() / 3 + card_faces;
             if total <= rung.budget { break; }
             left = left.saturating_sub(total - rung.budget);
         }
@@ -613,41 +749,69 @@ pub fn ladder(s: &Settings, budgets: Option<&[usize]>, trim: bool) -> Result<Lad
             "twigGroups": groups.iter().filter(|g| g.twig).count(), "variants": reps.len(),
             "cardTriangles": leaves.i.len() / 3, "woodTriangles": bark.i.len() / 3}));
         levels.push(Level { rung, bark, leaves });
+        card_ranges.push(ranges);
     }
-    // very far: two crossed cards of the whole tree through the trunk, ellipsoid normals
+    // very far: the whole tree on two crossed cards through the trunk (trimmed, 2 x 2 grid) and
+    // one horizontal card through the crown, seen from above
     let mut rung: Rung = LADDER[3];
     rung.budget = budgets[3];
     let all_leaves: Vec<u32> = (0..full.leaves.i.len() as u32 / 3).collect();
     let all_bark: Vec<u32> = (0..full.bark.i.len() as u32 / 3).collect();
     let points: Vec<Vec3> = full.bark.v.iter().chain(&full.leaves.v).map(|v| v.p).collect();
+    let crown_points: Vec<Vec3> = full.leaves.v.iter().map(|v| v.p).collect();
     let mut leaves = Part::default();
-    // a grid per card so the bent normals interpolate like a dome: 2 cards x 2 m^2 triangles
-    let m = (1..=6).rev().find(|m| 4 * m * m <= rung.budget).unwrap_or(1);
-    for (v, (t, b)) in [(Vec3::X, Vec3::Y), (-Vec3::Z, Vec3::Y)].into_iter().enumerate() {
-        let mut view = View::fit(Vec3::ZERO, t, b, &points);
-        view.z = (0., 0.);
-        let cell = Cell::slot(14 + v as u32);
-        bake(&tree, &View::fit(Vec3::ZERO, t, b, &points), &all_leaves, &all_bark, &mut atlas, cell);
-        view.z = (0., 0.);
-        let first = leaves.v.len() as u32;
-        for j in 0..=m {
-            for i in 0..=m {
-                let (s, tt) = (i as f32 / m as f32, j as f32 / m as f32);
-                let p = view.at(s, tt);
-                leaves.v.push(V { p, n: tree.crown_normal(p), c: [1.; 4], uv: cell.uv(s, tt), branch: 0 });
-            }
-        }
-        let w = m as u32 + 1;
-        for j in 0..m as u32 {
-            for i in 0..m as u32 {
-                let (a, b2, c, d) = (first + j * w + i, first + j * w + i + 1, first + (j + 1) * w + i + 1, first + (j + 1) * w + i);
-                // t down the image: (s right, t down) is clockwise seen from n, so reverse
-                leaves.i.extend([a, c, b2, a, d, c]);
-            }
-        }
+    let mut ranges = Vec::new();
+    for (v, (t, b)) in [(Vec3::X, Vec3::Y), (-Vec3::Z, Vec3::Y), (Vec3::X, -Vec3::Z)].into_iter().enumerate() {
+        let top = v == 2;
+        let bake_view = View::fit(Vec3::ZERO, t, b, if top { &crown_points } else { &points });
+        let cell = cells[3][v];
+        bake(&tree, &bake_view, &all_leaves, if top { &[] } else { &all_bark }, &mut atlas, cell);
+        let shape = outline(&atlas, cell, true);
+        let mut view = bake_view;
+        // vertical cards through the trunk axis; the horizontal one at the crown's middle
+        view.z = if top { (crown.y, crown.y) } else { (0., 0.) };
+        let start = leaves.v.len();
+        let pieces: Vec<Vec<Vec2>> = if top { vec![shape] } else {
+            (0..4).map(|q| clip_rect(shape.clone(), ((q % 2) as f32 * 0.5, (q % 2 + 1) as f32 * 0.5),
+                ((q / 2) as f32 * 0.5, (q / 2 + 1) as f32 * 0.5))).collect()
+        };
+        for piece in pieces { emit(&mut leaves, &tree, &view, cell, &piece, 0, bend); }
+        // a card scales as a whole, or its grid pieces would part
+        if leaves.v.len() > start { ranges.push((start, leaves.v.len())); }
     }
-    atlas.report.push(serde_json::json!({"level": rung.name, "cards": 2, "grid": m, "cardTriangles": leaves.i.len() / 3}));
+    atlas.report.push(serde_json::json!({"level": rung.name, "cards": 3, "cardTriangles": leaves.i.len() / 3}));
     levels.push(Level { rung, bark: Part::default(), leaves });
+    card_ranges.push(ranges);
+    // Equal projected coverage on every level, so density does not step at the switches (a
+    // forest would show rings): grow or shrink each level's cards, across and along the height
+    // separately, until each of the four views is within 4 % of the near level's.
+    let px = height / 320.;
+    let near = coverage(&levels[0], &atlas, px);
+    let mut matched = vec![serde_json::json!({"level": levels[0].rung.name, "scale": [1.0, 1.0],
+        "coverageM2": near, "ratio": [1.0, 1.0, 1.0, 1.0]})];
+    for k in 1..levels.len() {
+        let original = levels[k].leaves.v.clone();
+        let mut scale = Vec2::ONE;
+        let mut best = (f32::MAX, scale, [1f32; 4]);
+        for _ in 0..12 {
+            scale_cards(&mut levels[k].leaves, &original, &card_ranges[k], scale);
+            let c = coverage(&levels[k], &atlas, px);
+            let ratios: [f32; 4] = std::array::from_fn(|d| if near[d] > 0. { c[d] / near[d] } else { 1. });
+            let worst = ratios.iter().map(|r| (r - 1.).abs()).fold(0., f32::max);
+            if worst < best.0 { best = (worst, scale, ratios); }
+            if worst < 0.04 { break; }
+            // from above and below the cards' spread across counts; from the side both
+            let (side, vertical) = ((ratios[0] + ratios[1]) * 0.5, (ratios[2] + ratios[3]) * 0.5);
+            let across = (1. / vertical).sqrt().clamp(0.85, 1.18);
+            scale.x *= across;
+            scale.y *= (1. / (side * across)).clamp(0.85, 1.18);
+        }
+        let (_, scale, ratios) = best;
+        scale_cards(&mut levels[k].leaves, &original, &card_ranges[k], scale);
+        let c = coverage(&levels[k], &atlas, px);
+        matched.push(serde_json::json!({"level": levels[k].rung.name, "scale": [scale.x, scale.y], "coverageM2": c, "ratio": ratios}));
+    }
+    atlas.report.push(serde_json::json!({"coverage": matched, "views": COVERAGE_VIEWS.map(|v| v.0)}));
     Ok(Ladder { levels, atlas: Vec::new(), branches: full.branches.clone(), twig: Some(atlas) })
 }
 
@@ -659,20 +823,33 @@ mod tests {
     fn twig_card_ladders_fill_but_never_exceed_their_budgets() {
         for preset in ["solstice-oak", "solstice-fir"] {
             let s = Settings::preset(preset).unwrap();
-            let ladder = ladder(&s, None, true).unwrap();
+            let ladder = ladder(&s, None, true, DEFAULT_BEND).unwrap();
             let atlas = ladder.twig.as_ref().unwrap();
             assert_eq!(ladder.levels.len(), 4);
             for (level, budget) in ladder.levels.iter().zip(BUDGETS) {
-                assert!(level.triangles() <= budget, "{preset} {}: {} > {budget}", level.rung.name, level.triangles());
+                assert!(level.p3d_faces() <= budget, "{preset} {}: {} > {budget}", level.rung.name, level.p3d_faces());
                 assert!(level.leaves.v.iter().all(|v| v.p.is_finite() && v.n.is_finite() && (0. ..=1.).contains(&v.uv.x)));
             }
             // near and mid spend their budgets (the old ladder landed at ~60 %)
             for level in &ladder.levels[..2] {
-                assert!(level.triangles() * 10 >= level.rung.budget * 9, "{preset} {}: {} of {}", level.rung.name, level.triangles(), level.rung.budget);
+                assert!(level.p3d_faces() * 10 >= level.rung.budget * 9, "{preset} {}: {} of {}", level.rung.name, level.p3d_faces(), level.rung.budget);
             }
             let covered = atlas.color.chunks_exact(4).filter(|p| p[3] > 128).count();
             assert!(covered > (EDGE * EDGE / 20) as usize, "{preset}: atlas almost empty");
             assert!(atlas.normal.chunks_exact(4).all(|p| p[0] == 0));
+            // the gutters stay transparent
+            for c in &atlas.cells {
+                for x in c[0]..c[0] + c[2] {
+                    assert_eq!(atlas.color[((c[1] * EDGE + x) * 4 + 3) as usize], 0);
+                }
+            }
+            // every level covers about what near covers
+            let px = 0.05;
+            let near = coverage(&ladder.levels[0], atlas, px).iter().sum::<f32>();
+            for level in &ladder.levels[1..] {
+                let c = coverage(level, atlas, px).iter().sum::<f32>();
+                assert!((c / near - 1.).abs() < 0.12, "{preset} {}: coverage {c} vs near {near}", level.rung.name);
+            }
         }
     }
 
@@ -683,5 +860,14 @@ mod tests {
         assert!(values[0] >= values[1] && values[1] >= values[2]);
         assert!(axes[2].z.abs() > 0.99);
         assert!(axes[0].x.abs() > 0.99);
+    }
+
+    #[test]
+    fn rect_clipping_keeps_the_inside() {
+        let square = vec![vec2(0., 0.), vec2(1., 0.), vec2(1., 1.), vec2(0., 1.)];
+        let q = clip_rect(square, (0.5, 1.), (0., 0.5));
+        assert_eq!(q.len(), 4);
+        let area: f32 = (0..q.len()).map(|i| { let (a, b) = (q[i], q[(i + 1) % q.len()]); a.x * b.y - b.x * a.y }).sum::<f32>().abs() * 0.5;
+        assert!((area - 0.25).abs() < 1e-5);
     }
 }
