@@ -167,50 +167,9 @@ pub fn trim_cards(ladder: &mut Ladder) {
     let regions: Vec<_> = (0..4).map(|i| (i as f32 / 4., (i + 1) as f32 / 4., CUTOUT))
         .chain(SPRAY_U.into_iter().map(|(a,b)| (a,b,SPRAY))).collect();
     let hulls: Vec<_> = regions.iter().map(|&(u0,u1,(v0,v1))| {
-        let mut points = Vec::new();
-        for y in (v0 * ATLAS as f32) as u32..((v1 * ATLAS as f32).ceil() as u32).min(ATLAS) {
-            for x in (u0 * ATLAS as f32) as u32..((u1 * ATLAS as f32).ceil() as u32).min(ATLAS) {
-                if ladder.atlas[((y * ATLAS + x) * 4 + 3) as usize] != 0 {
-                    // Four texels cover base-level filtering and most BC3 block spread.
-                    for (dx,dy) in [(-4.,-4.), (5.,-4.), (5.,5.), (-4.,5.)] {
-                        points.push(vec2((x as f32 + dx) / ATLAS as f32, (y as f32 + dy) / ATLAS as f32));
-                    }
-                }
-            }
-        }
-        points.sort_by(|a,b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
-        points.dedup();
-        fn cross(a: Vec2,b: Vec2,c: Vec2) -> f32 { (b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x) }
-        let mut hull = Vec::new();
-        for &p in &points {
-            while hull.len() >= 2 && cross(hull[hull.len()-2], hull[hull.len()-1], p) <= 0. { hull.pop(); }
-            hull.push(p);
-        }
-        let lower = hull.len();
-        for &p in points.iter().rev().skip(1) {
-            while hull.len() > lower && cross(hull[hull.len()-2], hull[hull.len()-1], p) <= 0. { hull.pop(); }
-            hull.push(p);
-        }
-        if hull.len() > 1 { hull.pop(); }
-        if hull.len() < 3 { return Vec::new(); }
-        // Intersect eight support half-planes around the hull. This contains every alpha texel
-        // while bounding tessellation regardless of how irregular the baked texture is.
-        let mut outline = vec![vec2(-1.,-1.), vec2(2.,-1.), vec2(2.,2.), vec2(-1.,2.)];
-        for k in 0..8 {
-            let angle = k as f32 * std::f32::consts::FRAC_PI_4;
-            let normal = vec2(angle.cos(), angle.sin());
-            let limit = hull.iter().map(|p| p.dot(normal)).fold(f32::NEG_INFINITY, f32::max);
-            let input = std::mem::take(&mut outline);
-            let mut previous = *input.last().unwrap();
-            let mut dp = limit - previous.dot(normal);
-            for current in input {
-                let dc = limit - current.dot(normal);
-                if (dp >= 0.) != (dc >= 0.) { outline.push(previous.lerp(current, dp / (dp-dc))); }
-                if dc >= 0. { outline.push(current); }
-                previous = current; dp = dc;
-            }
-        }
-        outline
+        let x = ((u0 * ATLAS as f32) as u32, ((u1 * ATLAS as f32).ceil() as u32).min(ATLAS));
+        let y = ((v0 * ATLAS as f32) as u32, ((v1 * ATLAS as f32).ceil() as u32).min(ATLAS));
+        alpha_outline(&|x, y| ladder.atlas[((y * ATLAS + x) * 4 + 3) as usize] != 0, x, y, ATLAS, 4.)
     }).collect();
     for index in 1..ladder.levels.len() {
         let (earlier, later) = ladder.levels.split_at_mut(index);
@@ -335,6 +294,56 @@ pub fn trim_cards(ladder: &mut Ladder) {
         }
         level.leaves = result;
     }
+}
+
+/// The outline of the opaque texels in the texel rectangle `x` x `y` (half-open ranges) of an
+/// `edge`-wide texture, in texture UV: the convex hull of the texels padded by `pad` texels,
+/// bounded by eight support half-planes (at most eight corners). Empty when nothing is opaque.
+pub(crate) fn alpha_outline(opaque: &dyn Fn(u32, u32) -> bool, x: (u32, u32), y: (u32, u32), edge: u32, pad: f32) -> Vec<Vec2> {
+    let mut points = Vec::new();
+    for ty in y.0..y.1 {
+        for tx in x.0..x.1 {
+            if opaque(tx, ty) {
+                // Four texels cover base-level filtering and most BC3 block spread.
+                for (dx,dy) in [(-pad,-pad), (pad+1.,-pad), (pad+1.,pad+1.), (-pad,pad+1.)] {
+                    points.push(vec2((tx as f32 + dx) / edge as f32, (ty as f32 + dy) / edge as f32));
+                }
+            }
+        }
+    }
+    points.sort_by(|a,b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+    points.dedup();
+    fn cross(a: Vec2,b: Vec2,c: Vec2) -> f32 { (b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x) }
+    let mut hull = Vec::new();
+    for &p in &points {
+        while hull.len() >= 2 && cross(hull[hull.len()-2], hull[hull.len()-1], p) <= 0. { hull.pop(); }
+        hull.push(p);
+    }
+    let lower = hull.len();
+    for &p in points.iter().rev().skip(1) {
+        while hull.len() > lower && cross(hull[hull.len()-2], hull[hull.len()-1], p) <= 0. { hull.pop(); }
+        hull.push(p);
+    }
+    if hull.len() > 1 { hull.pop(); }
+    if hull.len() < 3 { return Vec::new(); }
+    // Intersect eight support half-planes around the hull. This contains every alpha texel
+    // while bounding tessellation regardless of how irregular the baked texture is.
+    let mut outline = vec![vec2(-1.,-1.), vec2(2.,-1.), vec2(2.,2.), vec2(-1.,2.)];
+    for k in 0..8 {
+        let angle = k as f32 * std::f32::consts::FRAC_PI_4;
+        let normal = vec2(angle.cos(), angle.sin());
+        let limit = hull.iter().map(|p| p.dot(normal)).fold(f32::NEG_INFINITY, f32::max);
+        let input = std::mem::take(&mut outline);
+        let mut previous = *input.last().unwrap();
+        let mut dp = limit - previous.dot(normal);
+        for current in input {
+            let dc = limit - current.dot(normal);
+            if (dp >= 0.) != (dc >= 0.) { outline.push(previous.lerp(current, dp / (dp-dc))); }
+            if dc >= 0. { outline.push(current); }
+            previous = current; dp = dc;
+        }
+    }
+    outline
 }
 
 pub fn ladder(s: &Settings) -> Ladder {
@@ -472,7 +481,7 @@ pub fn ladder_with(s: &Settings, rungs: &[Rung]) -> Ladder {
 
 /// Sum of single-sided triangle areas in square metres; alpha masks and overlap are not
 /// included, so this is geometry area rather than apparent canopy coverage.
-fn surface_area(part: &Part) -> f64 {
+pub(crate) fn surface_area(part: &Part) -> f64 {
     part.i.chunks_exact(3).map(|t| {
         let a = part.v[t[0] as usize].p;
         let b = part.v[t[1] as usize].p;
@@ -758,7 +767,7 @@ fn cluster(leaves: &[Leaf], target: usize, card_scale: f32) -> Vec<Cluster> {
         .collect()
 }
 
-fn hash(mut x: u32) -> u32 {
+pub(crate) fn hash(mut x: u32) -> u32 {
     x ^= x >> 16;
     x = x.wrapping_mul(0x7feb_352d);
     x ^= x >> 15;
@@ -879,7 +888,7 @@ pub fn simplify_wood(bark: &Part, rung: &Rung, height: f32) -> Part {
 }
 
 /// Height of the lowest point of the tallest shell (the trunk).
-fn trunk_foot(part: &Part) -> f32 {
+pub(crate) fn trunk_foot(part: &Part) -> f32 {
     let mut parent: Vec<u32> = (0..part.v.len() as u32).collect();
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
@@ -979,11 +988,11 @@ fn compact(part: &Part, indices: &[u32]) -> Part {
     out
 }
 
-fn srgb_byte(linear: f32) -> u8 {
+pub(crate) fn srgb_byte(linear: f32) -> u8 {
     (crate::tree::srgb(linear.clamp(0., 1.)) * 255.).round() as u8
 }
 
-fn linear(byte: u8) -> f32 {
+pub(crate) fn linear(byte: u8) -> f32 {
     ((byte as f32 / 255. + 0.055) / 1.055).powf(2.4)
 }
 
@@ -1118,7 +1127,7 @@ fn bake_sprays(
 }
 
 /// Fills a 2-D triangle, calling `f(x, y, l0, l1, l2)` with barycentric weights per pixel.
-fn raster(
+pub(crate) fn raster(
     a: (Vec2, f32),
     b: (Vec2, f32),
     c: (Vec2, f32),
