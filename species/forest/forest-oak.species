@@ -8,4 +8,5 @@ bark oak_bark
 level per_metre=1.9 span=0.4..0.96 angle=68..45 length=0.4 taper=0.3 radius=0.5 upturn=0.1 droop=0 gnarl=0.3 whorl=0
 level per_metre=2.4 span=0.15..0.95 angle=45..45 length=0.45 taper=0.3 radius=0.6 upturn=0 droop=0.05 gnarl=0.45 whorl=0
 level per_metre=7 span=0.2..1 angle=40..40 length=0.35 taper=0.3 radius=0.6 upturn=0 droop=0.2 gnarl=0.6 whorl=0
+terminal on
 leaves broadleaf_leaves per_metre=48 length=0.09..0.14 width=0.55 variants=0.5,0.3,0.15,0.05 normals=0.45

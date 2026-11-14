@@ -8,4 +8,5 @@ bark birch_bark
 level per_metre=3 span=0.45..0.98 angle=55..30 length=0.32 taper=0.3 radius=0.5 upturn=0.2 droop=0.05 gnarl=0.45 whorl=0
 level per_metre=3 span=0.2..0.95 angle=45..45 length=0.5 taper=0.3 radius=0.5 upturn=0 droop=0.45 gnarl=0.45 whorl=0
 level per_metre=6 span=0.2..1 angle=30..30 length=0.4 taper=0.3 radius=0.6 upturn=0 droop=0.6 gnarl=0.5 whorl=0
+terminal on
 leaves birch_leaves per_metre=36 length=0.045..0.07 width=0.7 variants=0.5,0.3,0.15,0.05 normals=0.5

@@ -9,4 +9,5 @@ bark beech_bark
 level per_metre=2.4 span=0.48..0.97 angle=55..30 length=0.36 taper=0.3 radius=0.45 upturn=0.25 droop=0 gnarl=0.2 whorl=0
 level per_metre=3.0 span=0.2..1 angle=42..42 length=0.42 taper=0.3 radius=0.6 upturn=0.05 droop=0.05 gnarl=0.35 whorl=0
 level per_metre=7 span=0.25..1 angle=35..35 length=0.35 taper=0.3 radius=0.6 upturn=0 droop=0.1 gnarl=0.5 whorl=0
+terminal on
 leaves broadleaf_leaves per_metre=40 length=0.08..0.12 width=0.6 variants=0.5,0.3,0.15,0.05 normals=0.5

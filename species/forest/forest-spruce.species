@@ -9,4 +9,5 @@ crown cone
 bark fir_bark
 level per_metre=6 span=0.42..0.99 angle=95..70 length=0.24 taper=0.3 radius=0.42 upturn=0 droop=0.2 gnarl=0.1 whorl=6
 level per_metre=6 span=0.05..0.97 angle=60..60 length=0.35 taper=0.3 radius=0.5 upturn=0 droop=0.2 gnarl=0.2 whorl=0
+terminal on
 leaves fir_needles per_metre=14 length=0.16..0.26 width=0.17 variants=0.4,0.3,0.2,0.1 normals=0.4

@@ -142,8 +142,9 @@ impl Species {
                 let count = (parent_length * span * level.per_metre).round().max(1.0) as usize;
                 let mut positions = shoot_positions(level, count, &mut rng);
                 // Solstice's specimen trees continue their branch tips with near-straight
-                // shoots. Retain the existing shape of Grove's other library species.
-                let has_terminal = matches!(self.leaves.kind, LeafKind::Willow | LeafKind::Oak)
+                // shoots (upstream tree.rs:151-156). Grove's other library species keep their
+                // shape unless their species text says `terminal on`.
+                let has_terminal = self.terminal.unwrap_or(matches!(self.leaves.kind, LeafKind::Willow | LeafKind::Oak))
                     && depth > 0 && level.span.1 >= 0.95 && level.whorl == 0;
                 if has_terminal { positions.push((0.985, rng.range(0.0, TAU))); }
                 let terminal_index = positions.len().saturating_sub(1);

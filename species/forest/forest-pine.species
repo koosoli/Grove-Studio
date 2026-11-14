@@ -7,4 +7,5 @@ crown profile 0.2 0.6 1 0.8 0.3
 bark pine_bark
 level per_metre=1.8 span=0.62..0.97 angle=70..40 length=0.34 taper=0.3 radius=0.5 upturn=0.3 droop=0 gnarl=0.3 whorl=0
 level per_metre=3.5 span=0.2..1 angle=50..50 length=0.35 taper=0.3 radius=0.6 upturn=0 droop=0.1 gnarl=0.4 whorl=0
+terminal on
 leaves fir_needles per_metre=70 length=0.1..0.16 width=0.2 variants=0.4,0.3,0.2,0.1 normals=0.4

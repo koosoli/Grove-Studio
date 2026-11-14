@@ -173,6 +173,10 @@ pub struct Species {
     /// they start, in metres, are grown as a mesh of their own, `Plant::twigs`, to be given
     /// this colour: a willow's withes are olive-gold, a dogwood's red.
     pub twigs: Option<(f32, [f32; 3])>,
+    /// Grove: whether every branch tip carries on as a near-straight shoot of the next level
+    /// (`terminal on|off`), as upstream Solstice grows all its species. None keeps Grove's
+    /// library shapes: only willow and oak do.
+    pub terminal: Option<bool>,
 }
 
 impl Default for Species {
@@ -187,6 +191,7 @@ impl Default for Species {
             levels: Vec::new(),
             leaves: Leaves::default(),
             twigs: None,
+            terminal: None,
         }
     }
 }
@@ -269,6 +274,13 @@ impl Species {
                     }
                     species.twigs = Some((below, colour));
                 }
+                "terminal" => {
+                    species.terminal = Some(match rest.first().copied() {
+                        Some("on") => true,
+                        Some("off") => false,
+                        other => return Err(at(format!("terminal wants on or off, not {other:?}"))),
+                    });
+                }
                 "leaves" => {
                     species.leaves = leaves(&rest).map_err(at)?;
                     have_leaves = true;
@@ -337,6 +349,9 @@ impl Species {
             self.leaves.crown_normals,
             self.leaves.lean
         );
+        if let Some(on) = self.terminal {
+            let _ = writeln!(text, "terminal {}", if on { "on" } else { "off" });
+        }
         if let Some((below, [r, g, b])) = self.twigs {
             let _ = writeln!(text, "twigs below={below} color={r},{g},{b}");
         }
