@@ -7,6 +7,7 @@ mod garden;
 mod ambience;
 mod gui;
 mod log;
+mod mips;
 mod poseidon;
 mod preview;
 mod reference;

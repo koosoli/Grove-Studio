@@ -41,7 +41,8 @@ pub struct TwigAtlas {
     /// Debug: per level, how many groups (cards' subtrees) and the radius cutoff used, and the
     /// projected coverage per level.
     pub report: Vec<serde_json::Value>,
-    /// Every cell (x, y, w, h in texels); the PAA writer keeps alpha-test coverage per cell.
+    /// Every cell (x, y, w, h in texels), for offline tools; each is a whole number of the
+    /// 256 texel tiles the masked mip chain keeps alpha-test coverage in.
     pub cells: Vec<[u32; 4]>,
 }
 

@@ -10,6 +10,8 @@ Grove Studio’s interface was created for this project. Its trees are Solstice�
 
 Grove Studio uses SamG-Coder’s MIT-licensed Solstice asset, cluster builder, procedural species and renderer code, pinned at `c347879d8f6b97a850db004ecfd6a9c5cf29768b`. The renderer copy includes Grove’s parallax and wind adaptations. See [Solstice](https://github.com/SamG-Coder/solstice) and [the vendored MIT license](vendor/solstice-render/LICENSE).
 
+Ported from upstream Solstice (MIT, SamG-Coder, revision `f214c0eb28ed91cff5f644df3f05de1c99e2c328`) beyond the pinned copy: `src/mips.rs` is `masked_mip_chain` from `crates/solstice-builder/src/texture.rs` (alpha-weighted mip colour, filled empty texels, per-tile alpha-test coverage), used for the twig-card atlas; the vendored species read `terminal on|off` (branch tips continuing as shoots, upstream `foliage/tree.rs:151-156`) and grow `twigs below= color=` as their own colour (upstream `Plant::twigs`, `foliage/tree.rs:204-212`).
+
 ## Dependencies
 
 Rust dependencies are managed by Cargo.lock. macroquad is licensed under MIT OR Apache-2.0; miniquad under MIT OR Apache-2.0; glam under MIT OR Apache-2.0; serde and serde_json under MIT OR Apache-2.0. See each dependency’s distributed license for its full terms. Macroquad’s included ProggyClean font is its fallback font. Segoe UI is loaded from the user’s own Windows installation, and is not redistributed with this project.

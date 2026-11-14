@@ -346,7 +346,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
             tree::write(&file("twigs_ca.rgba"), &twig.color)?;
             tree::write(&file("twigs_ca_nohq.rgba"), &twig.normal)?;
         }
-        tree::write(&twigs, paa_with(color, CompressionVariant::BC3, true, Some(&twig.cells)))?;
+        tree::write(&twigs, paa_with(color, CompressionVariant::BC3, true, true))?;
         tree::write(&twigs_n, paa(normal, CompressionVariant::BC3, false))?;
     }
     tree::write(&bark, paa(bark_pixels, CompressionVariant::BC1, false))?;
@@ -571,23 +571,13 @@ fn trunk_collision(s: &Settings) -> Part {
 }
 
 fn paa(image: RgbaImage, compression: CompressionVariant, alpha: bool) -> Vec<u8> {
-    paa_with(image, compression, alpha, None)
+    paa_with(image, compression, alpha, false)
 }
 
-/// Alpha-test coverage of a texel rectangle (x, y, w, h): the share at or above half alpha.
-fn coverage(image: &RgbaImage, r: [u32; 4]) -> f32 {
-    let mut n = 0;
-    for y in r[1]..r[1] + r[3] { for x in r[0]..r[0] + r[2] { if image.get_pixel(x, y)[3] >= 128 { n += 1; } } }
-    n as f32 / (r[2] * r[3]).max(1) as f32
-}
-
-/// `cells`: scale each mip's alpha per atlas cell (texel rectangles of the base level) so the
-/// alpha test keeps the base level's coverage; a box-filtered twig otherwise dissolves at a
-/// distance. This is the one coverage lift: the engine's `cutout_mip_alpha` must stay off for
-/// these textures (its shadow pass does not apply one, this one reaches the shadows too).
-fn paa_with(mut image: RgbaImage, compression: CompressionVariant, alpha: bool, cells: Option<&[[u32; 4]]>) -> Vec<u8> {
-    let base: Option<Vec<([u32; 4], f32)>> = cells.map(|c| c.iter().map(|&r| (r, coverage(&image, r))).collect());
-    let edge = image.width();
+/// `masked`: the mips come from `mips::masked_mip_chain` (Solstice): colour averaged by alpha,
+/// empty texels filled from the coarser level, alpha-test coverage kept per 256 texel tile. This
+/// is the one coverage lift for the texture; the engine's `cutout_mip_alpha` must stay off for it.
+fn paa_with(image: RgbaImage, compression: CompressionVariant, alpha: bool, masked: bool) -> Vec<u8> {
     let magic = if matches!(compression, CompressionVariant::BC1) {
         0xff01_u16
     } else {
@@ -600,50 +590,28 @@ fn paa_with(mut image: RgbaImage, compression: CompressionVariant, alpha: bool, 
         integer(&mut output, 1);
     }
     output.extend([0; 2]);
-    loop {
-        let size = image.width();
+    let edge = image.width();
+    let levels: Vec<Vec<u8>> = if masked && edge.is_power_of_two() && image.height() == edge {
+        crate::mips::masked_mip_chain(image.into_raw(), edge)
+    } else {
+        let mut levels = vec![image.as_raw().clone()];
+        let mut image = image;
+        while image.width() > 4 {
+            image = image::imageops::resize(&image, image.width() / 2, image.height() / 2, FilterType::Triangle);
+            levels.push(image.as_raw().clone());
+        }
+        levels
+    };
+    for (k, level) in levels.iter().enumerate() {
+        let size = edge >> k;
         let mut compressed = vec![0; compression.blocks_byte_size(size, size)];
-        compress_rgba8(
-            compression,
-            image.as_raw(),
-            &mut compressed,
-            size,
-            size,
-            size * 4,
-        );
+        compress_rgba8(compression, level, &mut compressed, size, size, size * 4);
         output.extend((size as u16).to_le_bytes());
         output.extend((size as u16).to_le_bytes());
         output.extend_from_slice(&(compressed.len() as u32).to_le_bytes()[..3]);
         output.extend(compressed);
-        if size == 4 {
+        if size <= 4 {
             break;
-        }
-        image = image::imageops::resize(&image, size / 2, size / 2, FilterType::Triangle);
-        if let Some(wanted) = &base {
-            let down = edge / image.width();
-            for &(r, want) in wanted {
-                let (cx, cy, cw, ch) = (r[0] / down, r[1] / down, r[2] / down, r[3] / down);
-                if cw < 2 || ch < 2 { continue; }
-                {
-                    let covered = |scale: f32, image: &RgbaImage| {
-                        let mut n = 0;
-                        for y in cy..cy + ch { for x in cx..cx + cw {
-                            if image.get_pixel(x, y)[3] as f32 * scale >= 127.5 { n += 1; }
-                        } }
-                        n as f32 / (cw * ch) as f32
-                    };
-                    let (mut lo, mut hi) = (1f32, 8f32);
-                    if covered(lo, &image) >= want { continue; }
-                    for _ in 0..12 {
-                        let mid = (lo + hi) * 0.5;
-                        if covered(mid, &image) < want { lo = mid } else { hi = mid }
-                    }
-                    for y in cy..cy + ch { for x in cx..cx + cw {
-                        let p = image.get_pixel_mut(x, y);
-                        p[3] = (p[3] as f32 * hi).min(255.).round() as u8;
-                    } }
-                }
-            }
         }
     }
     output.extend([0; 4]);
