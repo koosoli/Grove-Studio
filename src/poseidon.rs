@@ -157,6 +157,9 @@ pub struct GameOptions {
     /// per cluster with distance (GROVE-OPAQUE), and the very far spray level, which casts the
     /// shadows (`shadowcoarser`) and stands for the tree in the far forest.
     pub opaque_leaves: bool,
+    /// `--twig-cards`: every level's foliage is cards of baked twigs (gamelod's ladder replaced by
+    /// twigs.rs), sampling `<name>_twigs_ca.paa` and its `_nohq`; the far level casts the shadow.
+    pub twig_cards: bool,
     /// Trim alpha-card outlines using the generated atlas.
     pub trim_cards: bool,
 }
@@ -195,7 +198,9 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
         texture: reference(&leaves),
         material: String::new(),
     };
-    let mut ladder = if options.opaque_leaves {
+    let mut ladder = if options.twig_cards {
+        crate::twigs::ladder(s, options.budgets.as_deref(), options.trim_cards)?
+    } else if options.opaque_leaves {
         crate::gamelod::ladder_with(s, &crate::gamelod::opaque_rungs(options.budgets.as_deref())?)
     } else {
         match &options.budgets {
@@ -211,8 +216,13 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
         material: String::new(),
     };
     let mut model = b"MLOD\x01\x01\x00\x00".to_vec();
+    let twigs = file("twigs_ca.paa");
+    let twigs_n = file("twigs_ca_nohq.paa");
+    let twig_surface = Surface { texture: reference(&twigs), material: String::new() };
     let proxy = crate::gamelod::proxy_ladder(s);
-    let shadow = &proxy.levels[0];
+    // twig cards: the far level (limb cards) stands in for shadows and occlusion
+    let shadow = if ladder.twig.is_some() { &ladder.levels[2] } else { &proxy.levels[0] };
+    let shadow_leaf_surface = if ladder.twig.is_some() { &twig_surface } else { &leaf_surface };
     integer(&mut model, ladder.levels.len() as u32 + 2);
     let height = ladder
         .levels
@@ -245,7 +255,8 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
                 }
             }
         }
-        if k == 0 {
+        // twig cards are alpha cards, not opaque leaf pieces for per-cluster reduction
+        if k == 0 && !options.twig_cards {
             props.push(("clusterfoliage", "1".into()));
         }
         write_lod_with(
@@ -253,7 +264,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
             &level.bark,
             &level.leaves,
             &bark_surface,
-            if k == 0 { &opaque_surface } else { &leaf_surface },
+            if options.twig_cards { &twig_surface } else if k == 0 { &opaque_surface } else { &leaf_surface },
             level.rung.resolution,
             true,
             &props,
@@ -267,12 +278,12 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
     }
     // Resolution 11000 is the ShadowBuffer sentinel recognized by the model loader.
     // Some engine builds still cast visible objects from visual LODs rather than this level.
-    write_lod_with(&mut model, &shadow.bark, &shadow.leaves, &bark_surface, &leaf_surface,
+    write_lod_with(&mut model, &shadow.bark, &shadow.leaves, &bark_surface, shadow_leaf_surface,
         11000.0, true, &[]);
     let occlusion_path = file("occlusion.p3d");
     let mut occlusion = b"MLOD\x01\x01\x00\x00".to_vec();
     integer(&mut occlusion, 1);
-    write_lod_with(&mut occlusion, &shadow.bark, &shadow.leaves, &bark_surface, &leaf_surface,
+    write_lod_with(&mut occlusion, &shadow.bark, &shadow.leaves, &bark_surface, shadow_leaf_surface,
         8.0, true, &[]);
     tree::write(&occlusion_path, occlusion)?;
     let empty = Surface {
@@ -302,7 +313,8 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
         p.0 = [0, p[1], (z * 127.5 + 127.5) as u8, p[0]];
     }
     let edge = crate::gamelod::ATLAS;
-    let atlas = RgbaImage::from_raw(edge, edge, ladder.atlas.clone()).unwrap();
+    // a twig-card ladder has no single-leaf atlas: its foliage samples the twig atlas only
+    let atlas = RgbaImage::from_raw(edge, edge, ladder.atlas.clone()).unwrap_or_else(|| RgbaImage::new(edge, edge));
     let leaf_normal = if s.leaf_atlas_path.is_some() { leaf_normal_map(&atlas) } else {
         let (normals, _) = preview::leaf_surface_maps(s, true, edge as usize);
         RgbaImage::from_fn(edge, edge, |x,y| {
@@ -313,18 +325,40 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
             image::Rgba([0, normals[i+1], (nz*127.5+127.5).round() as u8, normals[i]])
         })
     };
+    let debug_png = std::env::var_os("GROVE_DEBUG_PNG").is_some();
+    if debug_png {
+        // PNG to look at, raw RGBA (edge from the manifest) for offline tools
+        bark_pixels.save(file("bark_co.png")).map_err(|e| e.to_string())?;
+        tree::write(&file("bark_co.rgba"), bark_pixels.as_raw())?;
+        if ladder.twig.is_none() {
+            atlas.save(file("leaves_ca.png")).map_err(|e| e.to_string())?;
+            tree::write(&file("leaves_ca.rgba"), atlas.as_raw())?;
+        }
+    }
+    if let Some(twig) = &ladder.twig {
+        let color = RgbaImage::from_raw(twig.edge, twig.edge, twig.color.clone()).unwrap();
+        let normal = RgbaImage::from_raw(twig.edge, twig.edge, twig.normal.clone()).unwrap();
+        if debug_png {
+            color.save(file("twigs_ca.png")).map_err(|e| e.to_string())?;
+            normal.save(file("twigs_ca_nohq.png")).map_err(|e| e.to_string())?;
+            tree::write(&file("twigs_ca.rgba"), &twig.color)?;
+            tree::write(&file("twigs_ca_nohq.rgba"), &twig.normal)?;
+        }
+        tree::write(&twigs, paa_with(color, CompressionVariant::BC3, true, Some(twig.edge / crate::twigs::CELL)))?;
+        tree::write(&twigs_n, paa(normal, CompressionVariant::BC3, false))?;
+    }
     tree::write(&bark, paa(bark_pixels, CompressionVariant::BC1, false))?;
     tree::write(&bark_n, paa(bark_normal, CompressionVariant::BC3, false))?;
-    {
+    if ladder.twig.is_none() {
         let mut opaque = atlas.clone();
         for p in opaque.pixels_mut() {
             p.0[3] = 255;
         }
         tree::write(&opaque_leaves, paa(opaque, CompressionVariant::BC1, false))?;
         tree::write(&opaque_leaves_n, paa(leaf_normal.clone(), CompressionVariant::BC3, false))?;
+        tree::write(&leaves, paa(atlas, CompressionVariant::BC3, true))?;
+        tree::write(&leaves_n, paa(leaf_normal, CompressionVariant::BC3, false))?;
     }
-    tree::write(&leaves, paa(atlas, CompressionVariant::BC3, true))?;
-    tree::write(&leaves_n, paa(leaf_normal, CompressionVariant::BC3, false))?;
     tree::write(&bark_mat, material("TreeAdvTrunk", &reference(&bark_n)))?;
     tree::write(&leaf_mat, material("TreeAdv", &reference(&leaves_n)))?;
     let detailed_wind = json!({
@@ -345,11 +379,17 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
         "path": path, "format": "MLOD 1.1 / P3DM", "settings": s,
         "pboPrefix": prefix, "model": reference(path), "levels": counts,
         "forestProxy": options.forest_proxy, "opaqueLeaves": true, "trimCards": options.trim_cards,
+        "twigCards": ladder.twig.as_ref().map(|t| json!({"texture": reference(&twigs), "normal": reference(&twigs_n),
+            "edge": t.edge, "levels": t.report})),
         "geometryLod": "Convex trunk collision",
         "shadowProxy": {"resolution":11000.0,"triangles":shadow.triangles(),"p3dFaces":shadow.bark.i.len()/3 + shadow.leaves.i.len()*2/3,"runtimeSelection":"requires engine support"},
         "occlusionProxy": occlusion_path.file_name().unwrap().to_string_lossy(),
         "wind": {"map":"tree","height":"model-space Y, meters","hierarchy":wind_sidecar.file_name().unwrap().to_string_lossy(),"hierarchyRequiresEngineSupport":true},
-        "sidecars": [&bark, &bark_n, &leaves, &leaves_n, &opaque_leaves, &opaque_leaves_n, &bark_mat, &leaf_mat, &wind_sidecar, &occlusion_path],
+        "sidecars": if ladder.twig.is_some() {
+            json!([&bark, &bark_n, &twigs, &twigs_n, &bark_mat, &leaf_mat, &wind_sidecar, &occlusion_path])
+        } else {
+            json!([&bark, &bark_n, &leaves, &leaves_n, &opaque_leaves, &opaque_leaves_n, &bark_mat, &leaf_mat, &wind_sidecar, &occlusion_path])
+        },
     });
     tree::write(path, model)?;
     tree::write(&manifest, serde_json::to_vec_pretty(&asset).unwrap())?;
@@ -528,7 +568,25 @@ fn trunk_collision(s: &Settings) -> Part {
     part
 }
 
-fn paa(mut image: RgbaImage, compression: CompressionVariant, alpha: bool) -> Vec<u8> {
+fn paa(image: RgbaImage, compression: CompressionVariant, alpha: bool) -> Vec<u8> {
+    paa_with(image, compression, alpha, None)
+}
+
+/// Alpha-test coverage per region of a `grid` x `grid` atlas: the share of texels at or above
+/// half alpha.
+fn coverage(image: &RgbaImage, grid: u32) -> Vec<f32> {
+    let cell = (image.width() / grid).max(1);
+    let mut out = vec![0f32; (grid * grid) as usize];
+    for (x, y, p) in image.enumerate_pixels() {
+        if p[3] >= 128 { out[((y / cell).min(grid - 1) * grid + (x / cell).min(grid - 1)) as usize] += 1.; }
+    }
+    out.iter().map(|n| n / (cell * cell) as f32).collect()
+}
+
+/// `coverage_grid`: scale each mip's alpha per atlas cell so the alpha test keeps the base
+/// level's coverage (a box-filtered twig otherwise dissolves at a distance).
+fn paa_with(mut image: RgbaImage, compression: CompressionVariant, alpha: bool, coverage_grid: Option<u32>) -> Vec<u8> {
+    let base = coverage_grid.map(|g| (g, coverage(&image, g)));
     let magic = if matches!(compression, CompressionVariant::BC1) {
         0xff01_u16
     } else {
@@ -560,6 +618,31 @@ fn paa(mut image: RgbaImage, compression: CompressionVariant, alpha: bool) -> Ve
             break;
         }
         image = image::imageops::resize(&image, size / 2, size / 2, FilterType::Triangle);
+        if let Some((grid, wanted)) = &base {
+            let cell = image.width() / grid;
+            if cell >= 2 {
+                for (k, &want) in wanted.iter().enumerate() {
+                    let (cx, cy) = (k as u32 % grid * cell, k as u32 / grid * cell);
+                    let covered = |scale: f32, image: &RgbaImage| {
+                        let mut n = 0;
+                        for y in cy..cy + cell { for x in cx..cx + cell {
+                            if image.get_pixel(x, y)[3] as f32 * scale >= 127.5 { n += 1; }
+                        } }
+                        n as f32 / (cell * cell) as f32
+                    };
+                    let (mut lo, mut hi) = (1f32, 8f32);
+                    if covered(lo, &image) >= want { continue; }
+                    for _ in 0..12 {
+                        let mid = (lo + hi) * 0.5;
+                        if covered(mid, &image) < want { lo = mid } else { hi = mid }
+                    }
+                    for y in cy..cy + cell { for x in cx..cx + cell {
+                        let p = image.get_pixel_mut(x, y);
+                        p[3] = (p[3] as f32 * hi).min(255.).round() as u8;
+                    } }
+                }
+            }
+        }
     }
     output.extend([0; 4]);
     output
@@ -580,6 +663,7 @@ mod tests {
             forest_proxy: true,
             budgets: None,
             opaque_leaves: false,
+            twig_cards: false,
             trim_cards: true,
         };
         let asset = export_game(&s, &path, &options).unwrap();
@@ -625,6 +709,7 @@ mod tests {
             forest_proxy: true,
             budgets: Some(vec![40_000, 400]),
             opaque_leaves: true,
+            twig_cards: false,
             trim_cards: true,
         };
         let asset = export_game(&s, &path, &options).unwrap();

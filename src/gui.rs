@@ -1003,7 +1003,7 @@ impl Editor {
             if base.extension().and_then(|s| s.to_str()) != Some("p3d") {
                 return Err("Game LOD export needs a .p3d filename.".into());
             }
-            let options = crate::poseidon::GameOptions { prefix: None, forest_proxy: false, budgets: None, opaque_leaves: false, trim_cards: self.trim_cards };
+            let options = crate::poseidon::GameOptions { prefix: None, forest_proxy: false, budgets: None, opaque_leaves: false, twig_cards: false, trim_cards: self.trim_cards };
             crate::poseidon::export_game(&self.s, base, &options)?;
             return Ok(vec![base.to_path_buf()]);
         }

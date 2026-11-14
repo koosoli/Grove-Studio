@@ -14,11 +14,13 @@ Grass controls: --size .25..4 --density .05..1.5 --height .25..2 --width .5..3 -
 Editor: grove-studio [--preset NAME] [--config FILE] [--forest SPECIES]
 Mesh export: grove-studio --headless --preset solstice-oak --out exports/oak.p3d --lod all
 Mesh inspection: grove-studio --headless --inspect --preset solstice-birch
-Budget report: grove-studio --budget-report [--preset SPECIES] [--no-trim-cards] [--budgets A,B,C,D] [--opaque-leaves]
+Budget report: grove-studio --budget-report [--preset SPECIES] [--no-trim-cards] [--budgets A,B,C,D] [--opaque-leaves|--twig-cards]
 Game LOD ladder (near/mid/far/very far, P3D): grove-studio --headless --preset solstice-cwa-buk
   --lod game --out exports/beech.p3d [--prefix PBO_PREFIX] [--forest-proxy] (also with --inspect)
   [--no-trim-cards] [--budgets near,mid,far,veryfar] [--opaque-leaves [--budgets near,veryfar]]: opaque leaf pieces
   in one near level for an engine that simplifies per cluster, plus the very far spray level
+  [--twig-cards [--budgets near,mid,far,veryfar]]: leafy twigs baked into a 2048 atlas (colour, coverage,
+  normal) and drawn as crossed cards; default budgets 8000,3000,900,250 faces; very far = 2 crossed tree cards
 Species file: --species-file species/forest/forest-beech.species --preset solstice-cwa-buk
   grows the preset from that text (forest-grown heights up to 40 m).
 PNG preview: grove-studio --headless --preview --out exports/forest.png --forest solstice-oak,solstice-fir
@@ -88,7 +90,7 @@ fn headless(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--headless" | "--budget-report" | "--inspect" | "--preview" | "--forest-proxy" | "--opaque-leaves" | "--no-trim-cards" | "--original-leaves" | "--no-leaf-specular" | "--no-forest-floor" | "--even-mix" | "--structure" | "--garden" | "--scene-grass" => i += 1,
+            "--headless" | "--budget-report" | "--inspect" | "--preview" | "--forest-proxy" | "--opaque-leaves" | "--twig-cards" | "--no-trim-cards" | "--original-leaves" | "--no-leaf-specular" | "--no-forest-floor" | "--even-mix" | "--structure" | "--garden" | "--scene-grass" => i += 1,
             "--randomize" | "--random-field" | "--random-seed" | "--bark-weathering" | "--bark-color" | "--bark-height" | "--bark-normal" | "--leaf-atlas" | "--preset" | "--seed" | "--height" | "--maturity" | "--density" | "--format" | "--lod" | "--count"
             | "--prefix" | "--species-file" | "--budgets"
             | "--config" | "--out" | "--season" | "--parallax-depth" | "--forest"
@@ -159,6 +161,7 @@ fn headless(args: &[String]) -> Result<(), String> {
             None => None,
         };
         let report_opaque = args.iter().any(|a| a == "--opaque-leaves");
+        let report_twigs = args.iter().any(|a| a == "--twig-cards");
         let names: Vec<String> = if option(args, "--preset").is_some() || option(args, "--config").is_some() {
             vec![s.species.clone()]
         } else {
@@ -167,7 +170,9 @@ fn headless(args: &[String]) -> Result<(), String> {
         let mut reports = Vec::new();
         for name in names {
             let settings = if name == s.species { s.clone() } else { Settings::preset(&name)? };
-            let mut ladder = if report_opaque {
+            let mut ladder = if report_twigs {
+                crate::twigs::ladder(&settings, report_budgets.as_deref(), !args.iter().any(|a| a == "--no-trim-cards"))?
+            } else if report_opaque {
                 crate::gamelod::ladder_with(&settings, &crate::gamelod::opaque_rungs(report_budgets.as_deref())?)
             } else if let Some(b) = &report_budgets {
                 crate::gamelod::ladder_with(&settings, &crate::gamelod::rungs_with_budgets(b)?)
@@ -274,6 +279,10 @@ fn headless(args: &[String]) -> Result<(), String> {
     if opaque_leaves && !game {
         return Err("--opaque-leaves needs --lod game".into());
     }
+    let twig_cards = args.iter().any(|a| a == "--twig-cards");
+    if twig_cards && (!game || opaque_leaves) {
+        return Err("--twig-cards needs --lod game and excludes --opaque-leaves".into());
+    }
     if (forest_proxy || option(args, "--prefix").is_some()) && !game {
         return Err("--prefix and --forest-proxy need --lod game".into());
     }
@@ -288,7 +297,9 @@ fn headless(args: &[String]) -> Result<(), String> {
     };
     if game {
         if args.iter().any(|a| a == "--inspect") {
-            let mut ladder = if opaque_leaves {
+            let mut ladder = if twig_cards {
+                crate::twigs::ladder(&s, budgets.as_deref(), !args.iter().any(|a| a == "--no-trim-cards"))?
+            } else if opaque_leaves {
                 crate::gamelod::ladder_with(&s, &crate::gamelod::opaque_rungs(budgets.as_deref())?)
             } else {
                 match &budgets {
@@ -297,7 +308,8 @@ fn headless(args: &[String]) -> Result<(), String> {
                 }
             };
             if !args.iter().any(|a| a == "--no-trim-cards") { crate::gamelod::trim_cards(&mut ladder); }
-            println!("{}", json!({"settings":s,"levels":crate::gamelod::stats(&ladder)}));
+            let twigs = ladder.twig.as_ref().map(|t| json!(t.report));
+            println!("{}", json!({"settings":s,"levels":crate::gamelod::stats(&ladder),"twigCards":twigs}));
             return Ok(());
         }
         let out = PathBuf::from(option(args, "--out").unwrap_or_else(|| "exports/tree.p3d".into()));
@@ -314,6 +326,7 @@ fn headless(args: &[String]) -> Result<(), String> {
             forest_proxy,
             budgets,
             opaque_leaves,
+            twig_cards,
             trim_cards: !args.iter().any(|a| a == "--no-trim-cards"),
         };
         let mut files = vec![];
@@ -610,7 +623,7 @@ pub fn call_tool(name: &str, args: &Value, root: &Path) -> Result<Value, String>
         }
         let trim = args.get("trimCards").map(|v| v.as_bool().ok_or("trimCards must be a boolean")).transpose()?.unwrap_or(true);
         check_outputs(Some(&root), std::iter::once(base.clone()).chain(crate::poseidon::game_sidecars(&base)))?;
-        let options = crate::poseidon::GameOptions { prefix: None, forest_proxy: false, budgets: None, opaque_leaves: false, trim_cards: trim };
+        let options = crate::poseidon::GameOptions { prefix: None, forest_proxy: false, budgets: None, opaque_leaves: false, twig_cards: false, trim_cards: trim };
         let file = crate::poseidon::export_game(&s, &base, &options)?;
         return Ok(json!({"ok":true,"files":[file]}));
     }
