@@ -588,11 +588,13 @@ fn coverage(level: &Level, atlas: &TwigAtlas, px: f32) -> [f32; 4] {
 }
 
 /// Grows or shrinks every card of `leaves` (vertex ranges `cards`) about its centre, by `scale`
-/// across (x, z) and along y, from the positions `original`.
-fn scale_cards(leaves: &mut Part, original: &[V], cards: &[(usize, usize)], scale: Vec2) {
+/// across (x, z) and along y, from the positions `original`. `grounded`: a card keeps its lowest
+/// point (the whole-tree cards stand on the ground).
+fn scale_cards(leaves: &mut Part, original: &[V], cards: &[(usize, usize)], scale: Vec2, grounded: bool) {
     let s = Vec3::new(scale.x, scale.y, scale.x);
     for &(a, b) in cards {
-        let centre = original[a..b].iter().map(|v| v.p).sum::<Vec3>() / (b - a) as f32;
+        let mut centre = original[a..b].iter().map(|v| v.p).sum::<Vec3>() / (b - a) as f32;
+        if grounded { centre.y = original[a..b].iter().map(|v| v.p.y).fold(f32::MAX, f32::min); }
         for k in a..b { leaves.v[k].p = centre + (original[k].p - centre) * s; }
     }
 }
@@ -674,7 +676,7 @@ pub fn ladder(s: &Settings, budgets: Option<&[usize]>, trim: bool, bend: f32) ->
         rung.min_branch = 0.;
         // P3D faces: an untrimmed card is 2 triangles, a trimmed one at most 6 (usually 4-5),
         // each drawn twice (the reversed face)
-        let faces_per_group = views * if trim { 10 } else { 4 };
+        let faces_per_group = views * if trim { 12 } else { 4 };
         let wood_share = (rung.budget as f64 * LADDER[k].wood as f64 / LADDER[k].budget as f64) as usize;
         let total_leaf_tris = full.leaves.i.len() / 3;
         let fits = |cutoff: f32| {
@@ -802,23 +804,37 @@ pub fn ladder(s: &Settings, budgets: Option<&[usize]>, trim: bool, bend: f32) ->
         let original = levels[k].leaves.v.clone();
         let mut scale = Vec2::ONE;
         let mut best = (f32::MAX, scale, [1f32; 4]);
-        for _ in 0..12 {
-            scale_cards(&mut levels[k].leaves, &original, &card_ranges[k], scale);
+        // very far: the two standing cards answer the side views, the horizontal one the views
+        // from below and above, so each gets its own width
+        let (standing, lying) = if k == 3 { card_ranges[k].split_at(2) } else { (&card_ranges[k][..], &[][..]) };
+        let mut top = 1f32;
+        let mut best_top = 1f32;
+        for _ in 0..16 {
+            scale_cards(&mut levels[k].leaves, &original, standing, scale, k == 3);
+            scale_cards(&mut levels[k].leaves, &original, lying, Vec2::new(top, 1.), false);
             let c = coverage(&levels[k], &atlas, px);
             let ratios: [f32; 4] = std::array::from_fn(|d| if near[d] > 0. { c[d] / near[d] } else { 1. });
             let worst = ratios.iter().map(|r| (r - 1.).abs()).fold(0., f32::max);
-            if worst < best.0 { best = (worst, scale, ratios); }
+            if worst < best.0 { best = (worst, scale, ratios); best_top = top; }
             if worst < 0.04 { break; }
             // from above and below the cards' spread across counts; from the side both
             let (side, vertical) = ((ratios[0] + ratios[1]) * 0.5, (ratios[2] + ratios[3]) * 0.5);
+            if k == 3 {
+                scale.x = (scale.x / side).clamp(0.6, 1.6);
+                top = (top / vertical.sqrt()).clamp(0.6, 1.6);
+                continue;
+            }
             let across = (1. / vertical).sqrt().clamp(0.85, 1.18);
-            scale.x *= across;
-            scale.y *= (1. / (side * across)).clamp(0.85, 1.18);
+            // never taller than the tree: the silhouette stays, height only shrinks
+            scale.x = (scale.x * across).clamp(0.6, 1.4);
+            scale.y = (scale.y * (1. / (side * across)).clamp(0.85, 1.18)).clamp(0.6, 1.0);
         }
         let (_, scale, ratios) = best;
-        scale_cards(&mut levels[k].leaves, &original, &card_ranges[k], scale);
+        let top = best_top;
+        scale_cards(&mut levels[k].leaves, &original, standing, scale, k == 3);
+        scale_cards(&mut levels[k].leaves, &original, lying, Vec2::new(top, 1.), false);
         let c = coverage(&levels[k], &atlas, px);
-        matched.push(serde_json::json!({"level": levels[k].rung.name, "scale": [scale.x, scale.y], "coverageM2": c, "ratio": ratios}));
+        matched.push(serde_json::json!({"level": levels[k].rung.name, "scale": [scale.x, scale.y, top], "coverageM2": c, "ratio": ratios}));
     }
     atlas.report.push(serde_json::json!({"coverage": matched, "views": COVERAGE_VIEWS.map(|v| v.0)}));
     Ok(Ladder { levels, atlas: Vec::new(), branches: full.branches.clone(), twig: Some(atlas) })
