@@ -98,7 +98,7 @@ fn headless(args: &[String]) -> Result<(), String> {
         match args[i].as_str() {
             "--headless" | "--budget-report" | "--inspect" | "--preview" | "--forest-proxy" | "--opaque-leaves" | "--twig-cards" | "--no-trim-cards" | "--original-leaves" | "--no-leaf-specular" | "--no-forest-floor" | "--even-mix" | "--structure" | "--garden" | "--scene-grass" => i += 1,
             "--randomize" | "--random-field" | "--random-seed" | "--bark-weathering" | "--bark-color" | "--bark-height" | "--bark-normal" | "--leaf-atlas" | "--preset" | "--seed" | "--height" | "--maturity" | "--density" | "--format" | "--lod" | "--count"
-            | "--prefix" | "--species-file" | "--budgets" | "--card-bend"
+            | "--prefix" | "--species-file" | "--budgets" | "--card-bend" | "--near-leaves"
             | "--config" | "--out" | "--season" | "--parallax-depth" | "--forest"
             | "--preview-view" | "--distance" | "--wind-time" | "--time-of-day" | "--forest-count"
             | "--garden-view" | "--sun-azimuth" | "--skybox" | "--cloud-cover" | "--leaf-roughness" | "--leaf-transmission" | "--wind-direction" | "--wind-strength" | "--wind-gust" | "--branch-sway" | "--branch-springiness" | "--leaf-flutter" => {
@@ -334,6 +334,7 @@ fn headless(args: &[String]) -> Result<(), String> {
             opaque_leaves,
             twig_cards,
             card_bend: card_bend(args)?,
+            near_leaves: option(args, "--near-leaves").map(|v| v.parse::<usize>().map_err(|_| "Invalid --near-leaves".to_string())).transpose()?,
             trim_cards: !args.iter().any(|a| a == "--no-trim-cards"),
         };
         let mut files = vec![];
@@ -630,7 +631,7 @@ pub fn call_tool(name: &str, args: &Value, root: &Path) -> Result<Value, String>
         }
         let trim = args.get("trimCards").map(|v| v.as_bool().ok_or("trimCards must be a boolean")).transpose()?.unwrap_or(true);
         check_outputs(Some(&root), std::iter::once(base.clone()).chain(crate::poseidon::game_sidecars(&base)))?;
-        let options = crate::poseidon::GameOptions { prefix: None, forest_proxy: false, budgets: None, opaque_leaves: false, twig_cards: false, card_bend: None, trim_cards: trim };
+        let options = crate::poseidon::GameOptions { prefix: None, forest_proxy: false, budgets: None, opaque_leaves: false, twig_cards: false, card_bend: None, near_leaves: None, trim_cards: trim };
         let file = crate::poseidon::export_game(&s, &base, &options)?;
         return Ok(json!({"ok":true,"files":[file]}));
     }

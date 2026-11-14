@@ -162,6 +162,11 @@ pub struct GameOptions {
     pub twig_cards: bool,
     /// `--card-bend`: share of the crown ellipsoid in the twig cards' normals (None = default).
     pub card_bend: Option<f32>,
+    /// `--near-leaves N` (with `--twig-cards`): the near level is the default ladder's opaque leaf
+    /// pieces at N P3D faces (`clusterfoliage`, `_leaves_co.paa`), every leaf its own piece, and
+    /// only mid, far and very far are twig cards. Planar cards cannot draw single crisp leaves up
+    /// close (GROVE-PARITY 2026-11-14: streaks from cards at grazing angles, one bake per twig).
+    pub near_leaves: Option<usize>,
     /// Trim alpha-card outlines using the generated atlas.
     pub trim_cards: bool,
 }
@@ -201,7 +206,15 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
         material: String::new(),
     };
     let mut ladder = if options.twig_cards {
-        crate::twigs::ladder(s, options.budgets.as_deref(), options.trim_cards, options.card_bend.unwrap_or(crate::twigs::DEFAULT_BEND))?
+        let mut twig = crate::twigs::ladder(s, options.budgets.as_deref(), options.trim_cards, options.card_bend.unwrap_or(crate::twigs::DEFAULT_BEND))?;
+        if let Some(n) = options.near_leaves {
+            let mut near = crate::gamelod::opaque_rungs(Some(&[n, 1_500]))?[0];
+            near.resolution = twig.levels[0].rung.resolution;
+            let full = crate::gamelod::ladder_with(s, &[near]);
+            twig.levels[0] = full.levels.into_iter().next().ok_or("--near-leaves made no level")?;
+            twig.atlas = full.atlas;
+        }
+        twig
     } else if options.opaque_leaves {
         crate::gamelod::ladder_with(s, &crate::gamelod::opaque_rungs(options.budgets.as_deref())?)
     } else {
@@ -239,6 +252,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
         })
         .unwrap_or(s.height);
     let mut counts = Vec::new();
+    let near_opaque = options.twig_cards && options.near_leaves.is_some();
     for (k, level) in ladder.levels.iter().enumerate() {
         let mut props: Vec<(&str, String)> = Vec::new();
         if options.forest_proxy {
@@ -258,7 +272,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
             }
         }
         // twig cards are alpha cards, not opaque leaf pieces for per-cluster reduction
-        if k == 0 && !options.twig_cards {
+        if k == 0 && (!options.twig_cards || near_opaque) {
             props.push(("clusterfoliage", "1".into()));
         }
         write_lod_with(
@@ -266,7 +280,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
             &level.bark,
             &level.leaves,
             &bark_surface,
-            if options.twig_cards { &twig_surface } else if k == 0 { &opaque_surface } else { &leaf_surface },
+            if options.twig_cards && !(k == 0 && near_opaque) { &twig_surface } else if k == 0 { &opaque_surface } else { &leaf_surface },
             level.rung.resolution,
             true,
             &props,
@@ -332,7 +346,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
         // PNG to look at, raw RGBA (edge from the manifest) for offline tools
         bark_pixels.save(file("bark_co.png")).map_err(|e| e.to_string())?;
         tree::write(&file("bark_co.rgba"), bark_pixels.as_raw())?;
-        if ladder.twig.is_none() {
+        if ladder.twig.is_none() || near_opaque {
             atlas.save(file("leaves_ca.png")).map_err(|e| e.to_string())?;
             tree::write(&file("leaves_ca.rgba"), atlas.as_raw())?;
         }
@@ -351,7 +365,7 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
     }
     tree::write(&bark, paa(bark_pixels, CompressionVariant::BC1, false))?;
     tree::write(&bark_n, paa(bark_normal, CompressionVariant::BC3, false))?;
-    if ladder.twig.is_none() {
+    if ladder.twig.is_none() || near_opaque {
         let mut opaque = atlas.clone();
         for p in opaque.pixels_mut() {
             p.0[3] = 255;
@@ -387,7 +401,9 @@ pub fn export_game(s: &Settings, path: &Path, options: &GameOptions) -> Result<V
         "shadowProxy": {"resolution":11000.0,"triangles":shadow.triangles(),"p3dFaces":shadow.bark.i.len()/3 + shadow.leaves.i.len()*2/3,"runtimeSelection":"requires engine support"},
         "occlusionProxy": occlusion_path.file_name().unwrap().to_string_lossy(),
         "wind": {"map":"tree","height":"model-space Y, meters","hierarchy":wind_sidecar.file_name().unwrap().to_string_lossy(),"hierarchyRequiresEngineSupport":true},
-        "sidecars": if ladder.twig.is_some() {
+        "sidecars": if near_opaque {
+            json!([&bark, &bark_n, &twigs, &twigs_n, &leaves, &leaves_n, &opaque_leaves, &opaque_leaves_n, &bark_mat, &leaf_mat, &wind_sidecar, &occlusion_path])
+        } else if ladder.twig.is_some() {
             json!([&bark, &bark_n, &twigs, &twigs_n, &bark_mat, &leaf_mat, &wind_sidecar, &occlusion_path])
         } else {
             json!([&bark, &bark_n, &leaves, &leaves_n, &opaque_leaves, &opaque_leaves_n, &bark_mat, &leaf_mat, &wind_sidecar, &occlusion_path])
@@ -635,6 +651,7 @@ mod tests {
             opaque_leaves: false,
             twig_cards: false,
             card_bend: None,
+            near_leaves: None,
             trim_cards: true,
         };
         let asset = export_game(&s, &path, &options).unwrap();
@@ -682,6 +699,7 @@ mod tests {
             opaque_leaves: true,
             twig_cards: false,
             card_bend: None,
+            near_leaves: None,
             trim_cards: true,
         };
         let asset = export_game(&s, &path, &options).unwrap();
