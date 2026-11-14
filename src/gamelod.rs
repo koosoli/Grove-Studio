@@ -158,12 +158,16 @@ pub struct Ladder {
     /// The leaf atlas: ATLAS x ATLAS RGBA, sRGB colour with the cutout alpha.
     pub atlas: Vec<u8>,
     pub branches: Vec<crate::tree::Branch>,
+    /// `--twig-cards`: the baked twig atlas every level's foliage samples instead of `atlas`.
+    pub twig: Option<crate::twigs::TwigAtlas>,
 }
 
 /// Clip alpha cards to a padded convex hull of the base atlas alpha. Opaque pieces are kept.
 /// Clipping each source triangle separately preserves folds and interpolates its attributes.
 /// Coarse mipmaps, compression and vertex-driven wind can still change the image.
 pub fn trim_cards(ladder: &mut Ladder) {
+    // twig cards are trimmed when they are made, against their own atlas
+    if ladder.twig.is_some() { return; }
     let regions: Vec<_> = (0..4).map(|i| (i as f32 / 4., (i + 1) as f32 / 4., CUTOUT))
         .chain(SPRAY_U.into_iter().map(|(a,b)| (a,b,SPRAY))).collect();
     let hulls: Vec<_> = regions.iter().map(|&(u0,u1,(v0,v1))| {
@@ -476,7 +480,7 @@ pub fn ladder_with(s: &Settings, rungs: &[Rung]) -> Ladder {
         }
         levels.push(Level { rung, bark, leaves: foliage });
     }
-    Ladder { levels, atlas, branches: full.branches }
+    Ladder { levels, atlas, branches: full.branches, twig: None }
 }
 
 /// Sum of single-sided triangle areas in square metres; alpha masks and overlap are not
@@ -1181,7 +1185,7 @@ mod tests {
                             i: vec![0,1,2, 0,2,3, 4,5,6] };
         let mut near = leaves.clone();
         near.i.extend_from_within(..);
-        let mut ladder = Ladder { atlas, branches: vec![], levels: vec![Level { rung: LADDER[0], bark: Part::default(), leaves: near }, Level { rung: LADDER[1], bark: Part::default(), leaves }] };
+        let mut ladder = Ladder { atlas, branches: vec![], twig: None, levels: vec![Level { rung: LADDER[0], bark: Part::default(), leaves: near }, Level { rung: LADDER[1], bark: Part::default(), leaves }] };
         trim_cards(&mut ladder);
         let out = &ladder.levels[1].leaves;
         assert!(out.i.len() >= 9);
@@ -1215,7 +1219,7 @@ mod tests {
             leaves.i.extend([i,i+1,i+2,i,i+2,i+3]);
         }
         let mut near = leaves.clone(); near.i.extend_from_within(..);
-        let make = |budget| { let mut r = LADDER[1]; r.budget = budget; Ladder { atlas: atlas.clone(), branches: vec![], levels: vec![Level { rung: LADDER[0], bark: Part::default(), leaves: near.clone() }, Level { rung:r, bark:Part::default(), leaves:leaves.clone() }] } };
+        let make = |budget| { let mut r = LADDER[1]; r.budget = budget; Ladder { atlas: atlas.clone(), branches: vec![], twig: None, levels: vec![Level { rung: LADDER[0], bark: Part::default(), leaves: near.clone() }, Level { rung:r, bark:Part::default(), leaves:leaves.clone() }] } };
         let mut reference = make(10000); trim_cards(&mut reference);
         let mut limited = make(80); trim_cards(&mut limited);
         let area = |p: &Part| -> f32 { p.i.chunks_exact(3).map(|t| { let a=p.v[t[0] as usize].p; let b=p.v[t[1] as usize].p; let c=p.v[t[2] as usize].p; (b-a).cross(c-a).length()*0.5 }).sum() };

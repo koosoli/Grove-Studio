@@ -11,6 +11,7 @@ mod poseidon;
 mod preview;
 mod reference;
 mod tree;
+mod twigs;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     log::install_panic_hook();
